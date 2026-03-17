@@ -148,21 +148,47 @@ async function getPayment(paymentId) {
   return response.data;
 }
 
-async function updateOrderByExternalReference(externalReference, patch) {
+async function updateOrderOrGroupByExternalReference(externalReference, patch) {
   if (!firebaseReady || !externalReference) return false;
 
-  const ref = admin.database().ref(`orders/${externalReference}`);
-  const snapshot = await ref.get();
+  const orderRef = admin.database().ref(`orders/${externalReference}`);
+  const orderSnap = await orderRef.get();
 
-  if (!snapshot.exists()) {
-    console.log("[firebase] order not found:", externalReference);
+  if (orderSnap.exists()) {
+    await orderRef.update({
+      ...patch,
+      updatedAtMs: Date.now(),
+    });
+    return true;
+  }
+
+  const groupRef = admin.database().ref(`checkout_groups/${externalReference}`);
+  const groupSnap = await groupRef.get();
+
+  if (!groupSnap.exists()) {
+    console.log("[firebase] no order or group found:", externalReference);
     return false;
   }
 
-  await ref.update({
+  const groupData = groupSnap.val() || {};
+  const orderIdsMap = groupData.orderIds || {};
+
+  await groupRef.update({
     ...patch,
     updatedAtMs: Date.now(),
   });
+
+  const updates = {};
+  for (const orderId of Object.keys(orderIdsMap)) {
+    updates[`orders/${orderId}/updatedAtMs`] = Date.now();
+    for (const [key, value] of Object.entries(patch)) {
+      updates[`orders/${orderId}/${key}`] = value;
+    }
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await admin.database().ref().update(updates);
+  }
 
   return true;
 }
@@ -259,39 +285,18 @@ app.get("/failure", (req, res) => {
   );
 });
 
-/**
- * Cria preferência do Checkout Pro.
- * Body esperado:
- * {
- *   "orderId": "firebase_order_id",
- *   "title": "Pedido FireRank",
- *   "items": [
- *     {
- *       "title": "Produto X",
- *       "quantity": 1,
- *       "unit_price": 99.9,
- *       "currency_id": "BRL"
- *     }
- *   ],
- *   "payer": {
- *     "email": "cliente@email.com",
- *     "name": "Pedro",
- *     "surname": "Silva"
- *   },
- *   "marketplaceFee": 10.5
- * }
- */
 app.post("/api/mercadopago/create-preference", async (req, res) => {
   try {
     ensureMercadoPagoConfigured();
 
     const body = req.body || {};
-    const orderId = safeText(body.orderId);
+    const externalReference =
+      safeText(body.externalReference) || safeText(body.orderId);
     const title = safeText(body.title) || "Pedido FireRank";
 
     const rawItems = Array.isArray(body.items) ? body.items : [];
-    if (!orderId) {
-      return res.status(400).json({ error: "orderId é obrigatório." });
+    if (!externalReference) {
+      return res.status(400).json({ error: "externalReference é obrigatório." });
     }
 
     if (rawItems.length === 0) {
@@ -308,7 +313,7 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
       }
 
       return {
-        id: safeText(item.id) || `${orderId}_${index + 1}`,
+        id: safeText(item.id) || `${externalReference}_${index + 1}`,
         title: itemTitle,
         description: safeText(item.description) || itemTitle,
         picture_url: safeText(item.picture_url),
@@ -329,7 +334,7 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
         name: safeText(payer.name) || undefined,
         surname: safeText(payer.surname) || undefined,
       },
-      external_reference: orderId,
+      external_reference: externalReference,
       statement_descriptor: "FIRERANK",
       marketplace_fee: marketplaceFee > 0 ? marketplaceFee : undefined,
       notification_url: MP_WEBHOOK_URL,
@@ -340,7 +345,7 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
       },
       auto_return: "approved",
       metadata: {
-        orderId,
+        externalReference,
         source: "firerank",
         title,
       },
@@ -355,7 +360,7 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
     const data = response.data || {};
 
     if (firebaseReady) {
-      await updateOrderByExternalReference(orderId, {
+      await updateOrderOrGroupByExternalReference(externalReference, {
         checkoutPreferenceId: safeText(data.id),
         checkoutUrl: safeText(data.init_point || data.sandbox_init_point),
         paymentProvider: "mercado_pago",
@@ -370,7 +375,7 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
       preferenceId: safeText(data.id),
       initPoint: safeText(data.init_point),
       sandboxInitPoint: safeText(data.sandbox_init_point),
-      externalReference: orderId,
+      externalReference,
     });
   } catch (error) {
     console.error("[create-preference] error:", error.response?.data || error.message);
@@ -385,11 +390,6 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
   }
 });
 
-/**
- * Webhook Mercado Pago
- * Mercado Pago pode notificar por querystring ou body,
- * e depois você consulta o pagamento oficial pela API.
- */
 app.post("/webhook", async (req, res) => {
   try {
     ensureMercadoPagoConfigured();
@@ -420,15 +420,11 @@ app.post("/webhook", async (req, res) => {
     const paymentStatus = safeText(payment.status);
     const paymentDetail = safeText(payment.status_detail);
 
-    console.log("[webhook] payment status:", paymentStatus, paymentDetail);
-    console.log("[webhook] external_reference:", externalReference);
-
     const patch = {
       paymentId,
       paymentStatus,
       mercadoPagoStatus: paymentStatus,
       mercadoPagoStatusDetail: paymentDetail,
-      mercadoPagoRaw: payment,
       ...mapPaymentStatusToOrderStatus(paymentStatus, paymentDetail),
     };
 
@@ -437,7 +433,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     if (firebaseReady && externalReference) {
-      await updateOrderByExternalReference(externalReference, patch);
+      await updateOrderOrGroupByExternalReference(externalReference, patch);
     }
 
     return res.status(200).json({
