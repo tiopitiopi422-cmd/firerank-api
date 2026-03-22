@@ -256,9 +256,11 @@ app.get("/success", (req, res) => {
   res.send(
     htmlPage(
       "Pagamento aprovado",
-      `Pagamento concluído. Você já pode voltar ao app. ${safeText(
-        req.query.payment_id
-      ) ? `Payment ID: ${safeText(req.query.payment_id)}.` : ""}`
+      `Pagamento concluído. Você já pode voltar ao app. ${
+        safeText(req.query.payment_id)
+          ? `Payment ID: ${safeText(req.query.payment_id)}.`
+          : ""
+      }`
     )
   );
 });
@@ -267,9 +269,11 @@ app.get("/pending", (req, res) => {
   res.send(
     htmlPage(
       "Pagamento pendente",
-      `Seu pagamento está pendente. Você já pode voltar ao app e acompanhar o status. ${safeText(
-        req.query.payment_id
-      ) ? `Payment ID: ${safeText(req.query.payment_id)}.` : ""}`
+      `Seu pagamento está pendente. Você já pode voltar ao app e acompanhar o status. ${
+        safeText(req.query.payment_id)
+          ? `Payment ID: ${safeText(req.query.payment_id)}.`
+          : ""
+      }`
     )
   );
 });
@@ -278,9 +282,11 @@ app.get("/failure", (req, res) => {
   res.send(
     htmlPage(
       "Pagamento não concluído",
-      `O pagamento não foi concluído. Você pode tentar novamente no app. ${safeText(
-        req.query.payment_id
-      ) ? `Payment ID: ${safeText(req.query.payment_id)}.` : ""}`
+      `O pagamento não foi concluído. Você pode tentar novamente no app. ${
+        safeText(req.query.payment_id)
+          ? `Payment ID: ${safeText(req.query.payment_id)}.`
+          : ""
+      }`
     )
   );
 });
@@ -295,12 +301,19 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
     const title = safeText(body.title) || "Pedido FireRank";
 
     const rawItems = Array.isArray(body.items) ? body.items : [];
+
     if (!externalReference) {
-      return res.status(400).json({ error: "externalReference é obrigatório." });
+      return res.status(400).json({
+        ok: false,
+        error: "externalReference é obrigatório.",
+      });
     }
 
     if (rawItems.length === 0) {
-      return res.status(400).json({ error: "items é obrigatório." });
+      return res.status(400).json({
+        ok: false,
+        error: "items é obrigatório.",
+      });
     }
 
     const items = rawItems.map((item, index) => {
@@ -316,7 +329,7 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
         id: safeText(item.id) || `${externalReference}_${index + 1}`,
         title: itemTitle,
         description: safeText(item.description) || itemTitle,
-        picture_url: safeText(item.picture_url),
+        picture_url: safeText(item.picture_url) || undefined,
         category_id: safeText(item.category_id) || "others",
         quantity,
         currency_id: safeText(item.currency_id) || "BRL",
@@ -324,8 +337,8 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
       };
     });
 
-    const payer = body.payer && typeof body.payer === "object" ? body.payer : {};
-    const marketplaceFee = Math.max(0, toNumber(body.marketplaceFee, 0));
+    const payer =
+      body.payer && typeof body.payer === "object" ? body.payer : {};
 
     const payload = {
       items,
@@ -335,8 +348,6 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
         surname: safeText(payer.surname) || undefined,
       },
       external_reference: externalReference,
-      statement_descriptor: "FIRERANK",
-      marketplace_fee: marketplaceFee > 0 ? marketplaceFee : undefined,
       notification_url: MP_WEBHOOK_URL,
       back_urls: {
         success: PAYMENT_SUCCESS_URL,
@@ -350,6 +361,8 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
         title,
       },
     };
+
+    console.log("[create-preference] payload:", JSON.stringify(payload));
 
     const response = await axios.post(
       "https://api.mercadopago.com/checkout/preferences",
@@ -378,14 +391,19 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
       externalReference,
     });
   } catch (error) {
-    console.error("[create-preference] error:", error.response?.data || error.message);
-    return res.status(500).json({
+    console.error(
+      "[create-preference] error:",
+      error.response?.data || error.message
+    );
+
+    return res.status(error.response?.status || 500).json({
       ok: false,
       error:
         error.response?.data?.message ||
         error.response?.data ||
         error.message ||
         "Erro ao criar preferência.",
+      details: error.response?.data || null,
     });
   }
 });
@@ -407,11 +425,17 @@ app.post("/webhook", async (req, res) => {
     console.log("[webhook] body:", JSON.stringify(req.body || {}));
 
     if (!resourceId) {
-      return res.status(200).json({ ok: true, received: true, skipped: "no_resource_id" });
+      return res
+        .status(200)
+        .json({ ok: true, received: true, skipped: "no_resource_id" });
     }
 
     if (topic && topic !== "payment") {
-      return res.status(200).json({ ok: true, received: true, skipped: `topic_${topic}` });
+      return res.status(200).json({
+        ok: true,
+        received: true,
+        skipped: `topic_${topic}`,
+      });
     }
 
     const payment = await getPayment(resourceId);
@@ -445,7 +469,8 @@ app.post("/webhook", async (req, res) => {
     });
   } catch (error) {
     console.error("[webhook] error:", error.response?.data || error.message);
-    return res.status(500).json({
+
+    return res.status(error.response?.status || 500).json({
       ok: false,
       error:
         error.response?.data?.message ||
