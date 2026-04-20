@@ -16,9 +16,10 @@ const APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost:10000";
 const MP_PUBLIC_KEY = process.env.MERCADO_PAGO_PUBLIC_KEY || "";
 const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 
+const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "";
+const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL || "";
+const FIREBASE_PRIVATE_KEY = process.env.FIREBASE_PRIVATE_KEY || "";
 const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || "";
-const FIREBASE_SERVICE_ACCOUNT_JSON =
-  process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
 
 const PAYMENT_SUCCESS_URL =
   process.env.PAYMENT_SUCCESS_URL || `${APP_BASE_URL}/success`;
@@ -107,28 +108,25 @@ function initFirebase() {
     return admin.database();
   }
 
-  if (!FIREBASE_DATABASE_URL) {
-    throw new Error("FIREBASE_DATABASE_URL não configurado");
+  if (
+    !FIREBASE_PROJECT_ID ||
+    !FIREBASE_CLIENT_EMAIL ||
+    !FIREBASE_PRIVATE_KEY ||
+    !FIREBASE_DATABASE_URL
+  ) {
+    throw new Error(
+      "FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY ou FIREBASE_DATABASE_URL não configurados"
+    );
   }
 
-  let credential;
-
-  if (FIREBASE_SERVICE_ACCOUNT_JSON) {
-    const parsed = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON);
-
-    if (parsed.private_key) {
-      parsed.private_key = String(parsed.private_key)
-        .replace(/\r/g, "")
-        .replace(/\\n/g, "\n");
-    }
-
-    credential = admin.credential.cert(parsed);
-  } else {
-    credential = admin.credential.applicationDefault();
-  }
+  const privateKey = FIREBASE_PRIVATE_KEY.replace(/\r/g, "").replace(/\\n/g, "\n");
 
   admin.initializeApp({
-    credential,
+    credential: admin.credential.cert({
+      projectId: FIREBASE_PROJECT_ID,
+      clientEmail: FIREBASE_CLIENT_EMAIL,
+      privateKey,
+    }),
     databaseURL: FIREBASE_DATABASE_URL,
   });
 
@@ -195,10 +193,8 @@ async function updateVerificationPaymentByRequestId(requestId, patch) {
 
   const updates = {};
   snap.forEach((child) => {
-    updates[`verification_payments/${child.key}/status`] =
-      patch.paymentStatus;
-    updates[`verification_payments/${child.key}/updatedAtMs`] =
-      patch.updatedAtMs;
+    updates[`verification_payments/${child.key}/status`] = patch.paymentStatus;
+    updates[`verification_payments/${child.key}/updatedAtMs`] = patch.updatedAtMs;
 
     if (patch.gatewayPaymentId) {
       updates[`verification_payments/${child.key}/gatewayPaymentId`] =
@@ -234,10 +230,7 @@ async function handleVerificationPayment(paymentDetail) {
   const uid = extractUidFromExternalReference(externalReference);
 
   if (!externalReference || !uid) {
-    console.log(
-      "Webhook ignorado: external_reference ausente ou inválido",
-      externalReference
-    );
+    console.log("Webhook ignorado:", externalReference);
     return;
   }
 
@@ -245,7 +238,7 @@ async function handleVerificationPayment(paymentDetail) {
   const requestSnap = await requestRef.get();
 
   if (!requestSnap.exists()) {
-    console.log("Webhook: verification_request não encontrado para uid", uid);
+    console.log("verification_request não encontrado para uid", uid);
     return;
   }
 
@@ -264,36 +257,10 @@ async function handleVerificationPayment(paymentDetail) {
     rootUpdates[`users/${uid}/verificationStatus`] =
       "waiting_admin_confirmation";
     rootUpdates[`users/${uid}/verified`] = false;
-
-    rootUpdates[`notifications/${uid}/verification-payment-${now}/title`] =
-      "Pagamento aprovado";
-    rootUpdates[`notifications/${uid}/verification-payment-${now}/body`] =
-      "Seu pagamento do selo foi aprovado. Agora aguarde a confirmação do ADM.";
-    rootUpdates[`notifications/${uid}/verification-payment-${now}/type`] =
-      "verification_payment_approved";
-    rootUpdates[`notifications/${uid}/verification-payment-${now}/read`] = false;
-    rootUpdates[
-      `notifications/${uid}/verification-payment-${now}/createdAtMs`
-    ] = now;
-  } else if (paymentStatus === "pending" || paymentStatus === "in_process") {
-    rootUpdates[`verification_requests/${uid}/adminStatus`] = "pending";
-    rootUpdates[`users/${uid}/verificationStatus`] = "payment_pending";
-    rootUpdates[`users/${uid}/verified`] = false;
   } else {
     rootUpdates[`verification_requests/${uid}/adminStatus`] = "pending";
     rootUpdates[`users/${uid}/verificationStatus`] = "payment_pending";
     rootUpdates[`users/${uid}/verified`] = false;
-
-    rootUpdates[`notifications/${uid}/verification-payment-${now}/title`] =
-      "Pagamento não aprovado";
-    rootUpdates[`notifications/${uid}/verification-payment-${now}/body`] =
-      "O pagamento do selo não foi aprovado. Você pode tentar novamente no app.";
-    rootUpdates[`notifications/${uid}/verification-payment-${now}/type`] =
-      "verification_payment_failed";
-    rootUpdates[`notifications/${uid}/verification-payment-${now}/read`] = false;
-    rootUpdates[
-      `notifications/${uid}/verification-payment-${now}/createdAtMs`
-    ] = now;
   }
 
   if (paymentId) {
@@ -319,7 +286,7 @@ async function handleVerificationPayment(paymentDetail) {
     rawStatusDetail: statusDetail,
   });
 
-  console.log("Webhook processado com sucesso:", {
+  console.log("Webhook processado:", {
     uid,
     externalReference,
     paymentId,
@@ -329,20 +296,16 @@ async function handleVerificationPayment(paymentDetail) {
 
 app.get("/", (_, res) => {
   res.send(
-    htmlPage(
-      "FireRank API",
-      "Backend online do checkout do selo verificado."
-    )
+    htmlPage("FireRank API", "Backend online do checkout do selo verificado.")
   );
 });
 
 app.get("/health", async (_, res) => {
   try {
-    const dbOk = !!db;
     res.json({
       ok: true,
       mercadoPagoConfigured: !!MP_ACCESS_TOKEN,
-      firebaseConfigured: dbOk,
+      firebaseConfigured: true,
       baseUrl: APP_BASE_URL,
       webhookUrl: MP_WEBHOOK_URL,
     });
@@ -356,10 +319,7 @@ app.get("/health", async (_, res) => {
 
 app.get("/success", (_, res) => {
   res.send(
-    htmlPage(
-      "Pagamento aprovado",
-      "Pagamento concluído. Você já pode voltar ao app."
-    )
+    htmlPage("Pagamento aprovado", "Pagamento concluído. Você já pode voltar ao app.")
   );
 });
 
@@ -386,8 +346,7 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
     ensureMP();
 
     const body = req.body || {};
-    const externalReference =
-      safe(body.externalReference) || safe(body.orderId);
+    const externalReference = safe(body.externalReference) || safe(body.orderId);
 
     if (!externalReference) {
       return res.status(400).json({
@@ -432,8 +391,6 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
       notification_url: MP_WEBHOOK_URL,
     };
 
-    console.log("PAYLOAD:", JSON.stringify(payload, null, 2));
-
     const response = await axios.post(
       "https://api.mercadopago.com/checkout/preferences",
       payload,
@@ -470,8 +427,6 @@ app.get("/api/mercadopago/webhook", async (req, res) => {
     const type = safe(req.query.type || req.query.topic);
     const id = safe(req.query["data.id"] || req.query.id);
 
-    console.log("Webhook GET recebido:", req.query);
-
     if (type === "payment" && id) {
       const paymentDetail = await fetchMercadoPagoPayment(id);
       await handleVerificationPayment(paymentDetail);
@@ -494,8 +449,6 @@ app.post("/api/mercadopago/webhook", async (req, res) => {
         req.query["data.id"] ||
         req.query.id
     );
-
-    console.log("Webhook POST recebido:", JSON.stringify(body, null, 2));
 
     if (type === "payment" && id) {
       const paymentDetail = await fetchMercadoPagoPayment(id);
