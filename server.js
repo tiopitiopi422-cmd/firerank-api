@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
+const admin = require("firebase-admin");
 
 const app = express();
 
@@ -15,12 +16,29 @@ const APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost:10000";
 const MP_PUBLIC_KEY = process.env.MERCADO_PAGO_PUBLIC_KEY || "";
 const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 
+const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || "";
+const FIREBASE_SERVICE_ACCOUNT_JSON =
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
+
 const PAYMENT_SUCCESS_URL =
   process.env.PAYMENT_SUCCESS_URL || `${APP_BASE_URL}/success`;
 const PAYMENT_PENDING_URL =
   process.env.PAYMENT_PENDING_URL || `${APP_BASE_URL}/pending`;
 const PAYMENT_FAILURE_URL =
   process.env.PAYMENT_FAILURE_URL || `${APP_BASE_URL}/failure`;
+
+const MP_WEBHOOK_URL =
+  process.env.MP_WEBHOOK_URL ||
+  `${APP_BASE_URL}/api/mercadopago/webhook`;
+
+function safe(v) {
+  return String(v ?? "").trim();
+}
+
+function toNumber(v) {
+  const n = Number(String(v ?? "").replace(",", ".").trim());
+  return Number.isFinite(n) ? n : 0;
+}
 
 function mpHeaders() {
   return {
@@ -33,15 +51,6 @@ function ensureMP() {
   if (!MP_ACCESS_TOKEN) {
     throw new Error("ACCESS TOKEN não configurado");
   }
-}
-
-function toNumber(v) {
-  const n = Number(String(v ?? "").replace(",", ".").trim());
-  return Number.isFinite(n) ? n : 0;
-}
-
-function safe(v) {
-  return String(v ?? "").trim();
 }
 
 function htmlPage(title, message) {
@@ -93,6 +102,222 @@ function htmlPage(title, message) {
   `;
 }
 
+function initFirebase() {
+  if (admin.apps.length > 0) {
+    return admin.database();
+  }
+
+  if (!FIREBASE_DATABASE_URL) {
+    throw new Error("FIREBASE_DATABASE_URL não configurado");
+  }
+
+  let credential;
+
+  if (FIREBASE_SERVICE_ACCOUNT_JSON) {
+    const parsed = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON);
+    credential = admin.credential.cert(parsed);
+  } else {
+    credential = admin.credential.applicationDefault();
+  }
+
+  admin.initializeApp({
+    credential,
+    databaseURL: FIREBASE_DATABASE_URL,
+  });
+
+  return admin.database();
+}
+
+const db = initFirebase();
+
+function extractUidFromExternalReference(externalReference) {
+  const ref = safe(externalReference);
+  if (!ref.startsWith("verification_")) return "";
+  const parts = ref.split("_");
+  if (parts.length < 3) return "";
+  return safe(parts[1]);
+}
+
+async function fetchMercadoPagoPayment(paymentId) {
+  const response = await axios.get(
+    `https://api.mercadopago.com/v1/payments/${paymentId}`,
+    { headers: mpHeaders() }
+  );
+  return response.data || {};
+}
+
+function normalizePaymentStatus(status) {
+  const s = safe(status).toLowerCase();
+
+  if (s === "approved") return "approved";
+  if (s === "pending") return "pending";
+  if (s === "in_process") return "in_process";
+  if (s === "rejected") return "rejected";
+  if (s === "cancelled") return "cancelled";
+  if (s === "refunded") return "refunded";
+  if (s === "charged_back") return "charged_back";
+
+  return s || "pending";
+}
+
+function verificationStatusFromPaymentStatus(paymentStatus) {
+  const s = normalizePaymentStatus(paymentStatus);
+
+  if (s === "approved") return "waiting_admin_confirmation";
+  if (s === "pending" || s === "in_process") return "payment_pending";
+  if (
+    s === "rejected" ||
+    s === "cancelled" ||
+    s === "refunded" ||
+    s === "charged_back"
+  ) {
+    return "rejected_by_admin";
+  }
+
+  return "payment_pending";
+}
+
+async function updateVerificationPaymentByRequestId(requestId, patch) {
+  const snap = await db
+    .ref("verification_payments")
+    .orderByChild("requestId")
+    .equalTo(requestId)
+    .get();
+
+  if (!snap.exists()) return;
+
+  const updates = {};
+  snap.forEach((child) => {
+    updates[`verification_payments/${child.key}/status`] =
+      patch.paymentStatus;
+    updates[`verification_payments/${child.key}/updatedAtMs`] =
+      patch.updatedAtMs;
+
+    if (patch.gatewayPaymentId) {
+      updates[`verification_payments/${child.key}/gatewayPaymentId`] =
+        patch.gatewayPaymentId;
+    }
+
+    if (patch.gatewayPreferenceId) {
+      updates[`verification_payments/${child.key}/gatewayPreferenceId`] =
+        patch.gatewayPreferenceId;
+    }
+
+    if (patch.rawStatusDetail) {
+      updates[`verification_payments/${child.key}/rawStatusDetail`] =
+        patch.rawStatusDetail;
+    }
+  });
+
+  if (Object.keys(updates).length > 0) {
+    await db.ref().update(updates);
+  }
+}
+
+async function handleVerificationPayment(paymentDetail) {
+  const now = Date.now();
+
+  const paymentId = safe(paymentDetail.id);
+  const paymentStatus = normalizePaymentStatus(paymentDetail.status);
+  const statusDetail = safe(paymentDetail.status_detail);
+  const externalReference = safe(paymentDetail.external_reference);
+  const preferenceId = safe(paymentDetail.order?.id || paymentDetail.metadata?.preference_id);
+  const uid = extractUidFromExternalReference(externalReference);
+
+  if (!externalReference || !uid) {
+    console.log(
+      "Webhook ignorado: external_reference ausente ou inválido",
+      externalReference
+    );
+    return;
+  }
+
+  const requestRef = db.ref(`verification_requests/${uid}`);
+  const requestSnap = await requestRef.get();
+
+  if (!requestSnap.exists()) {
+    console.log("Webhook: verification_request não encontrado para uid", uid);
+    return;
+  }
+
+  const verifiedStatus = verificationStatusFromPaymentStatus(paymentStatus);
+
+  const rootUpdates = {
+    [`verification_requests/${uid}/paymentStatus`]: paymentStatus,
+    [`verification_requests/${uid}/verifiedStatus`]: verifiedStatus,
+    [`verification_requests/${uid}/updatedAtMs`]: now,
+    [`users/${uid}/verificationPaymentStatus`]: paymentStatus,
+    [`users/${uid}/updatedAtMs`]: now,
+  };
+
+  if (paymentStatus === "approved") {
+    rootUpdates[`verification_requests/${uid}/adminStatus`] = "pending";
+    rootUpdates[`users/${uid}/verificationStatus`] =
+      "waiting_admin_confirmation";
+    rootUpdates[`users/${uid}/verified`] = false;
+
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/title`] =
+      "Pagamento aprovado";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/body`] =
+      "Seu pagamento do selo foi aprovado. Agora aguarde a confirmação do ADM.";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/type`] =
+      "verification_payment_approved";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/read`] = false;
+    rootUpdates[
+      `notifications/${uid}/verification-payment-${now}/createdAtMs`
+    ] = now;
+  } else if (paymentStatus === "pending" || paymentStatus === "in_process") {
+    rootUpdates[`verification_requests/${uid}/adminStatus`] = "pending";
+    rootUpdates[`users/${uid}/verificationStatus`] = "payment_pending";
+    rootUpdates[`users/${uid}/verified`] = false;
+  } else {
+    rootUpdates[`verification_requests/${uid}/adminStatus`] = "pending";
+    rootUpdates[`users/${uid}/verificationStatus`] = "payment_pending";
+    rootUpdates[`users/${uid}/verified`] = false;
+
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/title`] =
+      "Pagamento não aprovado";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/body`] =
+      "O pagamento do selo não foi aprovado. Você pode tentar novamente no app.";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/type`] =
+      "verification_payment_failed";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/read`] = false;
+    rootUpdates[
+      `notifications/${uid}/verification-payment-${now}/createdAtMs`
+    ] = now;
+  }
+
+  if (paymentId) {
+    rootUpdates[`verification_requests/${uid}/gatewayPaymentId`] = paymentId;
+  }
+
+  if (preferenceId) {
+    rootUpdates[`verification_requests/${uid}/gatewayPreferenceId`] =
+      preferenceId;
+  }
+
+  if (statusDetail) {
+    rootUpdates[`verification_requests/${uid}/rawStatusDetail`] = statusDetail;
+  }
+
+  await db.ref().update(rootUpdates);
+
+  await updateVerificationPaymentByRequestId(externalReference, {
+    paymentStatus,
+    updatedAtMs: now,
+    gatewayPaymentId: paymentId,
+    gatewayPreferenceId: preferenceId,
+    rawStatusDetail: statusDetail,
+  });
+
+  console.log("Webhook processado com sucesso:", {
+    uid,
+    externalReference,
+    paymentId,
+    paymentStatus,
+  });
+}
+
 app.get("/", (_, res) => {
   res.send(
     htmlPage(
@@ -102,12 +327,22 @@ app.get("/", (_, res) => {
   );
 });
 
-app.get("/health", (_, res) => {
-  res.json({
-    ok: true,
-    mercadoPagoConfigured: !!MP_ACCESS_TOKEN,
-    baseUrl: APP_BASE_URL,
-  });
+app.get("/health", async (_, res) => {
+  try {
+    const dbOk = !!db;
+    res.json({
+      ok: true,
+      mercadoPagoConfigured: !!MP_ACCESS_TOKEN,
+      firebaseConfigured: dbOk,
+      baseUrl: APP_BASE_URL,
+      webhookUrl: MP_WEBHOOK_URL,
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: e.message || String(e),
+    });
+  }
 });
 
 app.get("/success", (_, res) => {
@@ -185,6 +420,7 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
         failure: PAYMENT_FAILURE_URL,
       },
       auto_return: "approved",
+      notification_url: MP_WEBHOOK_URL,
     };
 
     console.log("PAYLOAD:", JSON.stringify(payload, null, 2));
@@ -204,6 +440,7 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
       initPoint: safe(data.init_point),
       checkoutUrl: safe(data.init_point),
       sandboxInitPoint: safe(data.sandbox_init_point),
+      webhookUrl: MP_WEBHOOK_URL,
     });
   } catch (error) {
     console.error("ERRO MP:", error.response?.data || error.message);
@@ -215,6 +452,53 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
         error.response?.data ||
         error.message ||
         "Erro ao criar preferência",
+    });
+  }
+});
+
+app.get("/api/mercadopago/webhook", async (req, res) => {
+  try {
+    const type = safe(req.query.type || req.query.topic);
+    const id = safe(req.query["data.id"] || req.query.id);
+
+    console.log("Webhook GET recebido:", req.query);
+
+    if (type === "payment" && id) {
+      const paymentDetail = await fetchMercadoPagoPayment(id);
+      await handleVerificationPayment(paymentDetail);
+    }
+
+    return res.status(200).send("ok");
+  } catch (e) {
+    console.error("Erro no webhook GET:", e.response?.data || e.message);
+    return res.status(500).send("webhook error");
+  }
+});
+
+app.post("/api/mercadopago/webhook", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const type = safe(body.type || body.topic || req.query.type || req.query.topic);
+    const id = safe(
+      body.data?.id ||
+        body["data.id"] ||
+        req.query["data.id"] ||
+        req.query.id
+    );
+
+    console.log("Webhook POST recebido:", JSON.stringify(body, null, 2));
+
+    if (type === "payment" && id) {
+      const paymentDetail = await fetchMercadoPagoPayment(id);
+      await handleVerificationPayment(paymentDetail);
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error("Erro no webhook POST:", e.response?.data || e.message);
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "webhook error",
     });
   }
 });
