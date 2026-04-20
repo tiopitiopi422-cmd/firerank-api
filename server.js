@@ -115,6 +115,13 @@ function initFirebase() {
 
   if (FIREBASE_SERVICE_ACCOUNT_JSON) {
     const parsed = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON);
+
+    if (parsed.private_key) {
+      parsed.private_key = String(parsed.private_key)
+        .replace(/\r/g, "")
+        .replace(/\\n/g, "\n");
+    }
+
     credential = admin.credential.cert(parsed);
   } else {
     credential = admin.credential.applicationDefault();
@@ -221,7 +228,9 @@ async function handleVerificationPayment(paymentDetail) {
   const paymentStatus = normalizePaymentStatus(paymentDetail.status);
   const statusDetail = safe(paymentDetail.status_detail);
   const externalReference = safe(paymentDetail.external_reference);
-  const preferenceId = safe(paymentDetail.order?.id || paymentDetail.metadata?.preference_id);
+  const preferenceId = safe(
+    paymentDetail.order?.id || paymentDetail.metadata?.preference_id
+  );
   const uid = extractUidFromExternalReference(externalReference);
 
   if (!externalReference || !uid) {
