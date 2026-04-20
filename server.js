@@ -10,16 +10,17 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-const PORT = process.env.PORT || 10000;
-const APP_BASE_URL = process.env.APP_BASE_URL || "http://localhost:10000";
+const PORT = Number(process.env.PORT || 10000);
+const APP_BASE_URL =
+  process.env.APP_BASE_URL ||
+  "https://firerank-api-production.up.railway.app";
 
 const MP_PUBLIC_KEY = process.env.MERCADO_PAGO_PUBLIC_KEY || "";
 const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "";
-const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL || "";
-const FIREBASE_PRIVATE_KEY = process.env.FIREBASE_PRIVATE_KEY || "";
 const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || "";
+const FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 =
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 || "";
 
 const PAYMENT_SUCCESS_URL =
   process.env.PAYMENT_SUCCESS_URL || `${APP_BASE_URL}/success`;
@@ -50,7 +51,7 @@ function mpHeaders() {
 
 function ensureMP() {
   if (!MP_ACCESS_TOKEN) {
-    throw new Error("ACCESS TOKEN não configurado");
+    throw new Error("MERCADO_PAGO_ACCESS_TOKEN não configurado");
   }
 }
 
@@ -108,25 +109,25 @@ function initFirebase() {
     return admin.database();
   }
 
-  if (
-    !FIREBASE_PROJECT_ID ||
-    !FIREBASE_CLIENT_EMAIL ||
-    !FIREBASE_PRIVATE_KEY ||
-    !FIREBASE_DATABASE_URL
-  ) {
+  if (!FIREBASE_DATABASE_URL) {
+    throw new Error("FIREBASE_DATABASE_URL não configurado");
+  }
+
+  if (!FIREBASE_SERVICE_ACCOUNT_JSON_BASE64) {
     throw new Error(
-      "FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY ou FIREBASE_DATABASE_URL não configurados"
+      "FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 não configurado"
     );
   }
 
-  const privateKey = FIREBASE_PRIVATE_KEY.replace(/\r/g, "").replace(/\\n/g, "\n");
+  const decodedJson = Buffer.from(
+    FIREBASE_SERVICE_ACCOUNT_JSON_BASE64,
+    "base64"
+  ).toString("utf8");
+
+  const serviceAccount = JSON.parse(decodedJson);
 
   admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: FIREBASE_PROJECT_ID,
-      clientEmail: FIREBASE_CLIENT_EMAIL,
-      privateKey,
-    }),
+    credential: admin.credential.cert(serviceAccount),
     databaseURL: FIREBASE_DATABASE_URL,
   });
 
@@ -194,7 +195,8 @@ async function updateVerificationPaymentByRequestId(requestId, patch) {
   const updates = {};
   snap.forEach((child) => {
     updates[`verification_payments/${child.key}/status`] = patch.paymentStatus;
-    updates[`verification_payments/${child.key}/updatedAtMs`] = patch.updatedAtMs;
+    updates[`verification_payments/${child.key}/updatedAtMs`] =
+      patch.updatedAtMs;
 
     if (patch.gatewayPaymentId) {
       updates[`verification_payments/${child.key}/gatewayPaymentId`] =
@@ -257,10 +259,36 @@ async function handleVerificationPayment(paymentDetail) {
     rootUpdates[`users/${uid}/verificationStatus`] =
       "waiting_admin_confirmation";
     rootUpdates[`users/${uid}/verified`] = false;
+
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/title`] =
+      "Pagamento aprovado";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/body`] =
+      "Seu pagamento do selo foi aprovado. Agora aguarde a confirmação do ADM.";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/type`] =
+      "verification_payment_approved";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/read`] = false;
+    rootUpdates[
+      `notifications/${uid}/verification-payment-${now}/createdAtMs`
+    ] = now;
+  } else if (paymentStatus === "pending" || paymentStatus === "in_process") {
+    rootUpdates[`verification_requests/${uid}/adminStatus`] = "pending";
+    rootUpdates[`users/${uid}/verificationStatus`] = "payment_pending";
+    rootUpdates[`users/${uid}/verified`] = false;
   } else {
     rootUpdates[`verification_requests/${uid}/adminStatus`] = "pending";
     rootUpdates[`users/${uid}/verificationStatus`] = "payment_pending";
     rootUpdates[`users/${uid}/verified`] = false;
+
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/title`] =
+      "Pagamento não aprovado";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/body`] =
+      "O pagamento do selo não foi aprovado. Você pode tentar novamente no app.";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/type`] =
+      "verification_payment_failed";
+    rootUpdates[`notifications/${uid}/verification-payment-${now}/read`] = false;
+    rootUpdates[
+      `notifications/${uid}/verification-payment-${now}/createdAtMs`
+    ] = now;
   }
 
   if (paymentId) {
@@ -300,26 +328,22 @@ app.get("/", (_, res) => {
   );
 });
 
-app.get("/health", async (_, res) => {
-  try {
-    res.json({
-      ok: true,
-      mercadoPagoConfigured: !!MP_ACCESS_TOKEN,
-      firebaseConfigured: true,
-      baseUrl: APP_BASE_URL,
-      webhookUrl: MP_WEBHOOK_URL,
-    });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: e.message || String(e),
-    });
-  }
+app.get("/health", (_, res) => {
+  res.json({
+    ok: true,
+    mercadoPagoConfigured: !!MP_ACCESS_TOKEN,
+    firebaseConfigured: true,
+    baseUrl: APP_BASE_URL,
+    webhookUrl: MP_WEBHOOK_URL,
+  });
 });
 
 app.get("/success", (_, res) => {
   res.send(
-    htmlPage("Pagamento aprovado", "Pagamento concluído. Você já pode voltar ao app.")
+    htmlPage(
+      "Pagamento aprovado",
+      "Pagamento concluído. Você já pode voltar ao app."
+    )
   );
 });
 
@@ -346,7 +370,8 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
     ensureMP();
 
     const body = req.body || {};
-    const externalReference = safe(body.externalReference) || safe(body.orderId);
+    const externalReference =
+      safe(body.externalReference) || safe(body.orderId);
 
     if (!externalReference) {
       return res.status(400).json({
@@ -466,5 +491,5 @@ app.post("/api/mercadopago/webhook", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log("Servidor rodando na porta", PORT);
+  console.log(`Servidor rodando na porta ${PORT}`);
 });
