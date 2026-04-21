@@ -210,6 +210,14 @@ function normalizePaymentStatus(status) {
   return s || "pending";
 }
 
+/**
+ * Para o fluxo do selo:
+ * approved -> waiting_admin_confirmation
+ * pending/in_process -> payment_pending
+ * rejected/cancelled/refunded/charged_back -> rejected_by_admin
+ *
+ * Mantive a compatibilidade com o seu painel atual.
+ */
 function verificationStatusFromPaymentStatus(paymentStatus) {
   const s = normalizePaymentStatus(paymentStatus);
 
@@ -227,39 +235,93 @@ function verificationStatusFromPaymentStatus(paymentStatus) {
   return "payment_pending";
 }
 
-async function updateVerificationPaymentByRequestId(requestId, patch) {
-  const snap = await db
-    .ref("verification_payments")
-    .orderByChild("requestId")
-    .equalTo(requestId)
-    .get();
-
-  if (!snap.exists()) return;
-
+/**
+ * Atualiza verification_payments procurando:
+ * 1) requestId
+ * 2) gatewayPreferenceId
+ *
+ * Isso resolve o caso em que o webhook chega, mas o update não encontra
+ * o registro só pelo requestId.
+ */
+async function updateVerificationPaymentRecords({
+  requestId,
+  gatewayPaymentId,
+  gatewayPreferenceId,
+  paymentStatus,
+  updatedAtMs,
+  rawStatusDetail,
+}) {
   const updates = {};
-  snap.forEach((child) => {
-    updates[`verification_payments/${child.key}/status`] = patch.paymentStatus;
-    updates[`verification_payments/${child.key}/updatedAtMs`] =
-      patch.updatedAtMs;
 
-    if (patch.gatewayPaymentId) {
-      updates[`verification_payments/${child.key}/gatewayPaymentId`] =
-        patch.gatewayPaymentId;
-    }
+  if (requestId) {
+    const byRequestId = await db
+      .ref("verification_payments")
+      .orderByChild("requestId")
+      .equalTo(requestId)
+      .get();
 
-    if (patch.gatewayPreferenceId) {
-      updates[`verification_payments/${child.key}/gatewayPreferenceId`] =
-        patch.gatewayPreferenceId;
-    }
+    if (byRequestId.exists()) {
+      byRequestId.forEach((child) => {
+        updates[`verification_payments/${child.key}/status`] = paymentStatus;
+        updates[`verification_payments/${child.key}/updatedAtMs`] = updatedAtMs;
 
-    if (patch.rawStatusDetail) {
-      updates[`verification_payments/${child.key}/rawStatusDetail`] =
-        patch.rawStatusDetail;
+        if (gatewayPaymentId) {
+          updates[`verification_payments/${child.key}/gatewayPaymentId`] =
+            gatewayPaymentId;
+        }
+
+        if (gatewayPreferenceId) {
+          updates[`verification_payments/${child.key}/gatewayPreferenceId`] =
+            gatewayPreferenceId;
+        }
+
+        if (rawStatusDetail) {
+          updates[`verification_payments/${child.key}/rawStatusDetail`] =
+            rawStatusDetail;
+        }
+      });
     }
-  });
+  }
+
+  if (Object.keys(updates).length === 0 && gatewayPreferenceId) {
+    const byPreference = await db
+      .ref("verification_payments")
+      .orderByChild("gatewayPreferenceId")
+      .equalTo(gatewayPreferenceId)
+      .get();
+
+    if (byPreference.exists()) {
+      byPreference.forEach((child) => {
+        updates[`verification_payments/${child.key}/status`] = paymentStatus;
+        updates[`verification_payments/${child.key}/updatedAtMs`] = updatedAtMs;
+
+        if (gatewayPaymentId) {
+          updates[`verification_payments/${child.key}/gatewayPaymentId`] =
+            gatewayPaymentId;
+        }
+
+        if (gatewayPreferenceId) {
+          updates[`verification_payments/${child.key}/gatewayPreferenceId`] =
+            gatewayPreferenceId;
+        }
+
+        if (rawStatusDetail) {
+          updates[`verification_payments/${child.key}/rawStatusDetail`] =
+            rawStatusDetail;
+        }
+      });
+    }
+  }
 
   if (Object.keys(updates).length > 0) {
     await db.ref().update(updates);
+  } else {
+    console.log("Nenhum verification_payment encontrado para atualizar", {
+      requestId,
+      gatewayPaymentId,
+      gatewayPreferenceId,
+      paymentStatus,
+    });
   }
 }
 
@@ -270,13 +332,27 @@ async function handleVerificationPayment(paymentDetail) {
   const paymentStatus = normalizePaymentStatus(paymentDetail.status);
   const statusDetail = safe(paymentDetail.status_detail);
   const externalReference = safe(paymentDetail.external_reference);
+
+  /**
+   * preferenceId:
+   * - tentamos primeiro metadata.preference_id
+   * - depois order.id
+   * - e por fim additional_info.items[0].id se existir
+   */
   const preferenceId = safe(
-    paymentDetail.order?.id || paymentDetail.metadata?.preference_id
+    paymentDetail.metadata?.preference_id ||
+      paymentDetail.order?.id ||
+      paymentDetail.additional_info?.items?.[0]?.id
   );
+
   const uid = extractUidFromExternalReference(externalReference);
 
   if (!externalReference || !uid) {
-    console.log("Webhook ignorado:", externalReference);
+    console.log("Webhook ignorado por external_reference inválido:", {
+      externalReference,
+      paymentId,
+      paymentStatus,
+    });
     return;
   }
 
@@ -284,7 +360,11 @@ async function handleVerificationPayment(paymentDetail) {
   const requestSnap = await requestRef.get();
 
   if (!requestSnap.exists()) {
-    console.log("verification_request não encontrado para uid", uid);
+    console.log("verification_request não encontrado para uid", uid, {
+      externalReference,
+      paymentId,
+      paymentStatus,
+    });
     return;
   }
 
@@ -350,7 +430,8 @@ async function handleVerificationPayment(paymentDetail) {
 
   await db.ref().update(rootUpdates);
 
-  await updateVerificationPaymentByRequestId(externalReference, {
+  await updateVerificationPaymentRecords({
+    requestId: externalReference,
     paymentStatus,
     updatedAtMs: now,
     gatewayPaymentId: paymentId,
@@ -363,6 +444,8 @@ async function handleVerificationPayment(paymentDetail) {
     externalReference,
     paymentId,
     paymentStatus,
+    statusDetail,
+    preferenceId,
   });
 }
 
@@ -441,6 +524,7 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
       }
 
       return {
+        id: safe(item.id) || `verification_item_${i + 1}`,
         title: safe(item.title) || `Item ${i + 1}`,
         quantity: Math.max(1, Number(item.quantity) || 1),
         currency_id: "BRL",
@@ -458,6 +542,9 @@ app.post("/api/mercadopago/create-preference", async (req, res) => {
       },
       auto_return: "approved",
       notification_url: MP_WEBHOOK_URL,
+      metadata: {
+        request_id: externalReference,
+      },
     };
 
     const response = await axios.post(
