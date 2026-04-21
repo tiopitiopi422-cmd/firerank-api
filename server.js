@@ -21,6 +21,8 @@ const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
 const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || "";
 const FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 =
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 || "";
+const FIREBASE_SERVICE_ACCOUNT_JSON =
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
 
 const PAYMENT_SUCCESS_URL =
   process.env.PAYMENT_SUCCESS_URL || `${APP_BASE_URL}/success`;
@@ -31,6 +33,7 @@ const PAYMENT_FAILURE_URL =
 
 const MP_WEBHOOK_URL =
   process.env.MP_WEBHOOK_URL ||
+  process.env.MERCADO_PAGO_WEBHOOK_URL ||
   `${APP_BASE_URL}/api/mercadopago/webhook`;
 
 function safe(v) {
@@ -104,6 +107,35 @@ function htmlPage(title, message) {
   `;
 }
 
+function parseServiceAccount() {
+  if (FIREBASE_SERVICE_ACCOUNT_JSON_BASE64) {
+    try {
+      const decodedJson = Buffer.from(
+        FIREBASE_SERVICE_ACCOUNT_JSON_BASE64,
+        "base64"
+      ).toString("utf8");
+
+      return JSON.parse(decodedJson);
+    } catch (e) {
+      throw new Error(
+        "FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 inválido ou malformado"
+      );
+    }
+  }
+
+  if (FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+      return JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON);
+    } catch (e) {
+      throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON inválido");
+    }
+  }
+
+  throw new Error(
+    "Firebase não configurado. Defina FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 ou FIREBASE_SERVICE_ACCOUNT_JSON"
+  );
+}
+
 function initFirebase() {
   if (admin.apps.length > 0) {
     return admin.database();
@@ -113,18 +145,7 @@ function initFirebase() {
     throw new Error("FIREBASE_DATABASE_URL não configurado");
   }
 
-  if (!FIREBASE_SERVICE_ACCOUNT_JSON_BASE64) {
-    throw new Error(
-      "FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 não configurado"
-    );
-  }
-
-  const decodedJson = Buffer.from(
-    FIREBASE_SERVICE_ACCOUNT_JSON_BASE64,
-    "base64"
-  ).toString("utf8");
-
-  const serviceAccount = JSON.parse(decodedJson);
+  const serviceAccount = parseServiceAccount();
 
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -332,7 +353,7 @@ app.get("/health", (_, res) => {
   res.json({
     ok: true,
     mercadoPagoConfigured: !!MP_ACCESS_TOKEN,
-    firebaseConfigured: true,
+    firebaseConfigured: !!FIREBASE_DATABASE_URL,
     baseUrl: APP_BASE_URL,
     webhookUrl: MP_WEBHOOK_URL,
   });
@@ -467,7 +488,9 @@ app.get("/api/mercadopago/webhook", async (req, res) => {
 app.post("/api/mercadopago/webhook", async (req, res) => {
   try {
     const body = req.body || {};
-    const type = safe(body.type || body.topic || req.query.type || req.query.topic);
+    const type = safe(
+      body.type || body.topic || req.query.type || req.query.topic
+    );
     const id = safe(
       body.data?.id ||
         body["data.id"] ||
