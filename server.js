@@ -107,33 +107,56 @@ function htmlPage(title, message) {
   `;
 }
 
+function normalizePrivateKey(privateKey) {
+  return String(privateKey || "")
+    .replace(/\r/g, "")
+    .replace(/\\n/g, "\n")
+    .trim();
+}
+
 function parseServiceAccount() {
+  let raw = "";
+
   if (FIREBASE_SERVICE_ACCOUNT_JSON_BASE64) {
     try {
-      const decodedJson = Buffer.from(
-        FIREBASE_SERVICE_ACCOUNT_JSON_BASE64,
+      raw = Buffer.from(
+        FIREBASE_SERVICE_ACCOUNT_JSON_BASE64.trim(),
         "base64"
       ).toString("utf8");
-
-      return JSON.parse(decodedJson);
     } catch (e) {
       throw new Error(
         "FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 inválido ou malformado"
       );
     }
+  } else if (FIREBASE_SERVICE_ACCOUNT_JSON) {
+    raw = FIREBASE_SERVICE_ACCOUNT_JSON.trim();
+  } else {
+    throw new Error(
+      "Firebase não configurado. Defina FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 ou FIREBASE_SERVICE_ACCOUNT_JSON"
+    );
   }
 
-  if (FIREBASE_SERVICE_ACCOUNT_JSON) {
-    try {
-      return JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON);
-    } catch (e) {
-      throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON inválido");
-    }
+  let serviceAccount;
+  try {
+    serviceAccount = JSON.parse(raw);
+  } catch (e) {
+    throw new Error("JSON da service account inválido");
   }
 
-  throw new Error(
-    "Firebase não configurado. Defina FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 ou FIREBASE_SERVICE_ACCOUNT_JSON"
-  );
+  if (!serviceAccount.private_key) {
+    throw new Error("private_key ausente na service account");
+  }
+
+  serviceAccount.private_key = normalizePrivateKey(serviceAccount.private_key);
+
+  if (
+    !serviceAccount.private_key.includes("-----BEGIN PRIVATE KEY-----") ||
+    !serviceAccount.private_key.includes("-----END PRIVATE KEY-----")
+  ) {
+    throw new Error("private_key inválida: cabeçalho PEM ausente");
+  }
+
+  return serviceAccount;
 }
 
 function initFirebase() {
