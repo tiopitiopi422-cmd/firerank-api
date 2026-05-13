@@ -305,7 +305,9 @@ function detectRequestTypeFromBody(body) {
     return "boost";
   }
 
-  const externalReference = safe(body.externalReference || body.external_reference);
+  const externalReference = safe(
+    body.externalReference || body.external_reference
+  );
 
   if (externalReference.startsWith("verification_")) return "verification";
   if (
@@ -619,6 +621,7 @@ async function handleVerificationPayment(paymentDetail) {
     updates[`users/${uid}/verifiedAtMs`] = t;
     updates[`users/${uid}/verificationExpiresAtMs`] = expiresAtMs;
     updates[`users/${uid}/verificationSubscription/status`] = "active";
+    updates[`users/${uid}/verificationSubscription/active`] = true;
     updates[`users/${uid}/verificationSubscription/plan`] = plan;
     updates[`users/${uid}/verificationSubscription/startsAtMs`] = startsAtMs;
     updates[`users/${uid}/verificationSubscription/expiresAtMs`] = expiresAtMs;
@@ -874,23 +877,20 @@ async function handleBoostPayment(paymentDetail) {
       : startsAtMs + days * DAY_MS;
 
   if (!sellerUid || !productId) {
+    const key = firebaseSafeKey(paymentId || requestId);
+
     const missingUpdates = {
-      [`payment_integrity_audit/boost_${firebaseSafeKey(paymentId || requestId)}/type`]:
+      [`payment_integrity_audit/boost_${key}/type`]:
         "boost_missing_required_fields",
-      [`payment_integrity_audit/boost_${firebaseSafeKey(paymentId || requestId)}/paymentId`]:
-        paymentId,
-      [`payment_integrity_audit/boost_${firebaseSafeKey(paymentId || requestId)}/externalReference`]:
+      [`payment_integrity_audit/boost_${key}/paymentId`]: paymentId,
+      [`payment_integrity_audit/boost_${key}/externalReference`]:
         externalReference,
-      [`payment_integrity_audit/boost_${firebaseSafeKey(paymentId || requestId)}/gatewayPreferenceId`]:
+      [`payment_integrity_audit/boost_${key}/gatewayPreferenceId`]:
         preferenceId,
-      [`payment_integrity_audit/boost_${firebaseSafeKey(paymentId || requestId)}/paymentStatus`]:
-        paymentStatus,
-      [`payment_integrity_audit/boost_${firebaseSafeKey(paymentId || requestId)}/sellerUid`]:
-        sellerUid,
-      [`payment_integrity_audit/boost_${firebaseSafeKey(paymentId || requestId)}/productId`]:
-        productId,
-      [`payment_integrity_audit/boost_${firebaseSafeKey(paymentId || requestId)}/createdAtMs`]:
-        t,
+      [`payment_integrity_audit/boost_${key}/paymentStatus`]: paymentStatus,
+      [`payment_integrity_audit/boost_${key}/sellerUid`]: sellerUid,
+      [`payment_integrity_audit/boost_${key}/productId`]: productId,
+      [`payment_integrity_audit/boost_${key}/createdAtMs`]: t,
     };
 
     await db.ref().update(missingUpdates);
@@ -905,6 +905,8 @@ async function handleBoostPayment(paymentDetail) {
 
     return;
   }
+
+  const paymentKey = firebaseSafeKey(paymentId || requestId);
 
   const updates = {
     [`boost_requests/${requestId}/requestId`]: requestId,
@@ -925,38 +927,24 @@ async function handleBoostPayment(paymentDetail) {
     [`boost_requests/${requestId}/gatewayPreferenceId`]: preferenceId,
     [`boost_requests/${requestId}/updatedAtMs`]: t,
 
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/paymentId`]:
-      firebaseSafeKey(paymentId || requestId),
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/gatewayPaymentId`]:
-      paymentId,
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/gatewayPreferenceId`]:
-      preferenceId,
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/externalReference`]:
-      externalReference,
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/provider`]:
-      "mercado_pago",
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/status`]:
-      paymentStatus,
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/amount`]: price,
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/currency`]:
-      "BRL",
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/requestId`]:
-      requestId,
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/adId`]: adId,
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/boostId`]:
-      boostId,
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/sellerUid`]:
-      sellerUid,
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/productId`]:
-      productId,
-    [`boost_payments/${firebaseSafeKey(paymentId || requestId)}/updatedAtMs`]:
-      t,
+    [`boost_payments/${paymentKey}/paymentId`]: paymentKey,
+    [`boost_payments/${paymentKey}/gatewayPaymentId`]: paymentId,
+    [`boost_payments/${paymentKey}/gatewayPreferenceId`]: preferenceId,
+    [`boost_payments/${paymentKey}/externalReference`]: externalReference,
+    [`boost_payments/${paymentKey}/provider`]: "mercado_pago",
+    [`boost_payments/${paymentKey}/status`]: paymentStatus,
+    [`boost_payments/${paymentKey}/amount`]: price,
+    [`boost_payments/${paymentKey}/currency`]: "BRL",
+    [`boost_payments/${paymentKey}/requestId`]: requestId,
+    [`boost_payments/${paymentKey}/adId`]: adId,
+    [`boost_payments/${paymentKey}/boostId`]: boostId,
+    [`boost_payments/${paymentKey}/sellerUid`]: sellerUid,
+    [`boost_payments/${paymentKey}/productId`]: productId,
+    [`boost_payments/${paymentKey}/updatedAtMs`]: t,
   };
 
   if (statusDetail) {
-    updates[
-      `boost_payments/${firebaseSafeKey(paymentId || requestId)}/rawStatusDetail`
-    ] = statusDetail;
+    updates[`boost_payments/${paymentKey}/rawStatusDetail`] = statusDetail;
     updates[`boost_requests/${requestId}/rawStatusDetail`] = statusDetail;
   }
 
@@ -1112,7 +1100,9 @@ async function savePendingVerificationPreference({
 
   const plan = safe(body.plan || body.verificationPlan || "monthly");
   const days = planToDays(plan, body.days || 30);
-  const price = toNumber(body.price || body.amount || body.items?.[0]?.unit_price);
+  const price = toNumber(
+    body.price || body.amount || body.items?.[0]?.unit_price
+  );
 
   const updates = {
     [`verification_requests/${uid}/uid`]: uid,
@@ -1167,7 +1157,9 @@ async function savePendingBoostPreference({
   const productImage = safe(body.productImage || body.product_image);
   const placement = safe(body.placement || "home_hero_horizontal");
 
-  const price = toNumber(body.price || body.amount || body.items?.[0]?.unit_price);
+  const price = toNumber(
+    body.price || body.amount || body.items?.[0]?.unit_price
+  );
   const days = planToDays(body.plan, body.days || 1);
   const plan = safe(body.plan || planFromDays(days));
 
@@ -1268,6 +1260,126 @@ async function savePendingBoostPreference({
   await db.ref().update(updates);
 }
 
+async function buildExpireBoostUpdates(t) {
+  const adsSnap = await db
+    .ref("ads")
+    .orderByChild("status")
+    .equalTo("active")
+    .get();
+
+  const updates = {};
+  let expiredBoosts = 0;
+
+  if (adsSnap.exists()) {
+    adsSnap.forEach((child) => {
+      const adId = child.key;
+      const ad = child.val() || {};
+      const productId = safe(ad.productId);
+      const sellerUid = safe(ad.sellerUid);
+      const expiresAtMs = Number(ad.endsAtMs || ad.expiresAtMs || 0);
+
+      if (expiresAtMs > 0 && expiresAtMs <= t) {
+        expiredBoosts++;
+
+        updates[`ads/${adId}/status`] = "expired";
+        updates[`ads/${adId}/expiredAtMs`] = t;
+        updates[`ads/${adId}/updatedAtMs`] = t;
+
+        if (productId) {
+          updates[`products/${productId}/isBoosted`] = false;
+          updates[`products/${productId}/boosted`] = false;
+          updates[`products/${productId}/boost/isBoosted`] = false;
+          updates[`products/${productId}/boost/active`] = false;
+          updates[`products/${productId}/boost/status`] = "expired";
+          updates[`products/${productId}/boost/expiredAtMs`] = t;
+          updates[`products/${productId}/boost/updatedAtMs`] = t;
+          updates[`products/${productId}/boostStatus`] = "expired";
+          updates[`products/${productId}/updatedAtMs`] = t;
+          updates[`active_boosts_by_product/${productId}/${adId}`] = null;
+        }
+
+        if (sellerUid) {
+          updates[`active_boosts_by_seller/${sellerUid}/${adId}`] = null;
+
+          updates[`notifications/${sellerUid}/boost-expired-${adId}-${t}/title`] =
+            "Anúncio expirado";
+          updates[`notifications/${sellerUid}/boost-expired-${adId}-${t}/body`] =
+            "O período do seu anúncio terminou.";
+          updates[`notifications/${sellerUid}/boost-expired-${adId}-${t}/type`] =
+            "boost_expired";
+          updates[`notifications/${sellerUid}/boost-expired-${adId}-${t}/read`] =
+            false;
+          updates[
+            `notifications/${sellerUid}/boost-expired-${adId}-${t}/createdAtMs`
+          ] = t;
+        }
+
+        updates[`active_boosts/${adId}`] = null;
+      }
+    });
+  }
+
+  return { updates, expiredBoosts };
+}
+
+async function buildExpireVerificationUpdates(t) {
+  const verifiedSnap = await db
+    .ref("verified_users")
+    .orderByChild("active")
+    .equalTo(true)
+    .get();
+
+  const updates = {};
+  let expiredVerifications = 0;
+
+  if (verifiedSnap.exists()) {
+    verifiedSnap.forEach((child) => {
+      const uid = child.key;
+      const data = child.val() || {};
+      const expiresAtMs = Number(data.expiresAtMs || 0);
+
+      if (!uid || !expiresAtMs) return;
+
+      if (expiresAtMs <= t) {
+        expiredVerifications++;
+
+        updates[`verified_users/${uid}/active`] = false;
+        updates[`verified_users/${uid}/status`] = "expired";
+        updates[`verified_users/${uid}/expiredAtMs`] = t;
+        updates[`verified_users/${uid}/updatedAtMs`] = t;
+
+        updates[`users/${uid}/verified`] = false;
+        updates[`users/${uid}/verificationStatus`] = "expired";
+        updates[`users/${uid}/verificationPaymentStatus`] = "expired";
+        updates[`users/${uid}/verificationExpiredAtMs`] = t;
+        updates[`users/${uid}/updatedAtMs`] = t;
+
+        updates[`users/${uid}/verificationSubscription/status`] = "expired";
+        updates[`users/${uid}/verificationSubscription/active`] = false;
+        updates[`users/${uid}/verificationSubscription/expiredAtMs`] = t;
+        updates[`users/${uid}/verificationSubscription/updatedAtMs`] = t;
+
+        updates[`verification_requests/${uid}/status`] = "expired";
+        updates[`verification_requests/${uid}/verifiedStatus`] = "expired";
+        updates[`verification_requests/${uid}/expiredAtMs`] = t;
+        updates[`verification_requests/${uid}/updatedAtMs`] = t;
+
+        updates[`notifications/${uid}/verification-expired-${t}/title`] =
+          "Selo verificado expirado";
+        updates[`notifications/${uid}/verification-expired-${t}/body`] =
+          "Seu selo verificado expirou. Renove para ativar novamente.";
+        updates[`notifications/${uid}/verification-expired-${t}/type`] =
+          "verification_expired";
+        updates[`notifications/${uid}/verification-expired-${t}/read`] = false;
+        updates[`notifications/${uid}/verification-expired-${t}/createdAtMs`] =
+          t;
+      }
+    });
+  }
+
+  return { updates, expiredVerifications };
+}
+
 app.get("/", (_, res) => {
   res.send(
     htmlPage(
@@ -1286,6 +1398,9 @@ app.get("/health", (_, res) => {
     webhookUrl: MP_WEBHOOK_URL,
     autoVerificationActivation: true,
     autoBoostActivation: true,
+    expireBoostsEnabled: true,
+    expireVerificationsEnabled: true,
+    maintenanceEnabled: true,
   });
 });
 
@@ -1531,46 +1646,7 @@ app.post("/api/internal/expire-boosts", async (_, res) => {
   try {
     const t = nowMs();
 
-    const adsSnap = await db
-      .ref("ads")
-      .orderByChild("status")
-      .equalTo("active")
-      .get();
-
-    const updates = {};
-
-    if (adsSnap.exists()) {
-      adsSnap.forEach((child) => {
-        const adId = child.key;
-        const ad = child.val() || {};
-        const productId = safe(ad.productId);
-        const sellerUid = safe(ad.sellerUid);
-        const expiresAtMs = Number(ad.endsAtMs || ad.expiresAtMs || 0);
-
-        if (expiresAtMs > 0 && expiresAtMs <= t) {
-          updates[`ads/${adId}/status`] = "expired";
-          updates[`ads/${adId}/updatedAtMs`] = t;
-
-          if (productId) {
-            updates[`products/${productId}/isBoosted`] = false;
-            updates[`products/${productId}/boosted`] = false;
-            updates[`products/${productId}/boost/isBoosted`] = false;
-            updates[`products/${productId}/boost/active`] = false;
-            updates[`products/${productId}/boost/status`] = "expired";
-            updates[`products/${productId}/boost/updatedAtMs`] = t;
-            updates[`products/${productId}/boostStatus`] = "expired";
-            updates[`products/${productId}/updatedAtMs`] = t;
-            updates[`active_boosts_by_product/${productId}/${adId}`] = null;
-          }
-
-          if (sellerUid) {
-            updates[`active_boosts_by_seller/${sellerUid}/${adId}`] = null;
-          }
-
-          updates[`active_boosts/${adId}`] = null;
-        }
-      });
-    }
+    const { updates, expiredBoosts } = await buildExpireBoostUpdates(t);
 
     if (Object.keys(updates).length > 0) {
       await db.ref().update(updates);
@@ -1578,12 +1654,67 @@ app.post("/api/internal/expire-boosts", async (_, res) => {
 
     return res.json({
       ok: true,
-      expiredCount: Object.keys(updates).length,
+      expiredBoosts,
+      checkedAtMs: t,
     });
   } catch (e) {
     return res.status(500).json({
       ok: false,
       error: e.message || "Erro ao expirar anúncios",
+    });
+  }
+});
+
+app.post("/api/internal/expire-verifications", async (_, res) => {
+  try {
+    const t = nowMs();
+
+    const { updates, expiredVerifications } =
+      await buildExpireVerificationUpdates(t);
+
+    if (Object.keys(updates).length > 0) {
+      await db.ref().update(updates);
+    }
+
+    return res.json({
+      ok: true,
+      expiredVerifications,
+      checkedAtMs: t,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "Erro ao expirar selos verificados",
+    });
+  }
+});
+
+app.post("/api/internal/run-maintenance", async (_, res) => {
+  try {
+    const t = nowMs();
+
+    const boostResult = await buildExpireBoostUpdates(t);
+    const verificationResult = await buildExpireVerificationUpdates(t);
+
+    const updates = {
+      ...boostResult.updates,
+      ...verificationResult.updates,
+    };
+
+    if (Object.keys(updates).length > 0) {
+      await db.ref().update(updates);
+    }
+
+    return res.json({
+      ok: true,
+      expiredBoosts: boostResult.expiredBoosts,
+      expiredVerifications: verificationResult.expiredVerifications,
+      checkedAtMs: t,
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: e.message || "Erro ao rodar manutenção",
     });
   }
 });
