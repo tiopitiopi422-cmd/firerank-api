@@ -4,11 +4,13 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const admin = require("firebase-admin");
+const nodemailer = require("nodemailer");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
 const PORT = Number(process.env.PORT || 10000);
 
@@ -24,6 +26,7 @@ const FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 =
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 || "";
 const FIREBASE_SERVICE_ACCOUNT_JSON =
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
+const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY || "";
 
 const PAYMENT_SUCCESS_URL =
   process.env.PAYMENT_SUCCESS_URL || `${APP_BASE_URL}/success`;
@@ -37,7 +40,21 @@ const MP_WEBHOOK_URL =
   process.env.MERCADO_PAGO_WEBHOOK_URL ||
   `${APP_BASE_URL}/api/mercadopago/webhook`;
 
+const PASSWORD_RESET_URL =
+  process.env.PASSWORD_RESET_URL || `${APP_BASE_URL}/reset-password`;
+
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
+const SMTP_SECURE = String(process.env.SMTP_SECURE || "true").toLowerCase() === "true";
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+const MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || "FireRank";
+const MAIL_FROM_EMAIL = process.env.MAIL_FROM_EMAIL || SMTP_USER || "";
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || MAIL_FROM_EMAIL || "";
+
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+const passwordResetThrottle = new Map();
 
 function safe(v) {
   return String(v ?? "").trim();
@@ -50,6 +67,30 @@ function toNumber(v) {
 
 function nowMs() {
   return Date.now();
+}
+
+function isValidEmail(email) {
+  const e = safe(email).toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function maskEmail(email) {
+  const e = safe(email);
+  const parts = e.split("@");
+  if (parts.length !== 2) return e;
+  const name = parts[0];
+  const domain = parts[1];
+  const visible = name.length <= 2 ? name[0] || "*" : `${name[0]}${name[1]}`;
+  return `${visible}***@${domain}`;
 }
 
 function mpHeaders() {
@@ -65,6 +106,21 @@ function ensureMP() {
   }
 }
 
+function ensureEmailConfig() {
+  const missing = [];
+
+  if (!SMTP_HOST) missing.push("SMTP_HOST");
+  if (!SMTP_PORT) missing.push("SMTP_PORT");
+  if (!SMTP_USER) missing.push("SMTP_USER");
+  if (!SMTP_PASS) missing.push("SMTP_PASS");
+  if (!MAIL_FROM_EMAIL) missing.push("MAIL_FROM_EMAIL");
+  if (!FIREBASE_WEB_API_KEY) missing.push("FIREBASE_WEB_API_KEY");
+
+  if (missing.length > 0) {
+    throw new Error(`Configuração de e-mail incompleta: ${missing.join(", ")}`);
+  }
+}
+
 function htmlPage(title, message) {
   return `
   <!DOCTYPE html>
@@ -72,8 +128,9 @@ function htmlPage(title, message) {
     <head>
       <meta charset="UTF-8" />
       <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>${title}</title>
+      <title>${escapeHtml(title)}</title>
       <style>
+        * { box-sizing: border-box; }
         body {
           margin: 0;
           font-family: Arial, sans-serif;
@@ -92,6 +149,20 @@ function htmlPage(title, message) {
           border: 1px solid rgba(255,255,255,0.08);
           border-radius: 20px;
           padding: 24px;
+          box-shadow: 0 18px 60px rgba(0,0,0,.35);
+        }
+        .logo {
+          width: 54px;
+          height: 54px;
+          border-radius: 18px;
+          background: rgba(30,136,229,.16);
+          color: #1E88E5;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 28px;
+          font-weight: 900;
+          margin-bottom: 16px;
         }
         h1 {
           margin: 0 0 12px;
@@ -102,16 +173,395 @@ function htmlPage(title, message) {
           line-height: 1.5;
           color: rgba(255,255,255,0.78);
         }
+        a {
+          color: #1E88E5;
+          font-weight: 800;
+        }
       </style>
     </head>
     <body>
       <div class="card">
-        <h1>${title}</h1>
-        <p>${message}</p>
+        <div class="logo">🔥</div>
+        <h1>${escapeHtml(title)}</h1>
+        <p>${escapeHtml(message)}</p>
       </div>
     </body>
   </html>
   `;
+}
+
+function resetPasswordPage() {
+  return `
+  <!DOCTYPE html>
+  <html lang="pt-BR">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>Redefinir senha - FireRank</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          min-height: 100vh;
+          font-family: Arial, sans-serif;
+          background:
+            radial-gradient(circle at top, rgba(30,136,229,.22), transparent 34%),
+            linear-gradient(180deg, #050505 0%, #0d0d0d 100%);
+          color: #fff;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 24px;
+        }
+        .card {
+          width: 100%;
+          max-width: 460px;
+          background: rgba(255,255,255,.07);
+          border: 1px solid rgba(255,255,255,.10);
+          border-radius: 26px;
+          padding: 26px;
+          box-shadow: 0 24px 90px rgba(0,0,0,.45);
+          backdrop-filter: blur(12px);
+        }
+        .brand {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          margin-bottom: 18px;
+        }
+        .brand-icon {
+          width: 52px;
+          height: 52px;
+          border-radius: 18px;
+          background: rgba(30,136,229,.16);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: #1E88E5;
+          font-size: 28px;
+        }
+        .brand-name {
+          font-size: 21px;
+          font-weight: 900;
+          letter-spacing: -.3px;
+        }
+        h1 {
+          margin: 0;
+          font-size: 28px;
+          line-height: 1.1;
+          letter-spacing: -.8px;
+        }
+        .subtitle {
+          margin: 10px 0 20px;
+          color: rgba(255,255,255,.68);
+          font-size: 14px;
+          line-height: 1.45;
+          font-weight: 600;
+        }
+        label {
+          display: block;
+          margin-bottom: 8px;
+          color: rgba(255,255,255,.72);
+          font-size: 13px;
+          font-weight: 800;
+        }
+        input {
+          width: 100%;
+          height: 52px;
+          border: 1px solid rgba(255,255,255,.12);
+          background: rgba(255,255,255,.08);
+          color: white;
+          border-radius: 16px;
+          padding: 0 15px;
+          font-size: 15px;
+          outline: none;
+        }
+        input:focus {
+          border-color: #1E88E5;
+          box-shadow: 0 0 0 3px rgba(30,136,229,.18);
+        }
+        button {
+          width: 100%;
+          height: 52px;
+          margin-top: 16px;
+          border: 0;
+          border-radius: 16px;
+          background: #1E88E5;
+          color: white;
+          font-weight: 900;
+          font-size: 15px;
+          cursor: pointer;
+        }
+        button:disabled {
+          opacity: .6;
+          cursor: not-allowed;
+        }
+        .msg {
+          margin-top: 14px;
+          padding: 12px;
+          border-radius: 14px;
+          background: rgba(255,255,255,.07);
+          color: rgba(255,255,255,.78);
+          font-size: 13px;
+          line-height: 1.4;
+          display: none;
+        }
+        .msg.ok {
+          display: block;
+          border: 1px solid rgba(67, 255, 143, .20);
+          background: rgba(67, 255, 143, .08);
+        }
+        .msg.err {
+          display: block;
+          border: 1px solid rgba(255, 84, 84, .22);
+          background: rgba(255, 84, 84, .09);
+        }
+        .footer {
+          margin-top: 18px;
+          color: rgba(255,255,255,.42);
+          font-size: 12px;
+          text-align: center;
+          line-height: 1.4;
+        }
+      </style>
+    </head>
+    <body>
+      <main class="card">
+        <div class="brand">
+          <div class="brand-icon">🔥</div>
+          <div class="brand-name">FireRank</div>
+        </div>
+
+        <h1>Crie uma nova senha</h1>
+        <p class="subtitle">
+          Digite sua nova senha abaixo. Depois disso, você já poderá voltar para o app e entrar normalmente.
+        </p>
+
+        <form id="form">
+          <label for="password">Nova senha</label>
+          <input id="password" type="password" minlength="6" autocomplete="new-password" placeholder="Mínimo de 6 caracteres" required />
+
+          <label for="confirm" style="margin-top: 12px;">Confirmar senha</label>
+          <input id="confirm" type="password" minlength="6" autocomplete="new-password" placeholder="Digite novamente" required />
+
+          <button id="btn" type="submit">Salvar nova senha</button>
+          <div id="msg" class="msg"></div>
+        </form>
+
+        <div class="footer">
+          Se o link estiver expirado, solicite uma nova recuperação de senha no app FireRank.
+        </div>
+      </main>
+
+      <script>
+        const form = document.getElementById("form");
+        const btn = document.getElementById("btn");
+        const msg = document.getElementById("msg");
+        const params = new URLSearchParams(window.location.search);
+        const oobCode = params.get("oobCode") || params.get("oobcode") || "";
+
+        function show(type, text) {
+          msg.className = "msg " + type;
+          msg.textContent = text;
+        }
+
+        if (!oobCode) {
+          show("err", "Link inválido. Peça uma nova recuperação de senha no app FireRank.");
+          btn.disabled = true;
+        }
+
+        form.addEventListener("submit", async (e) => {
+          e.preventDefault();
+
+          const password = document.getElementById("password").value.trim();
+          const confirm = document.getElementById("confirm").value.trim();
+
+          if (!password || password.length < 6) {
+            show("err", "A senha precisa ter pelo menos 6 caracteres.");
+            return;
+          }
+
+          if (password !== confirm) {
+            show("err", "As senhas não conferem.");
+            return;
+          }
+
+          btn.disabled = true;
+          btn.textContent = "Salvando...";
+
+          try {
+            const response = await fetch("/api/auth/confirm-password-reset", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ oobCode, newPassword: password })
+            });
+
+            const data = await response.json().catch(() => ({}));
+
+            if (!response.ok || !data.ok) {
+              throw new Error(data.error || "Não foi possível redefinir sua senha.");
+            }
+
+            show("ok", "Senha redefinida com sucesso. Agora você já pode voltar ao app FireRank e entrar com sua nova senha.");
+            btn.textContent = "Senha salva";
+          } catch (err) {
+            show("err", err.message || "Link expirado ou inválido. Solicite uma nova recuperação no app.");
+            btn.disabled = false;
+            btn.textContent = "Salvar nova senha";
+          }
+        });
+      </script>
+    </body>
+  </html>
+  `;
+}
+
+function buildResetEmailHtml({ resetUrl, email }) {
+  const cleanResetUrl = escapeHtml(resetUrl);
+  const cleanEmail = escapeHtml(email);
+
+  return `
+  <!DOCTYPE html>
+  <html lang="pt-BR">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>Redefina sua senha do FireRank</title>
+    </head>
+    <body style="margin:0;padding:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#111827;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f8;padding:28px 14px;">
+        <tr>
+          <td align="center">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:22px;overflow:hidden;border:1px solid #e5e7eb;">
+              <tr>
+                <td style="background:#0b0b0b;padding:26px 26px 22px;">
+                  <div style="display:inline-block;background:rgba(30,136,229,.16);color:#1E88E5;border-radius:16px;width:50px;height:50px;line-height:50px;text-align:center;font-size:26px;font-weight:900;">🔥</div>
+                  <h1 style="margin:16px 0 0;color:#ffffff;font-size:26px;line-height:1.15;">Redefina sua senha</h1>
+                  <p style="margin:8px 0 0;color:rgba(255,255,255,.72);font-size:14px;line-height:1.45;">Solicitação de recuperação da sua conta FireRank.</p>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:26px;">
+                  <p style="margin:0 0 14px;font-size:15px;line-height:1.55;color:#374151;">Olá,</p>
+                  <p style="margin:0 0 14px;font-size:15px;line-height:1.55;color:#374151;">
+                    Recebemos uma solicitação para redefinir a senha da conta FireRank vinculada a:
+                  </p>
+                  <p style="margin:0 0 20px;font-size:15px;line-height:1.55;color:#111827;font-weight:700;">${cleanEmail}</p>
+                  <p style="margin:0 0 22px;font-size:15px;line-height:1.55;color:#374151;">
+                    Clique no botão abaixo para criar uma nova senha:
+                  </p>
+
+                  <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 22px;">
+                    <tr>
+                      <td style="background:#1E88E5;border-radius:14px;">
+                        <a href="${cleanResetUrl}" style="display:inline-block;padding:14px 22px;color:#ffffff;text-decoration:none;font-weight:900;font-size:15px;">
+                          Redefinir minha senha
+                        </a>
+                      </td>
+                    </tr>
+                  </table>
+
+                  <p style="margin:0 0 14px;font-size:13px;line-height:1.55;color:#6b7280;">
+                    Se o botão não funcionar, copie e cole este link no navegador:
+                  </p>
+                  <p style="margin:0 0 20px;font-size:12px;line-height:1.55;color:#1E88E5;word-break:break-all;">
+                    <a href="${cleanResetUrl}" style="color:#1E88E5;">${cleanResetUrl}</a>
+                  </p>
+
+                  <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:16px;padding:14px;margin:0 0 20px;">
+                    <p style="margin:0;font-size:13px;line-height:1.5;color:#6b7280;">
+                      Se você não solicitou essa alteração, ignore este e-mail. Sua senha atual continuará a mesma.
+                    </p>
+                  </div>
+
+                  <p style="margin:0;font-size:15px;line-height:1.55;color:#374151;">Obrigado,</p>
+                  <p style="margin:4px 0 0;font-size:15px;line-height:1.55;color:#111827;font-weight:900;">Equipe FireRank</p>
+                </td>
+              </tr>
+            </table>
+
+            <p style="max-width:560px;margin:14px auto 0;font-size:11px;line-height:1.45;color:#9ca3af;text-align:center;">
+              Este e-mail foi enviado automaticamente pelo FireRank.
+            </p>
+          </td>
+        </tr>
+      </table>
+    </body>
+  </html>
+  `;
+}
+
+function buildResetEmailText({ resetUrl, email }) {
+  return [
+    "Olá,",
+    "",
+    `Recebemos uma solicitação para redefinir a senha da conta FireRank vinculada a ${email}.`,
+    "",
+    "Para criar uma nova senha, acesse o link abaixo:",
+    resetUrl,
+    "",
+    "Se você não solicitou essa alteração, ignore este e-mail.",
+    "",
+    "Equipe FireRank",
+  ].join("\n");
+}
+
+function getMailTransporter() {
+  ensureEmailConfig();
+
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  });
+}
+
+async function sendPasswordResetEmail({ email, resetUrl }) {
+  const transporter = getMailTransporter();
+
+  await transporter.sendMail({
+    from: `"${MAIL_FROM_NAME}" <${MAIL_FROM_EMAIL}>`,
+    to: email,
+    subject: "Redefina sua senha do FireRank",
+    text: buildResetEmailText({ resetUrl, email }),
+    html: buildResetEmailHtml({ resetUrl, email }),
+  });
+}
+
+function canRequestPasswordReset(email) {
+  const key = safe(email).toLowerCase();
+  const last = Number(passwordResetThrottle.get(key) || 0);
+  const t = nowMs();
+
+  if (last && t - last < 60 * 1000) {
+    return false;
+  }
+
+  passwordResetThrottle.set(key, t);
+  return true;
+}
+
+function extractOobCodeFromFirebaseLink(link) {
+  try {
+    const url = new URL(link);
+    const directCode = url.searchParams.get("oobCode");
+
+    if (directCode) return directCode;
+
+    const continueUrl = url.searchParams.get("continueUrl");
+    if (continueUrl) {
+      const nested = new URL(continueUrl);
+      return nested.searchParams.get("oobCode") || "";
+    }
+
+    return "";
+  } catch (_) {
+    return "";
+  }
 }
 
 function normalizePrivateKey(privateKey) {
@@ -1384,7 +1834,7 @@ app.get("/", (_, res) => {
   res.send(
     htmlPage(
       "FireRank API",
-      "Backend online do FireRank: pagamentos, selo verificado e anúncios automáticos."
+      "Backend online do FireRank: pagamentos, selo verificado, anúncios automáticos e recuperação de senha."
     )
   );
 });
@@ -1394,8 +1844,11 @@ app.get("/health", (_, res) => {
     ok: true,
     mercadoPagoConfigured: !!MP_ACCESS_TOKEN,
     firebaseConfigured: !!FIREBASE_DATABASE_URL,
+    firebaseWebApiKeyConfigured: !!FIREBASE_WEB_API_KEY,
+    emailConfigured: !!SMTP_HOST && !!SMTP_USER && !!SMTP_PASS && !!MAIL_FROM_EMAIL,
     baseUrl: APP_BASE_URL,
     webhookUrl: MP_WEBHOOK_URL,
+    passwordResetUrl: PASSWORD_RESET_URL,
     autoVerificationActivation: true,
     autoBoostActivation: true,
     expireBoostsEnabled: true,
@@ -1429,6 +1882,181 @@ app.get("/failure", (_, res) => {
       "O pagamento não foi concluído. Você pode tentar novamente no app."
     )
   );
+});
+
+app.get("/reset-password", (_, res) => {
+  res.send(resetPasswordPage());
+});
+
+app.post("/api/auth/request-password-reset", async (req, res) => {
+  const email = safe(req.body?.email).toLowerCase();
+  const t = nowMs();
+
+  try {
+    if (!isValidEmail(email)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Digite um e-mail válido.",
+      });
+    }
+
+    if (!canRequestPasswordReset(email)) {
+      return res.status(429).json({
+        ok: false,
+        error: "Aguarde um pouco antes de pedir outro link.",
+      });
+    }
+
+    ensureEmailConfig();
+
+    let userRecord = null;
+
+    try {
+      userRecord = await admin.auth().getUserByEmail(email);
+    } catch (e) {
+      console.log("Recuperação solicitada para e-mail não encontrado:", maskEmail(email));
+
+      await db.ref(`password_reset_requests/${firebaseSafeKey(email)}_${t}`).set({
+        emailMasked: maskEmail(email),
+        status: "email_not_found",
+        createdAtMs: t,
+      });
+
+      return res.json({
+        ok: true,
+        message:
+          "Se existir uma conta com esse e-mail, enviaremos um link de recuperação.",
+      });
+    }
+
+    const firebaseResetLink = await admin.auth().generatePasswordResetLink(email);
+    const oobCode = extractOobCodeFromFirebaseLink(firebaseResetLink);
+
+    if (!oobCode) {
+      throw new Error("Não foi possível gerar o código de redefinição.");
+    }
+
+    const resetUrl = `${PASSWORD_RESET_URL}?mode=resetPassword&oobCode=${encodeURIComponent(
+      oobCode
+    )}&email=${encodeURIComponent(email)}`;
+
+    await sendPasswordResetEmail({
+      email,
+      resetUrl,
+    });
+
+    await db.ref(`password_reset_requests/${firebaseSafeKey(userRecord.uid)}_${t}`).set({
+      uid: userRecord.uid,
+      emailMasked: maskEmail(email),
+      status: "sent",
+      provider: "railway_smtp",
+      createdAtMs: t,
+    });
+
+    return res.json({
+      ok: true,
+      message:
+        "Se existir uma conta com esse e-mail, enviaremos um link de recuperação.",
+    });
+  } catch (e) {
+    console.error("Erro ao enviar recuperação de senha:", e.message);
+
+    await db.ref(`password_reset_errors/${firebaseSafeKey(email || "unknown")}_${t}`).set({
+      emailMasked: email ? maskEmail(email) : "",
+      error: e.message || "Erro desconhecido",
+      createdAtMs: t,
+    });
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        "Não foi possível enviar o e-mail de recuperação agora. Tente novamente em alguns minutos.",
+    });
+  }
+});
+
+app.post("/api/auth/confirm-password-reset", async (req, res) => {
+  try {
+    const oobCode = safe(req.body?.oobCode || req.body?.code);
+    const newPassword = safe(req.body?.newPassword || req.body?.password);
+
+    if (!FIREBASE_WEB_API_KEY) {
+      return res.status(500).json({
+        ok: false,
+        error: "FIREBASE_WEB_API_KEY não configurada.",
+      });
+    }
+
+    if (!oobCode) {
+      return res.status(400).json({
+        ok: false,
+        error: "Link inválido. Solicite uma nova recuperação no app.",
+      });
+    }
+
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({
+        ok: false,
+        error: "A senha precisa ter pelo menos 6 caracteres.",
+      });
+    }
+
+    const response = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:resetPassword?key=${encodeURIComponent(
+        FIREBASE_WEB_API_KEY
+      )}`,
+      {
+        oobCode,
+        newPassword,
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const email = safe(response.data?.email);
+
+    await db.ref(`password_reset_confirmations/${firebaseSafeKey(email || nowMs())}`).set({
+      emailMasked: email ? maskEmail(email) : "",
+      status: "completed",
+      completedAtMs: nowMs(),
+    });
+
+    return res.json({
+      ok: true,
+      message: "Senha redefinida com sucesso.",
+    });
+  } catch (e) {
+    const apiError =
+      e.response?.data?.error?.message ||
+      e.response?.data?.message ||
+      e.message ||
+      "";
+
+    console.error("Erro ao confirmar nova senha:", apiError);
+
+    let friendly =
+      "Link expirado ou inválido. Solicite uma nova recuperação de senha no app.";
+
+    if (apiError.includes("WEAK_PASSWORD")) {
+      friendly = "A senha é muito fraca. Use pelo menos 6 caracteres.";
+    }
+
+    if (apiError.includes("EXPIRED_OOB_CODE")) {
+      friendly = "Esse link expirou. Solicite uma nova recuperação de senha no app.";
+    }
+
+    if (apiError.includes("INVALID_OOB_CODE")) {
+      friendly = "Esse link é inválido ou já foi usado. Solicite uma nova recuperação.";
+    }
+
+    return res.status(400).json({
+      ok: false,
+      error: friendly,
+    });
+  }
 });
 
 app.post("/api/mercadopago/create-preference", async (req, res) => {
@@ -1722,4 +2350,5 @@ app.post("/api/internal/run-maintenance", async (_, res) => {
 app.listen(PORT, () => {
   console.log(`Servidor FireRank rodando na porta ${PORT}`);
   console.log(`Webhook Mercado Pago: ${MP_WEBHOOK_URL}`);
+  console.log(`Reset de senha FireRank: ${PASSWORD_RESET_URL}`);
 });
