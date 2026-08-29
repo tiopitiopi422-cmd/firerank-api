@@ -1,567 +1,138 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
 
-const app = express();
-
-app.use(cors());
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true, limit: "2mb" }));
-
-const PORT = Number(process.env.PORT || 10000);
-
-const APP_BASE_URL =
-  process.env.APP_BASE_URL ||
-  "https://firerank-api-production.up.railway.app";
-
-const MP_PUBLIC_KEY = process.env.MERCADO_PAGO_PUBLIC_KEY || "";
-const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || "";
-
-const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || "";
-const FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 =
-  process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 || "";
-const FIREBASE_SERVICE_ACCOUNT_JSON =
-  process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
-const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY || "";
-
-const PAYMENT_SUCCESS_URL =
-  process.env.PAYMENT_SUCCESS_URL || `${APP_BASE_URL}/success`;
-const PAYMENT_PENDING_URL =
-  process.env.PAYMENT_PENDING_URL || `${APP_BASE_URL}/pending`;
-const PAYMENT_FAILURE_URL =
-  process.env.PAYMENT_FAILURE_URL || `${APP_BASE_URL}/failure`;
-
-const MP_WEBHOOK_URL =
-  process.env.MP_WEBHOOK_URL ||
-  process.env.MERCADO_PAGO_WEBHOOK_URL ||
-  `${APP_BASE_URL}/api/mercadopago/webhook`;
-
-const PASSWORD_RESET_URL =
-  process.env.PASSWORD_RESET_URL || `${APP_BASE_URL}/reset-password`;
-
-const SMTP_HOST = process.env.SMTP_HOST || "";
-const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
-const SMTP_SECURE = String(process.env.SMTP_SECURE || "true").toLowerCase() === "true";
-const SMTP_USER = process.env.SMTP_USER || "";
-const SMTP_PASS = process.env.SMTP_PASS || "";
-const MAIL_FROM_NAME = process.env.MAIL_FROM_NAME || "FireRank";
-const MAIL_FROM_EMAIL = process.env.MAIL_FROM_EMAIL || SMTP_USER || "";
-const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || MAIL_FROM_EMAIL || "";
-
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-const passwordResetThrottle = new Map();
-
-function safe(v) {
-  return String(v ?? "").trim();
+let sharp = null;
+try {
+  sharp = require("sharp");
+} catch (_) {
+  // O servidor continua online. O endpoint de mídia retorna 503 até "sharp" existir.
 }
 
-function toNumber(v) {
-  const n = Number(String(v ?? "").replace(",", ".").trim());
-  return Number.isFinite(n) ? n : 0;
+const app = express();
+app.disable("x-powered-by");
+
+const PORT = Number(process.env.PORT || 10000);
+const NODE_ENV = String(process.env.NODE_ENV || "development").toLowerCase();
+const APP_BASE_URL = String(
+  process.env.APP_BASE_URL || "https://firerank-api-production.up.railway.app"
+).replace(/\/+$/, "");
+
+const FIREBASE_DATABASE_URL = String(process.env.FIREBASE_DATABASE_URL || "");
+const FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 = String(
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 || ""
+);
+const FIREBASE_SERVICE_ACCOUNT_JSON = String(
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON || ""
+);
+const FIREBASE_WEB_API_KEY = String(process.env.FIREBASE_WEB_API_KEY || "");
+const FIREBASE_STORAGE_BUCKET = String(process.env.FIREBASE_STORAGE_BUCKET || "");
+
+const MP_PUBLIC_KEY = String(process.env.MERCADO_PAGO_PUBLIC_KEY || "");
+const MP_ACCESS_TOKEN = String(process.env.MERCADO_PAGO_ACCESS_TOKEN || "");
+const MP_WEBHOOK_URL = String(
+  process.env.MP_WEBHOOK_URL ||
+    process.env.MERCADO_PAGO_WEBHOOK_URL ||
+    `${APP_BASE_URL}/api/mercadopago/webhook`
+);
+
+const PAYMENT_SUCCESS_URL = String(
+  process.env.PAYMENT_SUCCESS_URL || `${APP_BASE_URL}/success`
+);
+const PAYMENT_PENDING_URL = String(
+  process.env.PAYMENT_PENDING_URL || `${APP_BASE_URL}/pending`
+);
+const PAYMENT_FAILURE_URL = String(
+  process.env.PAYMENT_FAILURE_URL || `${APP_BASE_URL}/failure`
+);
+const PASSWORD_RESET_URL = String(
+  process.env.PASSWORD_RESET_URL || `${APP_BASE_URL}/reset-password`
+);
+
+const SMTP_HOST = String(process.env.SMTP_HOST || "");
+const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
+const SMTP_SECURE =
+  String(process.env.SMTP_SECURE || "true").toLowerCase() === "true";
+const SMTP_USER = String(process.env.SMTP_USER || "");
+const SMTP_PASS = String(process.env.SMTP_PASS || "");
+const MAIL_FROM_NAME = String(process.env.MAIL_FROM_NAME || "FireRank");
+const MAIL_FROM_EMAIL = String(process.env.MAIL_FROM_EMAIL || SMTP_USER || "");
+
+const REQUIRE_APP_CHECK =
+  String(process.env.REQUIRE_APP_CHECK || "false").toLowerCase() === "true";
+const ENFORCE_GOOGLE_PLAY_BILLING =
+  String(process.env.ENFORCE_GOOGLE_PLAY_BILLING || "false").toLowerCase() ===
+  "true";
+const INTERNAL_MAINTENANCE_SECRET = String(
+  process.env.INTERNAL_MAINTENANCE_SECRET || ""
+);
+const MEDIA_TOKEN_SECRET = String(process.env.MEDIA_TOKEN_SECRET || "");
+const BOOST_CATALOG_JSON = String(process.env.BOOST_CATALOG_JSON || "");
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const MEDIA_UPLOAD_TOKEN_TTL_MS = 2 * HOUR_MS;
+const MAX_MEDIA_BYTES = 12 * 1024 * 1024;
+const MAX_PRODUCT_IMAGES = 8;
+const MAX_VARIANT_COMBINATIONS = 60;
+
+function safe(value) {
+  return String(value ?? "").trim();
 }
 
 function nowMs() {
   return Date.now();
 }
 
-function isValidEmail(email) {
-  const e = safe(email).toLowerCase();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+function bool(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (value === 1 || value === "1" || value === "true") return true;
+  if (value === 0 || value === "0" || value === "false") return false;
+  return fallback;
 }
 
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+function integer(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isInteger(n) ? n : fallback;
 }
 
-function maskEmail(email) {
-  const e = safe(email);
-  const parts = e.split("@");
-  if (parts.length !== 2) return e;
-  const name = parts[0];
-  const domain = parts[1];
-  const visible = name.length <= 2 ? name[0] || "*" : `${name[0]}${name[1]}`;
-  return `${visible}***@${domain}`;
+function finiteNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-function mpHeaders() {
-  return {
-    Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-    "Content-Type": "application/json",
-  };
+function isObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
 }
 
-function ensureMP() {
-  if (!MP_ACCESS_TOKEN) {
-    throw new Error("MERCADO_PAGO_ACCESS_TOKEN não configurado");
-  }
+function map(value) {
+  return isObject(value) ? value : {};
 }
 
-function ensureEmailConfig() {
-  const missing = [];
-
-  if (!SMTP_HOST) missing.push("SMTP_HOST");
-  if (!SMTP_PORT) missing.push("SMTP_PORT");
-  if (!SMTP_USER) missing.push("SMTP_USER");
-  if (!SMTP_PASS) missing.push("SMTP_PASS");
-  if (!MAIL_FROM_EMAIL) missing.push("MAIL_FROM_EMAIL");
-  if (!FIREBASE_WEB_API_KEY) missing.push("FIREBASE_WEB_API_KEY");
-
-  if (missing.length > 0) {
-    throw new Error(`Configuração de e-mail incompleta: ${missing.join(", ")}`);
-  }
+function clip(value, max) {
+  return safe(value).slice(0, max);
 }
 
-function htmlPage(title, message) {
-  return `
-  <!DOCTYPE html>
-  <html lang="pt-BR">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>${escapeHtml(title)}</title>
-      <style>
-        * { box-sizing: border-box; }
-        body {
-          margin: 0;
-          font-family: Arial, sans-serif;
-          background: #0b0b0b;
-          color: #fff;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          min-height: 100vh;
-          padding: 24px;
-        }
-        .card {
-          width: 100%;
-          max-width: 540px;
-          background: rgba(255,255,255,0.06);
-          border: 1px solid rgba(255,255,255,0.08);
-          border-radius: 20px;
-          padding: 24px;
-          box-shadow: 0 18px 60px rgba(0,0,0,.35);
-        }
-        .logo {
-          width: 54px;
-          height: 54px;
-          border-radius: 18px;
-          background: rgba(30,136,229,.16);
-          color: #1E88E5;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 28px;
-          font-weight: 900;
-          margin-bottom: 16px;
-        }
-        h1 {
-          margin: 0 0 12px;
-          font-size: 28px;
-        }
-        p {
-          margin: 0;
-          line-height: 1.5;
-          color: rgba(255,255,255,0.78);
-        }
-        a {
-          color: #1E88E5;
-          font-weight: 800;
-        }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <div class="logo">🔥</div>
-        <h1>${escapeHtml(title)}</h1>
-        <p>${escapeHtml(message)}</p>
-      </div>
-    </body>
-  </html>
-  `;
+function firebaseSafeKey(value) {
+  const text = safe(value);
+  if (!text) return "";
+  return text.replace(/[.#$/[\]]/g, "_");
 }
 
-function resetPasswordPage() {
-  return `
-  <!DOCTYPE html>
-  <html lang="pt-BR">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>Redefinir senha - FireRank</title>
-      <style>
-        * { box-sizing: border-box; }
-        body {
-          margin: 0;
-          min-height: 100vh;
-          font-family: Arial, sans-serif;
-          background:
-            radial-gradient(circle at top, rgba(30,136,229,.22), transparent 34%),
-            linear-gradient(180deg, #050505 0%, #0d0d0d 100%);
-          color: #fff;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          padding: 24px;
-        }
-        .card {
-          width: 100%;
-          max-width: 460px;
-          background: rgba(255,255,255,.07);
-          border: 1px solid rgba(255,255,255,.10);
-          border-radius: 26px;
-          padding: 26px;
-          box-shadow: 0 24px 90px rgba(0,0,0,.45);
-          backdrop-filter: blur(12px);
-        }
-        .brand {
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          margin-bottom: 18px;
-        }
-        .brand-icon {
-          width: 52px;
-          height: 52px;
-          border-radius: 18px;
-          background: rgba(30,136,229,.16);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          color: #1E88E5;
-          font-size: 28px;
-        }
-        .brand-name {
-          font-size: 21px;
-          font-weight: 900;
-          letter-spacing: -.3px;
-        }
-        h1 {
-          margin: 0;
-          font-size: 28px;
-          line-height: 1.1;
-          letter-spacing: -.8px;
-        }
-        .subtitle {
-          margin: 10px 0 20px;
-          color: rgba(255,255,255,.68);
-          font-size: 14px;
-          line-height: 1.45;
-          font-weight: 600;
-        }
-        label {
-          display: block;
-          margin-bottom: 8px;
-          color: rgba(255,255,255,.72);
-          font-size: 13px;
-          font-weight: 800;
-        }
-        input {
-          width: 100%;
-          height: 52px;
-          border: 1px solid rgba(255,255,255,.12);
-          background: rgba(255,255,255,.08);
-          color: white;
-          border-radius: 16px;
-          padding: 0 15px;
-          font-size: 15px;
-          outline: none;
-        }
-        input:focus {
-          border-color: #1E88E5;
-          box-shadow: 0 0 0 3px rgba(30,136,229,.18);
-        }
-        button {
-          width: 100%;
-          height: 52px;
-          margin-top: 16px;
-          border: 0;
-          border-radius: 16px;
-          background: #1E88E5;
-          color: white;
-          font-weight: 900;
-          font-size: 15px;
-          cursor: pointer;
-        }
-        button:disabled {
-          opacity: .6;
-          cursor: not-allowed;
-        }
-        .msg {
-          margin-top: 14px;
-          padding: 12px;
-          border-radius: 14px;
-          background: rgba(255,255,255,.07);
-          color: rgba(255,255,255,.78);
-          font-size: 13px;
-          line-height: 1.4;
-          display: none;
-        }
-        .msg.ok {
-          display: block;
-          border: 1px solid rgba(67, 255, 143, .20);
-          background: rgba(67, 255, 143, .08);
-        }
-        .msg.err {
-          display: block;
-          border: 1px solid rgba(255, 84, 84, .22);
-          background: rgba(255, 84, 84, .09);
-        }
-        .footer {
-          margin-top: 18px;
-          color: rgba(255,255,255,.42);
-          font-size: 12px;
-          text-align: center;
-          line-height: 1.4;
-        }
-      </style>
-    </head>
-    <body>
-      <main class="card">
-        <div class="brand">
-          <div class="brand-icon">🔥</div>
-          <div class="brand-name">FireRank</div>
-        </div>
-
-        <h1>Crie uma nova senha</h1>
-        <p class="subtitle">
-          Digite sua nova senha abaixo. Depois disso, você já poderá voltar para o app e entrar normalmente.
-        </p>
-
-        <form id="form">
-          <label for="password">Nova senha</label>
-          <input id="password" type="password" minlength="6" autocomplete="new-password" placeholder="Mínimo de 6 caracteres" required />
-
-          <label for="confirm" style="margin-top: 12px;">Confirmar senha</label>
-          <input id="confirm" type="password" minlength="6" autocomplete="new-password" placeholder="Digite novamente" required />
-
-          <button id="btn" type="submit">Salvar nova senha</button>
-          <div id="msg" class="msg"></div>
-        </form>
-
-        <div class="footer">
-          Se o link estiver expirado, solicite uma nova recuperação de senha no app FireRank.
-        </div>
-      </main>
-
-      <script>
-        const form = document.getElementById("form");
-        const btn = document.getElementById("btn");
-        const msg = document.getElementById("msg");
-        const params = new URLSearchParams(window.location.search);
-        const oobCode = params.get("oobCode") || params.get("oobcode") || "";
-
-        function show(type, text) {
-          msg.className = "msg " + type;
-          msg.textContent = text;
-        }
-
-        if (!oobCode) {
-          show("err", "Link inválido. Peça uma nova recuperação de senha no app FireRank.");
-          btn.disabled = true;
-        }
-
-        form.addEventListener("submit", async (e) => {
-          e.preventDefault();
-
-          const password = document.getElementById("password").value.trim();
-          const confirm = document.getElementById("confirm").value.trim();
-
-          if (!password || password.length < 6) {
-            show("err", "A senha precisa ter pelo menos 6 caracteres.");
-            return;
-          }
-
-          if (password !== confirm) {
-            show("err", "As senhas não conferem.");
-            return;
-          }
-
-          btn.disabled = true;
-          btn.textContent = "Salvando...";
-
-          try {
-            const response = await fetch("/api/auth/confirm-password-reset", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ oobCode, newPassword: password })
-            });
-
-            const data = await response.json().catch(() => ({}));
-
-            if (!response.ok || !data.ok) {
-              throw new Error(data.error || "Não foi possível redefinir sua senha.");
-            }
-
-            show("ok", "Senha redefinida com sucesso. Agora você já pode voltar ao app FireRank e entrar com sua nova senha.");
-            btn.textContent = "Senha salva";
-          } catch (err) {
-            show("err", err.message || "Link expirado ou inválido. Solicite uma nova recuperação no app.");
-            btn.disabled = false;
-            btn.textContent = "Salvar nova senha";
-          }
-        });
-      </script>
-    </body>
-  </html>
-  `;
+function stableHash(value) {
+  return crypto.createHash("sha256").update(String(value ?? "")).digest("hex");
 }
 
-function buildResetEmailHtml({ resetUrl, email }) {
-  const cleanResetUrl = escapeHtml(resetUrl);
-  const cleanEmail = escapeHtml(email);
-
-  return `
-  <!DOCTYPE html>
-  <html lang="pt-BR">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-      <title>Redefina sua senha do FireRank</title>
-    </head>
-    <body style="margin:0;padding:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#111827;">
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f8;padding:28px 14px;">
-        <tr>
-          <td align="center">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:22px;overflow:hidden;border:1px solid #e5e7eb;">
-              <tr>
-                <td style="background:#0b0b0b;padding:26px 26px 22px;">
-                  <div style="display:inline-block;background:rgba(30,136,229,.16);color:#1E88E5;border-radius:16px;width:50px;height:50px;line-height:50px;text-align:center;font-size:26px;font-weight:900;">🔥</div>
-                  <h1 style="margin:16px 0 0;color:#ffffff;font-size:26px;line-height:1.15;">Redefina sua senha</h1>
-                  <p style="margin:8px 0 0;color:rgba(255,255,255,.72);font-size:14px;line-height:1.45;">Solicitação de recuperação da sua conta FireRank.</p>
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:26px;">
-                  <p style="margin:0 0 14px;font-size:15px;line-height:1.55;color:#374151;">Olá,</p>
-                  <p style="margin:0 0 14px;font-size:15px;line-height:1.55;color:#374151;">
-                    Recebemos uma solicitação para redefinir a senha da conta FireRank vinculada a:
-                  </p>
-                  <p style="margin:0 0 20px;font-size:15px;line-height:1.55;color:#111827;font-weight:700;">${cleanEmail}</p>
-                  <p style="margin:0 0 22px;font-size:15px;line-height:1.55;color:#374151;">
-                    Clique no botão abaixo para criar uma nova senha:
-                  </p>
-
-                  <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 22px;">
-                    <tr>
-                      <td style="background:#1E88E5;border-radius:14px;">
-                        <a href="${cleanResetUrl}" style="display:inline-block;padding:14px 22px;color:#ffffff;text-decoration:none;font-weight:900;font-size:15px;">
-                          Redefinir minha senha
-                        </a>
-                      </td>
-                    </tr>
-                  </table>
-
-                  <p style="margin:0 0 14px;font-size:13px;line-height:1.55;color:#6b7280;">
-                    Se o botão não funcionar, copie e cole este link no navegador:
-                  </p>
-                  <p style="margin:0 0 20px;font-size:12px;line-height:1.55;color:#1E88E5;word-break:break-all;">
-                    <a href="${cleanResetUrl}" style="color:#1E88E5;">${cleanResetUrl}</a>
-                  </p>
-
-                  <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:16px;padding:14px;margin:0 0 20px;">
-                    <p style="margin:0;font-size:13px;line-height:1.5;color:#6b7280;">
-                      Se você não solicitou essa alteração, ignore este e-mail. Sua senha atual continuará a mesma.
-                    </p>
-                  </div>
-
-                  <p style="margin:0;font-size:15px;line-height:1.55;color:#374151;">Obrigado,</p>
-                  <p style="margin:4px 0 0;font-size:15px;line-height:1.55;color:#111827;font-weight:900;">Equipe FireRank</p>
-                </td>
-              </tr>
-            </table>
-
-            <p style="max-width:560px;margin:14px auto 0;font-size:11px;line-height:1.45;color:#9ca3af;text-align:center;">
-              Este e-mail foi enviado automaticamente pelo FireRank.
-            </p>
-          </td>
-        </tr>
-      </table>
-    </body>
-  </html>
-  `;
-}
-
-function buildResetEmailText({ resetUrl, email }) {
-  return [
-    "Olá,",
-    "",
-    `Recebemos uma solicitação para redefinir a senha da conta FireRank vinculada a ${email}.`,
-    "",
-    "Para criar uma nova senha, acesse o link abaixo:",
-    resetUrl,
-    "",
-    "Se você não solicitou essa alteração, ignore este e-mail.",
-    "",
-    "Equipe FireRank",
-  ].join("\n");
-}
-
-function getMailTransporter() {
-  ensureEmailConfig();
-
-  return nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: SMTP_PORT,
-    secure: SMTP_SECURE,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
-  });
-}
-
-async function sendPasswordResetEmail({ email, resetUrl }) {
-  const transporter = getMailTransporter();
-
-  await transporter.sendMail({
-    from: `"${MAIL_FROM_NAME}" <${MAIL_FROM_EMAIL}>`,
-    to: email,
-    subject: "Redefina sua senha do FireRank",
-    text: buildResetEmailText({ resetUrl, email }),
-    html: buildResetEmailHtml({ resetUrl, email }),
-  });
-}
-
-function canRequestPasswordReset(email) {
-  const key = safe(email).toLowerCase();
-  const last = Number(passwordResetThrottle.get(key) || 0);
-  const t = nowMs();
-
-  if (last && t - last < 60 * 1000) {
-    return false;
-  }
-
-  passwordResetThrottle.set(key, t);
-  return true;
-}
-
-function extractOobCodeFromFirebaseLink(link) {
-  try {
-    const url = new URL(link);
-    const directCode = url.searchParams.get("oobCode");
-
-    if (directCode) return directCode;
-
-    const continueUrl = url.searchParams.get("continueUrl");
-    if (continueUrl) {
-      const nested = new URL(continueUrl);
-      return nested.searchParams.get("oobCode") || "";
-    }
-
-    return "";
-  } catch (_) {
-    return "";
-  }
+function timingSafeEqualText(a, b) {
+  const aBuffer = Buffer.from(String(a ?? ""));
+  const bBuffer = Buffer.from(String(b ?? ""));
+  if (aBuffer.length !== bBuffer.length) return false;
+  return crypto.timingSafeEqual(aBuffer, bBuffer);
 }
 
 function normalizePrivateKey(privateKey) {
@@ -575,16 +146,10 @@ function parseServiceAccount() {
   let raw = "";
 
   if (FIREBASE_SERVICE_ACCOUNT_JSON_BASE64) {
-    try {
-      raw = Buffer.from(
-        FIREBASE_SERVICE_ACCOUNT_JSON_BASE64.trim(),
-        "base64"
-      ).toString("utf8");
-    } catch (_) {
-      throw new Error(
-        "FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 inválido ou malformado"
-      );
-    }
+    raw = Buffer.from(
+      FIREBASE_SERVICE_ACCOUNT_JSON_BASE64.trim(),
+      "base64"
+    ).toString("utf8");
   } else if (FIREBASE_SERVICE_ACCOUNT_JSON) {
     raw = FIREBASE_SERVICE_ACCOUNT_JSON.trim();
   } else {
@@ -593,1762 +158,8992 @@ function parseServiceAccount() {
     );
   }
 
-  let serviceAccount;
+  const serviceAccount = JSON.parse(raw);
 
-  try {
-    serviceAccount = JSON.parse(raw);
-  } catch (_) {
-    throw new Error("JSON da service account inválido");
-  }
-
-  if (!serviceAccount.private_key) {
-    throw new Error("private_key ausente na service account");
+  if (!serviceAccount.private_key || !serviceAccount.project_id) {
+    throw new Error("Service account Firebase incompleta");
   }
 
   serviceAccount.private_key = normalizePrivateKey(serviceAccount.private_key);
-
-  if (
-    !serviceAccount.private_key.includes("-----BEGIN PRIVATE KEY-----") ||
-    !serviceAccount.private_key.includes("-----END PRIVATE KEY-----")
-  ) {
-    throw new Error("private_key inválida: cabeçalho PEM ausente");
-  }
-
   return serviceAccount;
 }
 
-function initFirebase() {
-  if (admin.apps.length > 0) {
-    return admin.database();
-  }
+if (!FIREBASE_DATABASE_URL) {
+  throw new Error("FIREBASE_DATABASE_URL não configurado");
+}
 
-  if (!FIREBASE_DATABASE_URL) {
-    throw new Error("FIREBASE_DATABASE_URL não configurado");
-  }
+const serviceAccount = parseServiceAccount();
+const resolvedStorageBucket =
+  FIREBASE_STORAGE_BUCKET || `${serviceAccount.project_id}.firebasestorage.app`;
 
-  const serviceAccount = parseServiceAccount();
-
+if (admin.apps.length === 0) {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
     databaseURL: FIREBASE_DATABASE_URL,
-  });
-
-  return admin.database();
-}
-
-const db = initFirebase();
-
-function firebaseSafeKey(value) {
-  const s = safe(value);
-  if (!s) return "";
-  return s.replace(/[.#$/[\]]/g, "_");
-}
-
-function normalizePaymentStatus(status) {
-  const s = safe(status).toLowerCase();
-
-  if (s === "approved") return "approved";
-  if (s === "paid") return "approved";
-  if (s === "confirmed") return "approved";
-  if (s === "active") return "approved";
-  if (s === "pending") return "pending";
-  if (s === "in_process") return "in_process";
-  if (s === "rejected") return "rejected";
-  if (s === "cancelled") return "cancelled";
-  if (s === "canceled") return "cancelled";
-  if (s === "refunded") return "refunded";
-  if (s === "charged_back") return "charged_back";
-
-  return s || "pending";
-}
-
-function isPaymentApproved(status) {
-  return normalizePaymentStatus(status) === "approved";
-}
-
-function isPaymentPending(status) {
-  const s = normalizePaymentStatus(status);
-  return s === "pending" || s === "in_process";
-}
-
-function planToDays(plan, fallbackDays = 1) {
-  const p = safe(plan).toLowerCase();
-
-  if (p === "one_day" || p === "1_day" || p === "day_1") return 1;
-  if (p === "two_days" || p === "2_days" || p === "day_2") return 2;
-  if (p === "three_days" || p === "3_days" || p === "day_3") return 3;
-  if (p === "seven_days" || p === "7_days" || p === "week") return 7;
-  if (p === "monthly" || p === "month" || p === "30_days") return 30;
-  if (p === "yearly" || p === "year" || p === "365_days") return 365;
-
-  const n = Number(fallbackDays);
-  return Number.isFinite(n) && n > 0 ? Math.round(n) : 1;
-}
-
-function planFromDays(days) {
-  const d = Number(days);
-
-  if (d === 1) return "one_day";
-  if (d === 2) return "two_days";
-  if (d === 3) return "three_days";
-  if (d === 7) return "seven_days";
-  if (d === 30) return "monthly";
-  if (d === 365) return "yearly";
-
-  return `${d}_days`;
-}
-
-function extractUidFromVerificationExternalReference(externalReference) {
-  const ref = safe(externalReference);
-
-  if (!ref.startsWith("verification_")) return "";
-
-  const parts = ref.split("_");
-
-  if (parts.length < 2) return "";
-
-  return safe(parts[1]);
-}
-
-function getPaymentPreferenceId(paymentDetail) {
-  return safe(
-    paymentDetail.metadata?.preference_id ||
-      paymentDetail.metadata?.preferenceId ||
-      paymentDetail.order?.id ||
-      paymentDetail.additional_info?.items?.[0]?.id
-  );
-}
-
-function getPaymentExternalReference(paymentDetail) {
-  return safe(paymentDetail.external_reference);
-}
-
-function detectRequestTypeFromBody(body) {
-  const raw = safe(
-    body.type ||
-      body.paymentType ||
-      body.payment_type ||
-      body.requestType ||
-      body.request_type ||
-      body.kind ||
-      body.metadata?.type ||
-      body.metadata?.payment_type
-  ).toLowerCase();
-
-  if (
-    raw === "verification" ||
-    raw === "verified" ||
-    raw === "selo" ||
-    raw === "selo_verificado"
-  ) {
-    return "verification";
-  }
-
-  if (
-    raw === "boost" ||
-    raw === "ad" ||
-    raw === "ads" ||
-    raw === "advertisement" ||
-    raw === "turbinado" ||
-    raw === "impulsionamento"
-  ) {
-    return "boost";
-  }
-
-  const externalReference = safe(
-    body.externalReference || body.external_reference
-  );
-
-  if (externalReference.startsWith("verification_")) return "verification";
-  if (
-    externalReference.startsWith("boost_") ||
-    externalReference.startsWith("ad_") ||
-    externalReference.startsWith("ads_")
-  ) {
-    return "boost";
-  }
-
-  if (body.productId || body.product_id || body.adId || body.ad_id) {
-    return "boost";
-  }
-
-  return "verification";
-}
-
-function detectRequestTypeFromPayment(paymentDetail) {
-  const metadata = paymentDetail.metadata || {};
-  const raw = safe(
-    metadata.type ||
-      metadata.payment_type ||
-      metadata.request_type ||
-      metadata.kind
-  ).toLowerCase();
-
-  const externalReference = getPaymentExternalReference(paymentDetail);
-
-  if (
-    raw === "verification" ||
-    raw === "verified" ||
-    raw === "selo" ||
-    raw === "selo_verificado"
-  ) {
-    return "verification";
-  }
-
-  if (
-    raw === "boost" ||
-    raw === "ad" ||
-    raw === "ads" ||
-    raw === "advertisement" ||
-    raw === "turbinado" ||
-    raw === "impulsionamento"
-  ) {
-    return "boost";
-  }
-
-  if (externalReference.startsWith("verification_")) return "verification";
-
-  if (
-    externalReference.startsWith("boost_") ||
-    externalReference.startsWith("ad_") ||
-    externalReference.startsWith("ads_")
-  ) {
-    return "boost";
-  }
-
-  if (
-    metadata.product_id ||
-    metadata.productId ||
-    metadata.ad_id ||
-    metadata.adId ||
-    metadata.seller_uid ||
-    metadata.sellerUid
-  ) {
-    return "boost";
-  }
-
-  return "unknown";
-}
-
-async function fetchMercadoPagoPayment(paymentId) {
-  const response = await axios.get(
-    `https://api.mercadopago.com/v1/payments/${paymentId}`,
-    { headers: mpHeaders() }
-  );
-
-  return response.data || {};
-}
-
-async function findFirstByChild(path, child, value) {
-  const v = safe(value);
-  if (!v) return null;
-
-  const snap = await db.ref(path).orderByChild(child).equalTo(v).get();
-
-  if (!snap.exists()) return null;
-
-  let found = null;
-
-  snap.forEach((childSnap) => {
-    if (!found) {
-      found = {
-        key: childSnap.key,
-        value: childSnap.val() || {},
-      };
-    }
-  });
-
-  return found;
-}
-
-async function logPaymentWebhook(paymentDetail, requestType) {
-  const paymentId = safe(paymentDetail.id);
-  const key = firebaseSafeKey(paymentId || `webhook_${nowMs()}`);
-  const t = nowMs();
-
-  await db.ref(`payment_webhooks/${key}`).set({
-    paymentId,
-    requestType,
-    provider: "mercado_pago",
-    status: normalizePaymentStatus(paymentDetail.status),
-    externalReference: getPaymentExternalReference(paymentDetail),
-    gatewayPreferenceId: getPaymentPreferenceId(paymentDetail),
-    createdAtMs: t,
-    updatedAtMs: t,
-    processed: true,
+    storageBucket: resolvedStorageBucket,
   });
 }
 
-async function updateVerificationPaymentRecords({
-  uid,
-  requestId,
-  gatewayPaymentId,
-  gatewayPreferenceId,
-  paymentStatus,
-  updatedAtMs,
-  rawStatusDetail,
-}) {
-  const updates = {};
+const db = admin.database();
+const storageBucket = admin.storage().bucket(resolvedStorageBucket);
 
-  const paymentKey = firebaseSafeKey(
-    gatewayPaymentId || requestId || gatewayPreferenceId || `verification_${uid}`
+const allowedOrigins = String(process.env.CORS_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (
+        !origin ||
+        allowedOrigins.length === 0 ||
+        allowedOrigins.includes(origin)
+      ) {
+        return callback(null, true);
+      }
+
+      return callback(
+        new Error("CORS_ORIGIN_NOT_ALLOWED")
+      );
+    },
+    credentials: false,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+      "Authorization",
+      "Content-Type",
+      "X-Firebase-AppCheck",
+      "X-Firebase-AppCheck-Token",
+      "X-FireRank-Schema",
+      "X-FireRank-Internal-Secret",
+    ],
+  })
+);
+
+app.use((req, res, next) => {
+  res.setHeader(
+    "X-Content-Type-Options",
+    "nosniff"
+  );
+  res.setHeader(
+    "X-Frame-Options",
+    "DENY"
+  );
+  res.setHeader(
+    "Referrer-Policy",
+    "no-referrer"
+  );
+  res.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=()"
+  );
+  res.setHeader(
+    "Cross-Origin-Resource-Policy",
+    "cross-origin"
   );
 
-  if (paymentKey) {
-    updates[`verification_payments/${paymentKey}/uid`] = uid;
-    updates[`verification_payments/${paymentKey}/requestId`] = requestId;
-    updates[`verification_payments/${paymentKey}/status`] = paymentStatus;
-    updates[`verification_payments/${paymentKey}/provider`] = "mercado_pago";
-    updates[`verification_payments/${paymentKey}/updatedAtMs`] = updatedAtMs;
+  next();
+});
 
-    if (gatewayPaymentId) {
-      updates[`verification_payments/${paymentKey}/gatewayPaymentId`] =
-        gatewayPaymentId;
+app.use(
+  express.json({
+    limit: "2mb",
+  })
+);
+
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: "2mb",
+  })
+);
+
+const rateBuckets = new Map();
+
+function rateLimit(
+  name,
+  max,
+  windowMs
+) {
+  return (req, res, next) => {
+    const key =
+      `${name}:${req.auth?.uid || req.ip || "unknown"}`;
+
+    const t = nowMs();
+
+    const current =
+      rateBuckets.get(key);
+
+    if (
+      !current ||
+      current.resetAtMs <= t
+    ) {
+      rateBuckets.set(
+        key,
+        {
+          count: 1,
+          resetAtMs: t + windowMs,
+        }
+      );
+
+      return next();
     }
 
-    if (gatewayPreferenceId) {
-      updates[`verification_payments/${paymentKey}/gatewayPreferenceId`] =
-        gatewayPreferenceId;
-    }
+    current.count += 1;
 
-    if (rawStatusDetail) {
-      updates[`verification_payments/${paymentKey}/rawStatusDetail`] =
-        rawStatusDetail;
-    }
-  }
+    if (
+      current.count > max
+    ) {
+      res.setHeader(
+        "Retry-After",
+        Math.max(
+          1,
+          Math.ceil(
+            (current.resetAtMs - t) / 1000
+          )
+        ).toString()
+      );
 
-  if (requestId) {
-    const byRequestId = await db
-      .ref("verification_payments")
-      .orderByChild("requestId")
-      .equalTo(requestId)
-      .get();
-
-    if (byRequestId.exists()) {
-      byRequestId.forEach((child) => {
-        updates[`verification_payments/${child.key}/uid`] = uid;
-        updates[`verification_payments/${child.key}/status`] = paymentStatus;
-        updates[`verification_payments/${child.key}/updatedAtMs`] = updatedAtMs;
-
-        if (gatewayPaymentId) {
-          updates[`verification_payments/${child.key}/gatewayPaymentId`] =
-            gatewayPaymentId;
-        }
-
-        if (gatewayPreferenceId) {
-          updates[`verification_payments/${child.key}/gatewayPreferenceId`] =
-            gatewayPreferenceId;
-        }
-
-        if (rawStatusDetail) {
-          updates[`verification_payments/${child.key}/rawStatusDetail`] =
-            rawStatusDetail;
-        }
+      return res.status(429).json({
+        ok: false,
+        code: "RATE_LIMITED",
+        message:
+          "Muitas tentativas. Aguarde um pouco.",
       });
     }
-  }
 
-  if (gatewayPreferenceId) {
-    const byPreference = await db
-      .ref("verification_payments")
-      .orderByChild("gatewayPreferenceId")
-      .equalTo(gatewayPreferenceId)
-      .get();
+    rateBuckets.set(
+      key,
+      current
+    );
 
-    if (byPreference.exists()) {
-      byPreference.forEach((child) => {
-        updates[`verification_payments/${child.key}/uid`] = uid;
-        updates[`verification_payments/${child.key}/status`] = paymentStatus;
-        updates[`verification_payments/${child.key}/updatedAtMs`] = updatedAtMs;
-
-        if (gatewayPaymentId) {
-          updates[`verification_payments/${child.key}/gatewayPaymentId`] =
-            gatewayPaymentId;
-        }
-
-        if (rawStatusDetail) {
-          updates[`verification_payments/${child.key}/rawStatusDetail`] =
-            rawStatusDetail;
-        }
-      });
-    }
-  }
-
-  if (Object.keys(updates).length > 0) {
-    await db.ref().update(updates);
-  }
+    return next();
+  };
 }
 
-async function handleVerificationPayment(paymentDetail) {
+setInterval(() => {
   const t = nowMs();
 
-  const paymentId = safe(paymentDetail.id);
-  const paymentStatus = normalizePaymentStatus(paymentDetail.status);
-  const statusDetail = safe(paymentDetail.status_detail);
-  const externalReference = getPaymentExternalReference(paymentDetail);
-  const preferenceId = getPaymentPreferenceId(paymentDetail);
-  const metadata = paymentDetail.metadata || {};
+  for (
+    const [key, value]
+    of rateBuckets.entries()
+  ) {
+    if (
+      !value ||
+      value.resetAtMs <= t
+    ) {
+      rateBuckets.delete(key);
+    }
+  }
+}, 10 * 60 * 1000).unref();
 
-  let uid = safe(
-    metadata.uid ||
-      metadata.user_uid ||
-      metadata.userUid ||
-      metadata.seller_uid ||
-      metadata.sellerUid
-  );
+function bearerToken(req) {
+  const header =
+    safe(req.headers.authorization);
 
-  if (!uid) {
-    uid = extractUidFromVerificationExternalReference(externalReference);
+  if (
+    !header
+      .toLowerCase()
+      .startsWith("bearer ")
+  ) {
+    return "";
   }
 
-  if (!uid) {
-    console.log("Webhook de verificação ignorado: uid ausente", {
-      externalReference,
-      paymentId,
-      paymentStatus,
-    });
+  return header
+    .slice(7)
+    .trim();
+}
+
+async function verifyAppCheckIfRequired(
+  req
+) {
+  if (!REQUIRE_APP_CHECK) {
     return;
   }
 
-  const requestRef = db.ref(`verification_requests/${uid}`);
-  const requestSnap = await requestRef.get();
-  const requestData = requestSnap.exists() ? requestSnap.val() || {} : {};
-
-  const requestId = safe(
-    requestData.requestId ||
-      requestData.externalReference ||
-      metadata.request_id ||
-      metadata.requestId ||
-      externalReference ||
-      `verification_${uid}_${t}`
+  const token = safe(
+    req.headers["x-firebase-appcheck"] ||
+      req.headers[
+        "x-firebase-appcheck-token"
+      ]
   );
 
-  const plan = safe(
-    requestData.plan ||
-      metadata.plan ||
-      metadata.verification_plan ||
-      "monthly"
-  );
+  if (!token) {
+    const error =
+      new Error(
+        "APP_CHECK_REQUIRED"
+      );
 
-  const days = planToDays(plan, requestData.days || metadata.days || 30);
+    error.statusCode = 401;
 
-  const oldExpiresAt = Number(requestData.expiresAtMs || 0);
-  const startsAtMs = t;
-  const expiresAtMs =
-    oldExpiresAt > t && isPaymentApproved(paymentStatus)
-      ? oldExpiresAt
-      : t + days * DAY_MS;
-
-  const updates = {
-    [`verification_requests/${uid}/uid`]: uid,
-    [`verification_requests/${uid}/requestId`]: requestId,
-    [`verification_requests/${uid}/paymentStatus`]: paymentStatus,
-    [`verification_requests/${uid}/gatewayPaymentId`]: paymentId,
-    [`verification_requests/${uid}/gatewayPreferenceId`]: preferenceId,
-    [`verification_requests/${uid}/paymentProvider`]: "mercado_pago",
-    [`verification_requests/${uid}/updatedAtMs`]: t,
-
-    [`users/${uid}/verificationPaymentStatus`]: paymentStatus,
-    [`users/${uid}/updatedAtMs`]: t,
-  };
-
-  if (statusDetail) {
-    updates[`verification_requests/${uid}/rawStatusDetail`] = statusDetail;
+    throw error;
   }
 
-  if (isPaymentApproved(paymentStatus)) {
-    updates[`verification_requests/${uid}/status`] = "active";
-    updates[`verification_requests/${uid}/verifiedStatus`] = "active";
-    updates[`verification_requests/${uid}/adminStatus`] = "auto_approved";
-    updates[`verification_requests/${uid}/approvedAtMs`] = t;
-    updates[`verification_requests/${uid}/startsAtMs`] = startsAtMs;
-    updates[`verification_requests/${uid}/expiresAtMs`] = expiresAtMs;
-    updates[`verification_requests/${uid}/autoActivated`] = true;
-    updates[`verification_requests/${uid}/requiresAdminApproval`] = false;
+  await admin
+    .appCheck()
+    .verifyToken(token);
+}
 
-    updates[`users/${uid}/verified`] = true;
-    updates[`users/${uid}/verificationStatus`] = "active";
-    updates[`users/${uid}/verifiedAtMs`] = t;
-    updates[`users/${uid}/verificationExpiresAtMs`] = expiresAtMs;
-    updates[`users/${uid}/verificationSubscription/status`] = "active";
-    updates[`users/${uid}/verificationSubscription/active`] = true;
-    updates[`users/${uid}/verificationSubscription/plan`] = plan;
-    updates[`users/${uid}/verificationSubscription/startsAtMs`] = startsAtMs;
-    updates[`users/${uid}/verificationSubscription/expiresAtMs`] = expiresAtMs;
-    updates[`users/${uid}/verificationSubscription/paymentProvider`] =
-      "mercado_pago";
-    updates[`users/${uid}/verificationSubscription/gatewayPaymentId`] =
-      paymentId;
-    updates[`users/${uid}/verificationSubscription/gatewayPreferenceId`] =
-      preferenceId;
-    updates[`users/${uid}/verificationSubscription/autoActivated`] = true;
-    updates[`users/${uid}/verificationSubscription/updatedAtMs`] = t;
+async function requireUser(
+  req,
+  res,
+  next
+) {
+  try {
+    const token =
+      bearerToken(req);
 
-    updates[`verified_users/${uid}/uid`] = uid;
-    updates[`verified_users/${uid}/active`] = true;
-    updates[`verified_users/${uid}/status`] = "active";
-    updates[`verified_users/${uid}/source`] = "payment_auto_activation";
-    updates[`verified_users/${uid}/paymentProvider`] = "mercado_pago";
-    updates[`verified_users/${uid}/gatewayPaymentId`] = paymentId;
-    updates[`verified_users/${uid}/startsAtMs`] = startsAtMs;
-    updates[`verified_users/${uid}/expiresAtMs`] = expiresAtMs;
-    updates[`verified_users/${uid}/updatedAtMs`] = t;
+    if (!token) {
+      return res
+        .status(401)
+        .json({
+          ok: false,
+          code:
+            "AUTH_REQUIRED",
+          message:
+            "Autenticação necessária.",
+        });
+    }
 
-    updates[`admin_actions/AUTO_VERIFICATION_${uid}_${t}/actionId`] =
-      `AUTO_VERIFICATION_${uid}_${t}`;
-    updates[`admin_actions/AUTO_VERIFICATION_${uid}_${t}/actor`] =
-      "payment_webhook";
-    updates[`admin_actions/AUTO_VERIFICATION_${uid}_${t}/type`] =
-      "auto_approved_verification";
-    updates[`admin_actions/AUTO_VERIFICATION_${uid}_${t}/targetUid`] = uid;
-    updates[`admin_actions/AUTO_VERIFICATION_${uid}_${t}/createdAtMs`] = t;
-    updates[`admin_actions/AUTO_VERIFICATION_${uid}_${t}/message`] =
-      "Selo verificado ativado automaticamente após pagamento aprovado.";
+    await verifyAppCheckIfRequired(
+      req
+    );
 
-    updates[`notifications/${uid}/verification-payment-${t}/title`] =
-      "Selo verificado ativado";
-    updates[`notifications/${uid}/verification-payment-${t}/body`] =
-      "Seu pagamento foi aprovado e seu selo verificado já está ativo automaticamente.";
-    updates[`notifications/${uid}/verification-payment-${t}/type`] =
-      "verification_auto_activated";
-    updates[`notifications/${uid}/verification-payment-${t}/read`] = false;
-    updates[`notifications/${uid}/verification-payment-${t}/createdAtMs`] = t;
-  } else if (isPaymentPending(paymentStatus)) {
-    updates[`verification_requests/${uid}/status`] = "pending_payment";
-    updates[`verification_requests/${uid}/verifiedStatus`] = "payment_pending";
-    updates[`verification_requests/${uid}/adminStatus`] = "none";
-    updates[`verification_requests/${uid}/autoActivated`] = false;
-    updates[`verification_requests/${uid}/requiresAdminApproval`] = false;
+    const decoded =
+      await admin
+        .auth()
+        .verifyIdToken(
+          token,
+          true
+        );
 
-    updates[`users/${uid}/verificationStatus`] = "payment_pending";
-    updates[`users/${uid}/verified`] = false;
-  } else {
-    updates[`verification_requests/${uid}/status`] = "payment_failed";
-    updates[`verification_requests/${uid}/verifiedStatus`] = "payment_failed";
-    updates[`verification_requests/${uid}/adminStatus`] = "none";
-    updates[`verification_requests/${uid}/autoActivated`] = false;
-    updates[`verification_requests/${uid}/requiresAdminApproval`] = false;
+    const provider =
+      safe(
+        decoded.firebase
+          ?.sign_in_provider
+      ).toLowerCase();
 
-    updates[`users/${uid}/verificationStatus`] = "payment_failed";
-    updates[`users/${uid}/verified`] = false;
+    if (
+      !decoded.uid ||
+      provider === "anonymous"
+    ) {
+      return res
+        .status(403)
+        .json({
+          ok: false,
+          code:
+            "FULL_ACCOUNT_REQUIRED",
+          message:
+            "Use uma conta completa para esta ação.",
+        });
+    }
 
-    updates[`notifications/${uid}/verification-payment-${t}/title`] =
-      "Pagamento do selo não aprovado";
-    updates[`notifications/${uid}/verification-payment-${t}/body`] =
-      "O pagamento do selo não foi aprovado. Você pode tentar novamente no app.";
-    updates[`notifications/${uid}/verification-payment-${t}/type`] =
-      "verification_payment_failed";
-    updates[`notifications/${uid}/verification-payment-${t}/read`] = false;
-    updates[`notifications/${uid}/verification-payment-${t}/createdAtMs`] = t;
+    req.auth = decoded;
+
+    return next();
+  } catch (error) {
+    if (
+      NODE_ENV !== "production"
+    ) {
+      console.error(
+        "Auth middleware:",
+        error.message
+      );
+    }
+
+    return res
+      .status(
+        error.statusCode || 401
+      )
+      .json({
+        ok: false,
+        code:
+          "INVALID_SESSION",
+        message:
+          "Sessão inválida ou expirada.",
+      });
+  }
+}
+
+function requireInternalSecret(
+  req,
+  res,
+  next
+) {
+  if (
+    !INTERNAL_MAINTENANCE_SECRET
+  ) {
+    return res
+      .status(503)
+      .json({
+        ok: false,
+        code:
+          "MAINTENANCE_SECRET_NOT_CONFIGURED",
+        message:
+          "Manutenção interna não configurada.",
+      });
   }
 
-  await db.ref().update(updates);
+  const supplied =
+    safe(
+      req.headers[
+        "x-firerank-internal-secret"
+      ]
+    );
 
-  await updateVerificationPaymentRecords({
-    uid,
-    requestId,
-    gatewayPaymentId: paymentId,
-    gatewayPreferenceId: preferenceId,
-    paymentStatus,
-    updatedAtMs: t,
-    rawStatusDetail: statusDetail,
+  if (
+    !supplied ||
+    !timingSafeEqualText(
+      supplied,
+      INTERNAL_MAINTENANCE_SECRET
+    )
+  ) {
+    return res
+      .status(401)
+      .json({
+        ok: false,
+        code:
+          "INTERNAL_AUTH_REQUIRED",
+        message:
+          "Não autorizado.",
+      });
+  }
+
+  return next();
+}
+
+async function appendAudit(
+  type,
+  data = {}
+) {
+  const ref =
+    db.ref(
+      "audit_logs"
+    ).push();
+
+  const eventId =
+    ref.key;
+
+  await ref.set({
+    eventId,
+    type:
+      clip(
+        type,
+        80
+      ),
+    actorType:
+      clip(
+        data.actorType ||
+          "backend",
+        40
+      ),
+    actorUid:
+      clip(
+        data.actorUid || "",
+        128
+      ),
+    targetUid:
+      clip(
+        data.targetUid || "",
+        128
+      ),
+    referenceId:
+      clip(
+        data.referenceId || "",
+        180
+      ),
+    status:
+      clip(
+        data.status || "ok",
+        60
+      ),
+    createdAtMs:
+      nowMs(),
+    immutable:
+      true,
   });
 
-  console.log("Webhook de verificação processado:", {
-    uid,
-    externalReference,
-    paymentId,
-    paymentStatus,
-    preferenceId,
+  return eventId;
+}
+
+async function pushNotification(
+  uid,
+  notification
+) {
+  if (!uid) {
+    return;
+  }
+
+  const ref =
+    db
+      .ref(
+        `notifications/${uid}`
+      )
+      .push();
+
+  await ref.set({
+    title:
+      clip(
+        notification.title,
+        120
+      ),
+    body:
+      clip(
+        notification.body,
+        500
+      ),
+    type:
+      clip(
+        notification.type ||
+          "system",
+        80
+      ),
+    read:
+      false,
+    createdAtMs:
+      nowMs(),
+    data:
+      map(
+        notification.data
+      ),
   });
 }
 
-async function findBoostRequest({
-  externalReference,
-  gatewayPreferenceId,
-  gatewayPaymentId,
-}) {
-  const directKey = firebaseSafeKey(externalReference);
+async function ensurePublicApiConfig() {
+  const t = nowMs();
 
-  if (directKey) {
-    const directSnap = await db.ref(`boost_requests/${directKey}`).get();
-    if (directSnap.exists()) {
-      return {
-        key: directKey,
-        value: directSnap.val() || {},
-      };
+  await db
+    .ref(
+      "public_config/api"
+    )
+    .update({
+      schemaVersion:
+        "4.1.0",
+
+      baseUrl:
+        APP_BASE_URL,
+
+      gatewayBaseUrl:
+        APP_BASE_URL,
+
+      backendBaseUrl:
+        APP_BASE_URL,
+
+      productCreateEndpoint:
+        `${APP_BASE_URL}/v1/products`,
+
+      createProductEndpoint:
+        `${APP_BASE_URL}/v1/products`,
+
+      productUpdateEndpoint:
+        `${APP_BASE_URL}/v1/products/update`,
+
+      updateProductEndpoint:
+        `${APP_BASE_URL}/v1/products/update`,
+
+      mediaUploadEndpoint:
+        `${APP_BASE_URL}/v1/media/product`,
+
+      productMediaUploadEndpoint:
+        `${APP_BASE_URL}/v1/media/product`,
+
+      addressSaveEndpoint:
+        `${APP_BASE_URL}/v1/account/address`,
+
+      saveAddressEndpoint:
+        `${APP_BASE_URL}/v1/account/address`,
+
+      userAddressEndpoint:
+        `${APP_BASE_URL}/v1/account/address`,
+
+      updatedAtMs:
+        t,
+    });
+}
+
+async function getFeatureFlag(
+  name,
+  fallback = false
+) {
+  const snap =
+    await db
+      .ref(
+        `feature_flags/${name}`
+      )
+      .get();
+
+  return snap.exists()
+    ? bool(
+        snap.val(),
+        fallback
+      )
+    : fallback;
+}
+
+async function getAccountVisibility(
+  uid
+) {
+  const snap =
+    await db
+      .ref(
+        `account_visibility/${uid}`
+      )
+      .get();
+
+  const visibility =
+    safe(
+      snap.val()
+    ).toLowerCase();
+
+  return visibility ===
+    "private"
+    ? "private"
+    : "public";
+}
+
+async function assertSellerCanPublish(
+  uid
+) {
+  const [
+    rolesSnap,
+    stateSnap,
+    eligibilitySnap,
+  ] =
+    await Promise.all([
+      db
+        .ref(
+          `user_roles/${uid}`
+        )
+        .get(),
+
+      db
+        .ref(
+          `role_state/${uid}/seller`
+        )
+        .get(),
+
+      db
+        .ref(
+          `eligibility/${uid}`
+        )
+        .get(),
+    ]);
+
+  const roles =
+    map(
+      rolesSnap.val()
+    );
+
+  const state =
+    map(
+      stateSnap.val()
+    );
+
+  const eligibility =
+    map(
+      eligibilitySnap.val()
+    );
+
+  const allowed =
+    roles.seller === true &&
+    state.active === true &&
+    state.accessEnabled === true &&
+    eligibility.canSell === true &&
+    eligibility.needsAgeReview !== true;
+
+  if (!allowed) {
+    const error =
+      new Error(
+        "SELLER_NOT_ELIGIBLE"
+      );
+
+    error.statusCode =
+      403;
+
+    error.publicMessage =
+      "Sua conta ainda não está liberada para publicar produtos.";
+
+    throw error;
+  }
+
+  return {
+    roles,
+    state,
+    eligibility,
+  };
+}
+
+async function resolveStoreForUser(
+  uid,
+  requestedStoreId
+) {
+  const requested =
+    safe(
+      requestedStoreId
+    );
+
+  if (requested) {
+    const memberSnap =
+      await db
+        .ref(
+          `store_members/${requested}/${uid}`
+        )
+        .get();
+
+    const member =
+      map(
+        memberSnap.val()
+      );
+
+    if (
+      member.active !== true
+    ) {
+      const error =
+        new Error(
+          "STORE_MEMBERSHIP_REQUIRED"
+        );
+
+      error.statusCode =
+        403;
+
+      error.publicMessage =
+        "Você não possui acesso a esta loja.";
+
+      throw error;
+    }
+
+    return requested;
+  }
+
+  const indexSnap =
+    await db
+      .ref(
+        `stores_by_user/${uid}`
+      )
+      .get();
+
+  const index =
+    map(
+      indexSnap.val()
+    );
+
+  for (
+    const storeId
+    of Object
+      .keys(index)
+      .slice(0, 20)
+  ) {
+    const memberSnap =
+      await db
+        .ref(
+          `store_members/${storeId}/${uid}`
+        )
+        .get();
+
+    if (
+      map(
+        memberSnap.val()
+      ).active === true
+    ) {
+      return storeId;
     }
   }
 
-  const byRequestId = await findFirstByChild(
-    "boost_requests",
-    "requestId",
-    externalReference
+  const error =
+    new Error(
+      "STORE_REQUIRED"
+    );
+
+  error.statusCode =
+    422;
+
+  error.publicMessage =
+    "Nenhuma loja válida foi encontrada para esta conta.";
+
+  throw error;
+}
+
+function normalizeSearchTerm(
+  value
+) {
+  return safe(value)
+    .normalize("NFD")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
+    .toLowerCase()
+    .replace(
+      /[^a-z0-9]+/g,
+      "_"
+    )
+    .replace(
+      /^_+|_+$/g,
+      ""
+    )
+    .slice(
+      0,
+      80
+    );
+}
+
+function searchTermsForProduct(
+  title,
+  categoryId
+) {
+  const terms =
+    new Set();
+
+  const full =
+    normalizeSearchTerm(
+      title
+    );
+
+  const category =
+    normalizeSearchTerm(
+      categoryId
+    );
+
+  if (full) {
+    terms.add(full);
+  }
+
+  if (category) {
+    terms.add(category);
+  }
+
+  for (
+    const part
+    of safe(title)
+      .split(/\s+/)
+      .slice(0, 12)
+  ) {
+    const term =
+      normalizeSearchTerm(
+        part
+      );
+
+    if (
+      term.length >= 2
+    ) {
+      terms.add(term);
+    }
+
+    if (
+      terms.size >= 12
+    ) {
+      break;
+    }
+  }
+
+  return [...terms];
+}
+
+function makeSignedToken(
+  payload,
+  secret
+) {
+  const body =
+    Buffer
+      .from(
+        JSON.stringify(
+          payload
+        )
+      )
+      .toString(
+        "base64url"
+      );
+
+  const signature =
+    crypto
+      .createHmac(
+        "sha256",
+        secret
+      )
+      .update(body)
+      .digest(
+        "base64url"
+      );
+
+  return `${body}.${signature}`;
+}
+
+function verifySignedToken(
+  token,
+  secret
+) {
+  const parts =
+    safe(token).split(".");
+
+  if (
+    parts.length !== 2
+  ) {
+    throw new Error(
+      "INVALID_MEDIA_TOKEN"
+    );
+  }
+
+  const [
+    body,
+    signature,
+  ] =
+    parts;
+
+  const expected =
+    crypto
+      .createHmac(
+        "sha256",
+        secret
+      )
+      .update(body)
+      .digest(
+        "base64url"
+      );
+
+  if (
+    !timingSafeEqualText(
+      signature,
+      expected
+    )
+  ) {
+    throw new Error(
+      "INVALID_MEDIA_TOKEN"
+    );
+  }
+
+  const payload =
+    JSON.parse(
+      Buffer
+        .from(
+          body,
+          "base64url"
+        )
+        .toString(
+          "utf8"
+        )
+    );
+
+  if (
+    payload.exp &&
+    Number(payload.exp) <
+      nowMs()
+  ) {
+    throw new Error(
+      "EXPIRED_MEDIA_TOKEN"
+    );
+  }
+
+  return payload;
+}
+
+function resolvedMediaTokenSecret() {
+  return (
+    MEDIA_TOKEN_SECRET ||
+    stableHash(
+      serviceAccount.private_key
+    ).slice(
+      0,
+      64
+    )
   );
+}
 
-  if (byRequestId) return byRequestId;
+function parseMultipartSingleFile(
+  req
+) {
+  if (
+    !Buffer.isBuffer(
+      req.body
+    )
+  ) {
+    throw new Error(
+      "MULTIPART_BODY_REQUIRED"
+    );
+  }
 
-  const byExternal = await findFirstByChild(
-    "boost_requests",
-    "externalReference",
-    externalReference
-  );
+  const contentType =
+    safe(
+      req.headers[
+        "content-type"
+      ]
+    );
 
-  if (byExternal) return byExternal;
+  const match =
+    contentType.match(
+      /boundary=(?:"([^"]+)"|([^;]+))/i
+    );
 
-  const byPref = await findFirstByChild(
-    "boost_requests",
-    "gatewayPreferenceId",
-    gatewayPreferenceId
-  );
+  const boundaryText =
+    safe(
+      match?.[1] ||
+        match?.[2]
+    );
 
-  if (byPref) return byPref;
+  if (!boundaryText) {
+    throw new Error(
+      "MULTIPART_BOUNDARY_REQUIRED"
+    );
+  }
 
-  const byPayment = await findFirstByChild(
-    "boost_payments",
-    "gatewayPaymentId",
-    gatewayPaymentId
-  );
+  const delimiter =
+    Buffer.from(
+      `--${boundaryText}`
+    );
 
-  if (byPayment) {
-    const requestId = safe(byPayment.value.requestId);
-    if (requestId) {
-      const requestSnap = await db.ref(`boost_requests/${requestId}`).get();
-      if (requestSnap.exists()) {
-        return {
-          key: requestId,
-          value: requestSnap.val() || {},
+  const endMarker =
+    Buffer.from(
+      `--${boundaryText}--`
+    );
+
+  const fields = {};
+
+  let file = null;
+
+  let cursor =
+    req.body.indexOf(
+      delimiter
+    );
+
+  while (
+    cursor >= 0 &&
+    cursor < req.body.length
+  ) {
+    cursor +=
+      delimiter.length;
+
+    if (
+      req.body
+        .slice(
+          cursor,
+          cursor + 2
+        )
+        .equals(
+          Buffer.from("--")
+        )
+    ) {
+      break;
+    }
+
+    if (
+      req.body
+        .slice(
+          cursor,
+          cursor + 2
+        )
+        .equals(
+          Buffer.from("\r\n")
+        )
+    ) {
+      cursor += 2;
+    }
+
+    const next =
+      req.body.indexOf(
+        delimiter,
+        cursor
+      );
+
+    const terminal =
+      req.body.indexOf(
+        endMarker,
+        cursor
+      );
+
+    let end =
+      next >= 0
+        ? next
+        : terminal;
+
+    if (end < 0) {
+      break;
+    }
+
+    let part =
+      req.body.slice(
+        cursor,
+        end
+      );
+
+    if (
+      part
+        .slice(-2)
+        .equals(
+          Buffer.from("\r\n")
+        )
+    ) {
+      part =
+        part.slice(
+          0,
+          -2
+        );
+    }
+
+    const headerEnd =
+      part.indexOf(
+        Buffer.from(
+          "\r\n\r\n"
+        )
+      );
+
+    if (
+      headerEnd < 0
+    ) {
+      cursor = next;
+      continue;
+    }
+
+    const headerText =
+      part
+        .slice(
+          0,
+          headerEnd
+        )
+        .toString(
+          "latin1"
+        );
+
+    const content =
+      part.slice(
+        headerEnd + 4
+      );
+
+    const disposition =
+      headerText
+        .match(
+          /content-disposition:[^\r\n]+/i
+        )?.[0] || "";
+
+    const name =
+      disposition
+        .match(
+          /name="([^"]+)"/i
+        )?.[1] || "";
+
+    const filename =
+      disposition
+        .match(
+          /filename="([^"]*)"/i
+        )?.[1] || "";
+
+    const mimeType =
+      headerText
+        .match(
+          /content-type:\s*([^\r\n]+)/i
+        )?.[1]
+        ?.trim() || "";
+
+    if (filename) {
+      if (
+        name === "file" &&
+        !file
+      ) {
+        file = {
+          filename:
+            filename.slice(
+              0,
+              180
+            ),
+          mimeType,
+          bytes:
+            content,
         };
       }
+    } else if (name) {
+      fields[name] =
+        content
+          .toString(
+            "utf8"
+          )
+          .slice(
+            0,
+            10000
+          );
+    }
+
+    cursor = next;
+  }
+
+  if (!file) {
+    throw new Error(
+      "MEDIA_FILE_REQUIRED"
+    );
+  }
+
+  return {
+    fields,
+    file,
+  };
+}
+
+function detectImageType(
+  bytes
+) {
+  if (
+    !Buffer.isBuffer(bytes) ||
+    bytes.length < 12
+  ) {
+    return null;
+  }
+
+  if (
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[2] === 0xff
+  ) {
+    return "jpeg";
+  }
+
+  if (
+    bytes
+      .slice(0, 8)
+      .equals(
+        Buffer.from([
+          0x89,
+          0x50,
+          0x4e,
+          0x47,
+          0x0d,
+          0x0a,
+          0x1a,
+          0x0a,
+        ])
+      )
+  ) {
+    return "png";
+  }
+
+  if (
+    bytes
+      .slice(
+        0,
+        4
+      )
+      .toString(
+        "ascii"
+      ) === "RIFF" &&
+    bytes
+      .slice(
+        8,
+        12
+      )
+      .toString(
+        "ascii"
+      ) === "WEBP"
+  ) {
+    return "webp";
+  }
+
+  if (
+    bytes
+      .slice(
+        4,
+        8
+      )
+      .toString(
+        "ascii"
+      ) === "ftyp"
+  ) {
+    const brand =
+      bytes
+        .slice(
+          8,
+          12
+        )
+        .toString(
+          "ascii"
+        )
+        .toLowerCase();
+
+    if (
+      [
+        "heic",
+        "heix",
+        "hevc",
+        "hevx",
+        "mif1",
+        "msf1",
+      ].includes(
+        brand
+      )
+    ) {
+      return "heic";
     }
   }
 
   return null;
 }
 
-async function handleBoostPayment(paymentDetail) {
-  const t = nowMs();
+async function processProductImage(
+  bytes
+) {
+  if (!sharp) {
+    const error =
+      new Error(
+        "MEDIA_PROCESSOR_NOT_INSTALLED"
+      );
 
-  const paymentId = safe(paymentDetail.id);
-  const paymentStatus = normalizePaymentStatus(paymentDetail.status);
-  const statusDetail = safe(paymentDetail.status_detail);
-  const externalReference = getPaymentExternalReference(paymentDetail);
-  const preferenceId = getPaymentPreferenceId(paymentDetail);
-  const metadata = paymentDetail.metadata || {};
+    error.statusCode =
+      503;
 
-  const foundRequest = await findBoostRequest({
-    externalReference,
-    gatewayPreferenceId: preferenceId,
-    gatewayPaymentId: paymentId,
-  });
+    error.publicMessage =
+      'O processador de imagens do servidor ainda não está instalado. Adicione o pacote "sharp".';
 
-  const requestData = foundRequest?.value || {};
-  const requestKey = safe(foundRequest?.key);
-
-  const requestId = safe(
-    requestData.requestId ||
-      metadata.request_id ||
-      metadata.requestId ||
-      externalReference ||
-      requestKey ||
-      `boost_${t}`
-  );
-
-  const sellerUid = safe(
-    requestData.sellerUid ||
-      requestData.seller_uid ||
-      metadata.seller_uid ||
-      metadata.sellerUid ||
-      metadata.uid
-  );
-
-  const productId = safe(
-    requestData.productId ||
-      requestData.product_id ||
-      metadata.product_id ||
-      metadata.productId
-  );
-
-  const adId = safe(
-    requestData.adId ||
-      requestData.ad_id ||
-      metadata.ad_id ||
-      metadata.adId ||
-      requestId
-  );
-
-  const boostId = safe(
-    requestData.boostId ||
-      requestData.boost_id ||
-      metadata.boost_id ||
-      metadata.boostId ||
-      requestId
-  );
-
-  const productTitle = safe(
-    requestData.productTitle ||
-      requestData.product_title ||
-      metadata.product_title ||
-      metadata.productTitle
-  );
-
-  const productImage = safe(
-    requestData.productImage ||
-      requestData.product_image ||
-      metadata.product_image ||
-      metadata.productImage
-  );
-
-  const placement = safe(
-    requestData.placement ||
-      metadata.placement ||
-      "home_hero_horizontal"
-  );
-
-  const plan = safe(
-    requestData.plan ||
-      metadata.plan ||
-      planFromDays(requestData.days || metadata.days || 1)
-  );
-
-  const days = planToDays(plan, requestData.days || metadata.days || 1);
-
-  const price = toNumber(
-    requestData.price ||
-      metadata.price ||
-      paymentDetail.transaction_amount ||
-      paymentDetail.total_paid_amount
-  );
-
-  const startsAtMs = t;
-  const expiresAtMs =
-    Number(requestData.expiresAtMs || 0) > t
-      ? Number(requestData.expiresAtMs)
-      : startsAtMs + days * DAY_MS;
-
-  if (!sellerUid || !productId) {
-    const key = firebaseSafeKey(paymentId || requestId);
-
-    const missingUpdates = {
-      [`payment_integrity_audit/boost_${key}/type`]:
-        "boost_missing_required_fields",
-      [`payment_integrity_audit/boost_${key}/paymentId`]: paymentId,
-      [`payment_integrity_audit/boost_${key}/externalReference`]:
-        externalReference,
-      [`payment_integrity_audit/boost_${key}/gatewayPreferenceId`]:
-        preferenceId,
-      [`payment_integrity_audit/boost_${key}/paymentStatus`]: paymentStatus,
-      [`payment_integrity_audit/boost_${key}/sellerUid`]: sellerUid,
-      [`payment_integrity_audit/boost_${key}/productId`]: productId,
-      [`payment_integrity_audit/boost_${key}/createdAtMs`]: t,
-    };
-
-    await db.ref().update(missingUpdates);
-
-    console.log("Boost ignorado: sellerUid/productId ausente", {
-      paymentId,
-      externalReference,
-      preferenceId,
-      sellerUid,
-      productId,
-    });
-
-    return;
+    throw error;
   }
 
-  const paymentKey = firebaseSafeKey(paymentId || requestId);
-
-  const updates = {
-    [`boost_requests/${requestId}/requestId`]: requestId,
-    [`boost_requests/${requestId}/adId`]: adId,
-    [`boost_requests/${requestId}/boostId`]: boostId,
-    [`boost_requests/${requestId}/sellerUid`]: sellerUid,
-    [`boost_requests/${requestId}/productId`]: productId,
-    [`boost_requests/${requestId}/productTitle`]: productTitle,
-    [`boost_requests/${requestId}/productImage`]: productImage,
-    [`boost_requests/${requestId}/placement`]: placement,
-    [`boost_requests/${requestId}/plan`]: plan,
-    [`boost_requests/${requestId}/days`]: days,
-    [`boost_requests/${requestId}/price`]: price,
-    [`boost_requests/${requestId}/currency`]: "BRL",
-    [`boost_requests/${requestId}/paymentStatus`]: paymentStatus,
-    [`boost_requests/${requestId}/paymentProvider`]: "mercado_pago",
-    [`boost_requests/${requestId}/gatewayPaymentId`]: paymentId,
-    [`boost_requests/${requestId}/gatewayPreferenceId`]: preferenceId,
-    [`boost_requests/${requestId}/updatedAtMs`]: t,
-
-    [`boost_payments/${paymentKey}/paymentId`]: paymentKey,
-    [`boost_payments/${paymentKey}/gatewayPaymentId`]: paymentId,
-    [`boost_payments/${paymentKey}/gatewayPreferenceId`]: preferenceId,
-    [`boost_payments/${paymentKey}/externalReference`]: externalReference,
-    [`boost_payments/${paymentKey}/provider`]: "mercado_pago",
-    [`boost_payments/${paymentKey}/status`]: paymentStatus,
-    [`boost_payments/${paymentKey}/amount`]: price,
-    [`boost_payments/${paymentKey}/currency`]: "BRL",
-    [`boost_payments/${paymentKey}/requestId`]: requestId,
-    [`boost_payments/${paymentKey}/adId`]: adId,
-    [`boost_payments/${paymentKey}/boostId`]: boostId,
-    [`boost_payments/${paymentKey}/sellerUid`]: sellerUid,
-    [`boost_payments/${paymentKey}/productId`]: productId,
-    [`boost_payments/${paymentKey}/updatedAtMs`]: t,
-  };
-
-  if (statusDetail) {
-    updates[`boost_payments/${paymentKey}/rawStatusDetail`] = statusDetail;
-    updates[`boost_requests/${requestId}/rawStatusDetail`] = statusDetail;
-  }
-
-  if (isPaymentApproved(paymentStatus)) {
-    updates[`boost_requests/${requestId}/status`] = "active";
-    updates[`boost_requests/${requestId}/startsAtMs`] = startsAtMs;
-    updates[`boost_requests/${requestId}/expiresAtMs`] = expiresAtMs;
-    updates[`boost_requests/${requestId}/activatedAtMs`] = t;
-    updates[`boost_requests/${requestId}/autoActivated`] = true;
-    updates[`boost_requests/${requestId}/requiresAdminApproval`] = false;
-
-    updates[`ads/${adId}/adId`] = adId;
-    updates[`ads/${adId}/boostId`] = boostId;
-    updates[`ads/${adId}/requestId`] = requestId;
-    updates[`ads/${adId}/sellerUid`] = sellerUid;
-    updates[`ads/${adId}/productId`] = productId;
-    updates[`ads/${adId}/productTitle`] = productTitle;
-    updates[`ads/${adId}/productImage`] = productImage;
-    updates[`ads/${adId}/placement`] = placement;
-    updates[`ads/${adId}/plan`] = plan;
-    updates[`ads/${adId}/days`] = days;
-    updates[`ads/${adId}/price`] = price;
-    updates[`ads/${adId}/currency`] = "BRL";
-    updates[`ads/${adId}/status`] = "active";
-    updates[`ads/${adId}/paymentStatus`] = "approved";
-    updates[`ads/${adId}/paymentProvider`] = "mercado_pago";
-    updates[`ads/${adId}/paymentId`] = paymentId;
-    updates[`ads/${adId}/gatewayPaymentId`] = paymentId;
-    updates[`ads/${adId}/gatewayPreferenceId`] = preferenceId;
-    updates[`ads/${adId}/startsAtMs`] = startsAtMs;
-    updates[`ads/${adId}/endsAtMs`] = expiresAtMs;
-    updates[`ads/${adId}/expiresAtMs`] = expiresAtMs;
-    updates[`ads/${adId}/views`] = requestData.views || 0;
-    updates[`ads/${adId}/clicks`] = requestData.clicks || 0;
-    updates[`ads/${adId}/createdAtMs`] = requestData.createdAtMs || t;
-    updates[`ads/${adId}/updatedAtMs`] = t;
-    updates[`ads/${adId}/autoActivated`] = true;
-
-    updates[`products/${productId}/isBoosted`] = true;
-    updates[`products/${productId}/boosted`] = true;
-    updates[`products/${productId}/boost/isBoosted`] = true;
-    updates[`products/${productId}/boost/active`] = true;
-    updates[`products/${productId}/boost/status`] = "active";
-    updates[`products/${productId}/boost/paymentStatus`] = "approved";
-    updates[`products/${productId}/boost/paymentProvider`] = "mercado_pago";
-    updates[`products/${productId}/boost/paymentId`] = paymentId;
-    updates[`products/${productId}/boost/gatewayPaymentId`] = paymentId;
-    updates[`products/${productId}/boost/gatewayPreferenceId`] = preferenceId;
-    updates[`products/${productId}/boost/requestId`] = requestId;
-    updates[`products/${productId}/boost/adId`] = adId;
-    updates[`products/${productId}/boost/boostId`] = boostId;
-    updates[`products/${productId}/boost/sellerUid`] = sellerUid;
-    updates[`products/${productId}/boost/placement`] = placement;
-    updates[`products/${productId}/boost/plan`] = plan;
-    updates[`products/${productId}/boost/days`] = days;
-    updates[`products/${productId}/boost/price`] = price;
-    updates[`products/${productId}/boost/startAtMs`] = startsAtMs;
-    updates[`products/${productId}/boost/startsAtMs`] = startsAtMs;
-    updates[`products/${productId}/boost/activatedAtMs`] = t;
-    updates[`products/${productId}/boost/expiresAtMs`] = expiresAtMs;
-    updates[`products/${productId}/boost/endsAtMs`] = expiresAtMs;
-    updates[`products/${productId}/boost/updatedAtMs`] = t;
-
-    updates[`products/${productId}/boostStatus`] = "active";
-    updates[`products/${productId}/boostPaymentStatus`] = "approved";
-    updates[`products/${productId}/boostStartAtMs`] = startsAtMs;
-    updates[`products/${productId}/boostExpiresAtMs`] = expiresAtMs;
-    updates[`products/${productId}/boostEndAtMs`] = expiresAtMs;
-    updates[`products/${productId}/updatedAtMs`] = t;
-
-    updates[`active_boosts/${adId}`] = true;
-    updates[`active_boosts_by_product/${productId}/${adId}`] = true;
-    updates[`active_boosts_by_seller/${sellerUid}/${adId}`] = true;
-
-    updates[`boost_events/${requestId}_${t}/eventId`] = `${requestId}_${t}`;
-    updates[`boost_events/${requestId}_${t}/type`] = "payment_approved";
-    updates[`boost_events/${requestId}_${t}/requestId`] = requestId;
-    updates[`boost_events/${requestId}_${t}/adId`] = adId;
-    updates[`boost_events/${requestId}_${t}/boostId`] = boostId;
-    updates[`boost_events/${requestId}_${t}/sellerUid`] = sellerUid;
-    updates[`boost_events/${requestId}_${t}/productId`] = productId;
-    updates[`boost_events/${requestId}_${t}/createdAtMs`] = t;
-
-    updates[`notifications/${sellerUid}/boost-payment-${t}/title`] =
-      "Anúncio ativado";
-    updates[`notifications/${sellerUid}/boost-payment-${t}/body`] =
-      "Seu pagamento foi aprovado e o anúncio do produto já está ativo automaticamente.";
-    updates[`notifications/${sellerUid}/boost-payment-${t}/type`] =
-      "boost_auto_activated";
-    updates[`notifications/${sellerUid}/boost-payment-${t}/read`] = false;
-    updates[`notifications/${sellerUid}/boost-payment-${t}/createdAtMs`] = t;
-    updates[`notifications/${sellerUid}/boost-payment-${t}/data/productId`] =
-      productId;
-    updates[`notifications/${sellerUid}/boost-payment-${t}/data/adId`] = adId;
-  } else if (isPaymentPending(paymentStatus)) {
-    updates[`boost_requests/${requestId}/status`] = "pending_payment";
-    updates[`ads/${adId}/status`] = "pending_payment";
-    updates[`ads/${adId}/paymentStatus`] = paymentStatus;
-    updates[`ads/${adId}/updatedAtMs`] = t;
-  } else {
-    updates[`boost_requests/${requestId}/status`] = "cancelled";
-    updates[`ads/${adId}/status`] = "cancelled";
-    updates[`ads/${adId}/paymentStatus`] = paymentStatus;
-    updates[`ads/${adId}/updatedAtMs`] = t;
-
-    updates[`products/${productId}/boost/paymentStatus`] = paymentStatus;
-
-    updates[`notifications/${sellerUid}/boost-payment-${t}/title`] =
-      "Pagamento do anúncio não aprovado";
-    updates[`notifications/${sellerUid}/boost-payment-${t}/body`] =
-      "O pagamento do anúncio/turbinamento não foi aprovado. Você pode tentar novamente no app.";
-    updates[`notifications/${sellerUid}/boost-payment-${t}/type`] =
-      "boost_payment_failed";
-    updates[`notifications/${sellerUid}/boost-payment-${t}/read`] = false;
-    updates[`notifications/${sellerUid}/boost-payment-${t}/createdAtMs`] = t;
-  }
-
-  await db.ref().update(updates);
-
-  console.log("Webhook de boost/anúncio processado:", {
-    sellerUid,
-    productId,
-    requestId,
-    adId,
-    paymentId,
-    paymentStatus,
-    preferenceId,
-  });
-}
-
-async function savePendingVerificationPreference({
-  externalReference,
-  preferenceId,
-  checkoutUrl,
-  sandboxInitPoint,
-  body,
-}) {
-  const t = nowMs();
-
-  let uid = safe(
-    body.uid ||
-      body.userUid ||
-      body.user_uid ||
-      body.sellerUid ||
-      body.seller_uid
-  );
-
-  if (!uid) {
-    uid = extractUidFromVerificationExternalReference(externalReference);
-  }
-
-  if (!uid) return;
-
-  const plan = safe(body.plan || body.verificationPlan || "monthly");
-  const days = planToDays(plan, body.days || 30);
-  const price = toNumber(
-    body.price || body.amount || body.items?.[0]?.unit_price
-  );
-
-  const updates = {
-    [`verification_requests/${uid}/uid`]: uid,
-    [`verification_requests/${uid}/requestId`]: externalReference,
-    [`verification_requests/${uid}/externalReference`]: externalReference,
-    [`verification_requests/${uid}/plan`]: plan,
-    [`verification_requests/${uid}/days`]: days,
-    [`verification_requests/${uid}/price`]: price,
-    [`verification_requests/${uid}/currency`]: "BRL",
-    [`verification_requests/${uid}/checkoutUrl`]: checkoutUrl,
-    [`verification_requests/${uid}/sandboxCheckoutUrl`]: sandboxInitPoint,
-    [`verification_requests/${uid}/gatewayPreferenceId`]: preferenceId,
-    [`verification_requests/${uid}/paymentProvider`]: "mercado_pago",
-    [`verification_requests/${uid}/paymentStatus`]: "pending",
-    [`verification_requests/${uid}/status`]: "pending_payment",
-    [`verification_requests/${uid}/verifiedStatus`]: "payment_pending",
-    [`verification_requests/${uid}/adminStatus`]: "none",
-    [`verification_requests/${uid}/requiresAdminApproval`]: false,
-    [`verification_requests/${uid}/autoActivationEnabled`]: true,
-    [`verification_requests/${uid}/createdAtMs`]: t,
-    [`verification_requests/${uid}/updatedAtMs`]: t,
-
-    [`users/${uid}/verificationStatus`]: "payment_pending",
-    [`users/${uid}/verificationPaymentStatus`]: "pending",
-    [`users/${uid}/verified`]: false,
-    [`users/${uid}/updatedAtMs`]: t,
-  };
-
-  await db.ref().update(updates);
-}
-
-async function savePendingBoostPreference({
-  externalReference,
-  preferenceId,
-  checkoutUrl,
-  sandboxInitPoint,
-  body,
-}) {
-  const t = nowMs();
-
-  const requestId = safe(body.requestId || body.request_id || externalReference);
-  const adId = safe(body.adId || body.ad_id || requestId);
-  const boostId = safe(body.boostId || body.boost_id || requestId);
-
-  const sellerUid = safe(
-    body.sellerUid || body.seller_uid || body.uid || body.userUid
-  );
-
-  const productId = safe(body.productId || body.product_id);
-
-  const productTitle = safe(body.productTitle || body.product_title);
-  const productImage = safe(body.productImage || body.product_image);
-  const placement = safe(body.placement || "home_hero_horizontal");
-
-  const price = toNumber(
-    body.price || body.amount || body.items?.[0]?.unit_price
-  );
-  const days = planToDays(body.plan, body.days || 1);
-  const plan = safe(body.plan || planFromDays(days));
-
-  if (!sellerUid || !productId || !requestId) {
-    await db.ref(`payment_integrity_audit/pending_boost_${t}`).set({
-      type: "pending_boost_missing_required_fields",
-      externalReference,
-      preferenceId,
-      checkoutUrl,
-      sellerUid,
-      productId,
-      requestId,
-      createdAtMs: t,
-    });
-
-    return;
-  }
-
-  const common = {
-    requestId,
-    adId,
-    boostId,
-    sellerUid,
-    productId,
-    productTitle,
-    productImage,
-    placement,
-    plan,
-    days,
-    price,
-    currency: "BRL",
-    checkoutUrl,
-    sandboxCheckoutUrl: sandboxInitPoint,
-    gatewayPreferenceId: preferenceId,
-    paymentProvider: "mercado_pago",
-    paymentStatus: "pending",
-    status: "pending_payment",
-    requiresAdminApproval: false,
-    autoActivationEnabled: true,
-    createdAtMs: t,
-    updatedAtMs: t,
-  };
-
-  const updates = {
-    [`boost_requests/${requestId}`]: common,
-
-    [`ads/${adId}/adId`]: adId,
-    [`ads/${adId}/requestId`]: requestId,
-    [`ads/${adId}/boostId`]: boostId,
-    [`ads/${adId}/sellerUid`]: sellerUid,
-    [`ads/${adId}/productId`]: productId,
-    [`ads/${adId}/productTitle`]: productTitle,
-    [`ads/${adId}/productImage`]: productImage,
-    [`ads/${adId}/placement`]: placement,
-    [`ads/${adId}/plan`]: plan,
-    [`ads/${adId}/days`]: days,
-    [`ads/${adId}/price`]: price,
-    [`ads/${adId}/currency`]: "BRL",
-    [`ads/${adId}/checkoutUrl`]: checkoutUrl,
-    [`ads/${adId}/sandboxCheckoutUrl`]: sandboxInitPoint,
-    [`ads/${adId}/gatewayPreferenceId`]: preferenceId,
-    [`ads/${adId}/paymentProvider`]: "mercado_pago",
-    [`ads/${adId}/paymentStatus`]: "pending",
-    [`ads/${adId}/status`]: "pending_payment",
-    [`ads/${adId}/requiresAdminApproval`]: false,
-    [`ads/${adId}/autoActivationEnabled`]: true,
-    [`ads/${adId}/views`]: 0,
-    [`ads/${adId}/clicks`]: 0,
-    [`ads/${adId}/createdAtMs`]: t,
-    [`ads/${adId}/updatedAtMs`]: t,
-
-    [`boost_payments/${requestId}/paymentId`]: requestId,
-    [`boost_payments/${requestId}/requestId`]: requestId,
-    [`boost_payments/${requestId}/adId`]: adId,
-    [`boost_payments/${requestId}/boostId`]: boostId,
-    [`boost_payments/${requestId}/sellerUid`]: sellerUid,
-    [`boost_payments/${requestId}/productId`]: productId,
-    [`boost_payments/${requestId}/amount`]: price,
-    [`boost_payments/${requestId}/currency`]: "BRL",
-    [`boost_payments/${requestId}/provider`]: "mercado_pago",
-    [`boost_payments/${requestId}/status`]: "pending",
-    [`boost_payments/${requestId}/externalReference`]: externalReference,
-    [`boost_payments/${requestId}/gatewayPreferenceId`]: preferenceId,
-    [`boost_payments/${requestId}/checkoutUrl`]: checkoutUrl,
-    [`boost_payments/${requestId}/createdAtMs`]: t,
-    [`boost_payments/${requestId}/updatedAtMs`]: t,
-
-    [`boost_events/${requestId}_${t}/eventId`]: `${requestId}_${t}`,
-    [`boost_events/${requestId}_${t}/type`]: "created",
-    [`boost_events/${requestId}_${t}/requestId`]: requestId,
-    [`boost_events/${requestId}_${t}/adId`]: adId,
-    [`boost_events/${requestId}_${t}/boostId`]: boostId,
-    [`boost_events/${requestId}_${t}/sellerUid`]: sellerUid,
-    [`boost_events/${requestId}_${t}/productId`]: productId,
-    [`boost_events/${requestId}_${t}/createdAtMs`]: t,
-  };
-
-  await db.ref().update(updates);
-}
-
-async function buildExpireBoostUpdates(t) {
-  const adsSnap = await db
-    .ref("ads")
-    .orderByChild("status")
-    .equalTo("active")
-    .get();
-
-  const updates = {};
-  let expiredBoosts = 0;
-
-  if (adsSnap.exists()) {
-    adsSnap.forEach((child) => {
-      const adId = child.key;
-      const ad = child.val() || {};
-      const productId = safe(ad.productId);
-      const sellerUid = safe(ad.sellerUid);
-      const expiresAtMs = Number(ad.endsAtMs || ad.expiresAtMs || 0);
-
-      if (expiresAtMs > 0 && expiresAtMs <= t) {
-        expiredBoosts++;
-
-        updates[`ads/${adId}/status`] = "expired";
-        updates[`ads/${adId}/expiredAtMs`] = t;
-        updates[`ads/${adId}/updatedAtMs`] = t;
-
-        if (productId) {
-          updates[`products/${productId}/isBoosted`] = false;
-          updates[`products/${productId}/boosted`] = false;
-          updates[`products/${productId}/boost/isBoosted`] = false;
-          updates[`products/${productId}/boost/active`] = false;
-          updates[`products/${productId}/boost/status`] = "expired";
-          updates[`products/${productId}/boost/expiredAtMs`] = t;
-          updates[`products/${productId}/boost/updatedAtMs`] = t;
-          updates[`products/${productId}/boostStatus`] = "expired";
-          updates[`products/${productId}/updatedAtMs`] = t;
-          updates[`active_boosts_by_product/${productId}/${adId}`] = null;
-        }
-
-        if (sellerUid) {
-          updates[`active_boosts_by_seller/${sellerUid}/${adId}`] = null;
-
-          updates[`notifications/${sellerUid}/boost-expired-${adId}-${t}/title`] =
-            "Anúncio expirado";
-          updates[`notifications/${sellerUid}/boost-expired-${adId}-${t}/body`] =
-            "O período do seu anúncio terminou.";
-          updates[`notifications/${sellerUid}/boost-expired-${adId}-${t}/type`] =
-            "boost_expired";
-          updates[`notifications/${sellerUid}/boost-expired-${adId}-${t}/read`] =
-            false;
-          updates[
-            `notifications/${sellerUid}/boost-expired-${adId}-${t}/createdAtMs`
-          ] = t;
-        }
-
-        updates[`active_boosts/${adId}`] = null;
+  const image =
+    sharp(
+      bytes,
+      {
+        failOn:
+          "error",
+        limitInputPixels:
+          80_000_000,
       }
-    });
+    ).rotate();
+
+  const metadata =
+    await image.metadata();
+
+  if (
+    !metadata.width ||
+    !metadata.height ||
+    metadata.width < 240 ||
+    metadata.height < 240
+  ) {
+    const error =
+      new Error(
+        "MEDIA_RESOLUTION_TOO_SMALL"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "A imagem precisa ter resolução maior.";
+
+    throw error;
   }
 
-  return { updates, expiredBoosts };
-}
-
-async function buildExpireVerificationUpdates(t) {
-  const verifiedSnap = await db
-    .ref("verified_users")
-    .orderByChild("active")
-    .equalTo(true)
-    .get();
-
-  const updates = {};
-  let expiredVerifications = 0;
-
-  if (verifiedSnap.exists()) {
-    verifiedSnap.forEach((child) => {
-      const uid = child.key;
-      const data = child.val() || {};
-      const expiresAtMs = Number(data.expiresAtMs || 0);
-
-      if (!uid || !expiresAtMs) return;
-
-      if (expiresAtMs <= t) {
-        expiredVerifications++;
-
-        updates[`verified_users/${uid}/active`] = false;
-        updates[`verified_users/${uid}/status`] = "expired";
-        updates[`verified_users/${uid}/expiredAtMs`] = t;
-        updates[`verified_users/${uid}/updatedAtMs`] = t;
-
-        updates[`users/${uid}/verified`] = false;
-        updates[`users/${uid}/verificationStatus`] = "expired";
-        updates[`users/${uid}/verificationPaymentStatus`] = "expired";
-        updates[`users/${uid}/verificationExpiredAtMs`] = t;
-        updates[`users/${uid}/updatedAtMs`] = t;
-
-        updates[`users/${uid}/verificationSubscription/status`] = "expired";
-        updates[`users/${uid}/verificationSubscription/active`] = false;
-        updates[`users/${uid}/verificationSubscription/expiredAtMs`] = t;
-        updates[`users/${uid}/verificationSubscription/updatedAtMs`] = t;
-
-        updates[`verification_requests/${uid}/status`] = "expired";
-        updates[`verification_requests/${uid}/verifiedStatus`] = "expired";
-        updates[`verification_requests/${uid}/expiredAtMs`] = t;
-        updates[`verification_requests/${uid}/updatedAtMs`] = t;
-
-        updates[`notifications/${uid}/verification-expired-${t}/title`] =
-          "Selo verificado expirado";
-        updates[`notifications/${uid}/verification-expired-${t}/body`] =
-          "Seu selo verificado expirou. Renove para ativar novamente.";
-        updates[`notifications/${uid}/verification-expired-${t}/type`] =
-          "verification_expired";
-        updates[`notifications/${uid}/verification-expired-${t}/read`] = false;
-        updates[`notifications/${uid}/verification-expired-${t}/createdAtMs`] =
-          t;
+  const detail =
+    await sharp(
+      bytes,
+      {
+        failOn:
+          "error",
+        limitInputPixels:
+          80_000_000,
       }
+    )
+      .rotate()
+      .resize(
+        1080,
+        1080,
+        {
+          fit:
+            "cover",
+          position:
+            "attention",
+        }
+      )
+      .webp({
+        quality:
+          84,
+      })
+      .toBuffer();
+
+  const thumb =
+    await sharp(
+      bytes,
+      {
+        failOn:
+          "error",
+        limitInputPixels:
+          80_000_000,
+      }
+    )
+      .rotate()
+      .resize(
+        480,
+        480,
+        {
+          fit:
+            "cover",
+          position:
+            "attention",
+        }
+      )
+      .webp({
+        quality:
+          80,
+      })
+      .toBuffer();
+
+  return {
+    detail,
+    thumb,
+  };
+}
+
+async function uploadPrivateObject(
+  path,
+  bytes
+) {
+  const file =
+    storageBucket.file(
+      path
+    );
+
+  await file.save(
+    bytes,
+    {
+      resumable:
+        false,
+      metadata: {
+        contentType:
+          "image/webp",
+        cacheControl:
+          "private, max-age=0, no-store",
+      },
+    }
+  );
+}
+
+async function createMediaUploadSession(
+  uid,
+  fileBytes
+) {
+  const mediaId =
+    crypto
+      .randomBytes(18)
+      .toString("hex");
+
+  const processed =
+    await processProductImage(
+      fileBytes
+    );
+
+  const detailPath =
+    `product_media/${uid}/${mediaId}/detail.webp`;
+
+  const thumbPath =
+    `product_media/${uid}/${mediaId}/thumb.webp`;
+
+  await Promise.all([
+    uploadPrivateObject(
+      detailPath,
+      processed.detail
+    ),
+    uploadPrivateObject(
+      thumbPath,
+      processed.thumb
+    ),
+  ]);
+
+  const token =
+    makeSignedToken(
+      {
+        v: 1,
+        type: "upload",
+        uid,
+        mediaId,
+        detailPath,
+        thumbPath,
+        exp:
+          nowMs() +
+          MEDIA_UPLOAD_TOKEN_TTL_MS,
+      },
+      resolvedMediaTokenSecret()
+    );
+
+  return {
+    mediaId:
+      token,
+  };
+}
+
+function verifyMediaUploadToken(
+  token,
+  uid
+) {
+  const payload =
+    verifySignedToken(
+      token,
+      resolvedMediaTokenSecret()
+    );
+
+  if (
+    payload.type !== "upload" ||
+    payload.uid !== uid
+  ) {
+    throw new Error(
+      "MEDIA_TOKEN_OWNER_MISMATCH"
+    );
+  }
+
+  return payload;
+}
+
+function deliveryMediaUrl({
+  uid,
+  productId,
+  path,
+  scope,
+  kind,
+}) {
+  const token =
+    makeSignedToken(
+      {
+        v: 1,
+        type:
+          "delivery",
+        uid,
+        productId,
+        path,
+        scope,
+        kind,
+      },
+      resolvedMediaTokenSecret()
+    );
+
+  return (
+    `${APP_BASE_URL}/v1/media/${scope}/${token}`
+  );
+}
+
+function parseOwnDeliveryUrl(
+  url,
+  uid,
+  productId
+) {
+  const prefixPublic =
+    `${APP_BASE_URL}/v1/media/public/`;
+
+  const prefixPrivate =
+    `${APP_BASE_URL}/v1/media/private/`;
+
+  let token = "";
+
+  if (
+    safe(url).startsWith(
+      prefixPublic
+    )
+  ) {
+    token =
+      safe(url).slice(
+        prefixPublic.length
+      );
+  }
+
+  if (
+    safe(url).startsWith(
+      prefixPrivate
+    )
+  ) {
+    token =
+      safe(url).slice(
+        prefixPrivate.length
+      );
+  }
+
+  if (!token) {
+    return null;
+  }
+
+  const payload =
+    verifySignedToken(
+      token,
+      resolvedMediaTokenSecret()
+    );
+
+  if (
+    payload.type !==
+      "delivery" ||
+    payload.uid !== uid ||
+    payload.productId !==
+      productId ||
+    !payload.path
+  ) {
+    return null;
+  }
+
+  return payload;
+}
+
+function rescopeExistingMediaUrl(
+  url,
+  uid,
+  productId,
+  scope
+) {
+  const own =
+    parseOwnDeliveryUrl(
+      url,
+      uid,
+      productId
+    );
+
+  if (!own) {
+    if (
+      scope === "private"
+    ) {
+      const error =
+        new Error(
+          "LEGACY_MEDIA_NOT_PRIVATE"
+        );
+
+      error.statusCode =
+        409;
+
+      error.publicMessage =
+        "Para manter a conta privada, substitua as imagens antigas por novas imagens protegidas.";
+
+      throw error;
+    }
+
+    return safe(url);
+  }
+
+  return deliveryMediaUrl({
+    uid,
+    productId,
+    path:
+      own.path,
+    scope,
+    kind:
+      own.kind ||
+      "detail",
+  });
+}
+
+async function finalizeUploadedMedia(
+  entries,
+  uid,
+  productId,
+  scope
+) {
+  if (
+    !Array.isArray(entries) ||
+    entries.length < 1 ||
+    entries.length >
+      MAX_PRODUCT_IMAGES
+  ) {
+    const error =
+      new Error(
+        "INVALID_MEDIA_COUNT"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      `Selecione entre 1 e ${MAX_PRODUCT_IMAGES} imagens.`;
+
+    throw error;
+  }
+
+  const ordered =
+    [...entries].sort(
+      (a, b) =>
+        integer(a.order) -
+        integer(b.order)
+    );
+
+  const result = [];
+
+  for (
+    let i = 0;
+    i < ordered.length;
+    i += 1
+  ) {
+    const payload =
+      verifyMediaUploadToken(
+        ordered[i].mediaId,
+        uid
+      );
+
+    result.push({
+      detailUrl:
+        deliveryMediaUrl({
+          uid,
+          productId,
+          path:
+            payload.detailPath,
+          scope,
+          kind:
+            "detail",
+        }),
+
+      thumbUrl:
+        deliveryMediaUrl({
+          uid,
+          productId,
+          path:
+            payload.thumbPath,
+          scope,
+          kind:
+            "thumb",
+        }),
     });
   }
 
-  return { updates, expiredVerifications };
+  return result;
 }
 
-app.get("/", (_, res) => {
-  res.send(
-    htmlPage(
-      "FireRank API",
-      "Backend online do FireRank: pagamentos, selo verificado, anúncios automáticos e recuperação de senha."
-    )
+async function canViewPrivateProduct(
+  auth,
+  product
+) {
+  if (!auth?.uid) {
+    return false;
+  }
+
+  if (
+    auth.admin === true ||
+    product.ownerUid ===
+      auth.uid
+  ) {
+    return true;
+  }
+
+  if (
+    product.storeId
+  ) {
+    const memberSnap =
+      await db
+        .ref(
+          `store_members/${product.storeId}/${auth.uid}`
+        )
+        .get();
+
+    if (
+      map(
+        memberSnap.val()
+      ).active === true
+    ) {
+      return true;
+    }
+  }
+
+  const followSnap =
+    await db
+      .ref(
+        `follow_edges/${product.ownerUid}/${auth.uid}`
+      )
+      .get();
+
+  return (
+    safe(
+      map(
+        followSnap.val()
+      ).status
+    ).toLowerCase() ===
+    "approved"
   );
-});
+}
 
-app.get("/health", (_, res) => {
-  res.json({
-    ok: true,
-    mercadoPagoConfigured: !!MP_ACCESS_TOKEN,
-    firebaseConfigured: !!FIREBASE_DATABASE_URL,
-    firebaseWebApiKeyConfigured: !!FIREBASE_WEB_API_KEY,
-    emailConfigured: !!SMTP_HOST && !!SMTP_USER && !!SMTP_PASS && !!MAIL_FROM_EMAIL,
-    baseUrl: APP_BASE_URL,
-    webhookUrl: MP_WEBHOOK_URL,
-    passwordResetUrl: PASSWORD_RESET_URL,
-    autoVerificationActivation: true,
-    autoBoostActivation: true,
-    expireBoostsEnabled: true,
-    expireVerificationsEnabled: true,
-    maintenanceEnabled: true,
-  });
-});
+async function streamStoredMedia(
+  req,
+  res,
+  scope
+) {
+  try {
+    const payload =
+      verifySignedToken(
+        req.params.token,
+        resolvedMediaTokenSecret()
+      );
 
-app.get("/success", (_, res) => {
-  res.send(
-    htmlPage(
-      "Pagamento aprovado",
-      "Pagamento concluído. Você já pode voltar ao app."
+    if (
+      payload.type !==
+        "delivery" ||
+      payload.scope !==
+        scope ||
+      !payload.path
+    ) {
+      return res
+        .status(404)
+        .end();
+    }
+
+    const productSnap =
+      await db
+        .ref(
+          `products/${payload.productId}`
+        )
+        .get();
+
+    if (
+      !productSnap.exists()
+    ) {
+      return res
+        .status(404)
+        .end();
+    }
+
+    const product =
+      map(
+        productSnap.val()
+      );
+
+    if (
+      product.ownerUid !==
+      payload.uid
+    ) {
+      return res
+        .status(404)
+        .end();
+    }
+
+    if (
+      scope === "public"
+    ) {
+      const accountVisibility =
+        await getAccountVisibility(
+          payload.uid
+        );
+
+      const allowed =
+        accountVisibility ===
+          "public" &&
+        product.status ===
+          "active" &&
+        product.visibility ===
+          "public" &&
+        safe(
+          product.moderation
+            ?.status
+        ) === "approved";
+
+      if (!allowed) {
+        return res
+          .status(403)
+          .end();
+      }
+
+      res.setHeader(
+        "Cache-Control",
+        "public, max-age=300, stale-while-revalidate=300"
+      );
+    } else {
+      if (
+        !(await canViewPrivateProduct(
+          req.auth,
+          product
+        ))
+      ) {
+        return res
+          .status(403)
+          .end();
+      }
+
+      res.setHeader(
+        "Cache-Control",
+        "private, max-age=60"
+      );
+    }
+
+    const file =
+      storageBucket.file(
+        payload.path
+      );
+
+    const [exists] =
+      await file.exists();
+
+    if (!exists) {
+      return res
+        .status(404)
+        .end();
+    }
+
+    res.setHeader(
+      "Content-Type",
+      "image/webp"
+    );
+
+    return file
+      .createReadStream()
+      .on(
+        "error",
+        () => {
+          if (
+            !res.headersSent
+          ) {
+            res
+              .status(500)
+              .end();
+          } else {
+            res.end();
+          }
+        }
+      )
+      .pipe(res);
+  } catch (_) {
+    return res
+      .status(404)
+      .end();
+  }
+}
+
+function validateProductTitle(
+  value
+) {
+  const title =
+    safe(value);
+
+  if (
+    title.length < 3 ||
+    title.length > 120
+  ) {
+    const error =
+      new Error(
+        "INVALID_PRODUCT_TITLE"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "O título deve ter entre 3 e 120 caracteres.";
+
+    throw error;
+  }
+
+  return title;
+}
+
+function validateProductDescription(
+  value
+) {
+  const description =
+    safe(value);
+
+  if (
+    description.length < 10 ||
+    description.length > 5000
+  ) {
+    const error =
+      new Error(
+        "INVALID_PRODUCT_DESCRIPTION"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "A descrição deve ter entre 10 e 5000 caracteres.";
+
+    throw error;
+  }
+
+  return description;
+}
+
+function validatePriceCents(
+  value
+) {
+  const priceCents =
+    integer(
+      value,
+      -1
+    );
+
+  if (
+    priceCents <= 0 ||
+    priceCents >
+      1_000_000_000
+  ) {
+    const error =
+      new Error(
+        "INVALID_PRICE_CENTS"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Preço inválido.";
+
+    throw error;
+  }
+
+  return priceCents;
+}
+
+async function validateCategory(
+  categoryId,
+  productType
+) {
+  const id =
+    safe(
+      categoryId
+    );
+
+  if (
+    !id ||
+    id.length > 80
+  ) {
+    const error =
+      new Error(
+        "CATEGORY_REQUIRED"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Selecione uma categoria válida.";
+
+    throw error;
+  }
+
+  const snap =
+    await db
+      .ref(
+        `categories/${id}`
+      )
+      .get();
+
+  const category =
+    map(
+      snap.val()
+    );
+
+  if (
+    !snap.exists() ||
+    category.active !== true
+  ) {
+    const error =
+      new Error(
+        "CATEGORY_NOT_AVAILABLE"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Esta categoria não está disponível.";
+
+    throw error;
+  }
+
+  const type =
+    safe(
+      category.type
+    ).toLowerCase();
+
+  if (
+    productType === "local" &&
+    (
+      category.affiliateOnly ===
+        true ||
+      type === "affiliate"
     )
-  );
-});
+  ) {
+    const error =
+      new Error(
+        "CATEGORY_NOT_LOCAL"
+      );
 
-app.get("/pending", (_, res) => {
-  res.send(
-    htmlPage(
-      "Pagamento pendente",
-      "Seu pagamento está pendente. Você já pode voltar ao app e acompanhar o status."
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Esta categoria não aceita produtos locais.";
+
+    throw error;
+  }
+
+  if (
+    productType ===
+      "affiliate" &&
+    (
+      category.localOnly ===
+        true ||
+      type === "local"
     )
-  );
-});
+  ) {
+    const error =
+      new Error(
+        "CATEGORY_NOT_AFFILIATE"
+      );
 
-app.get("/failure", (_, res) => {
-  res.send(
-    htmlPage(
-      "Pagamento não concluído",
-      "O pagamento não foi concluído. Você pode tentar novamente no app."
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Esta categoria não aceita produtos afiliados.";
+
+    throw error;
+  }
+
+  return {
+    id,
+    title:
+      clip(
+        category.title ||
+          id,
+        100
+      ),
+    category,
+  };
+}
+
+async function getStoreContext(
+  storeId
+) {
+  const [
+    storeSnap,
+    settingsSnap,
+  ] =
+    await Promise.all([
+      db
+        .ref(
+          `stores/${storeId}`
+        )
+        .get(),
+
+      db
+        .ref(
+          `store_settings/${storeId}`
+        )
+        .get(),
+    ]);
+
+  if (
+    !storeSnap.exists()
+  ) {
+    const error =
+      new Error(
+        "STORE_NOT_FOUND"
+      );
+
+    error.statusCode =
+      404;
+
+    error.publicMessage =
+      "Loja não encontrada.";
+
+    throw error;
+  }
+
+  return {
+    store:
+      map(
+        storeSnap.val()
+      ),
+    settings:
+      map(
+        settingsSnap.val()
+      ),
+  };
+}
+
+function validateStoreFeature(
+  settings,
+  productType
+) {
+  if (
+    productType ===
+      "affiliate" &&
+    settings
+      .affiliateProductsEnabled ===
+      false
+  ) {
+    const error =
+      new Error(
+        "AFFILIATE_PRODUCTS_DISABLED_FOR_STORE"
+      );
+
+    error.statusCode =
+      409;
+
+    error.publicMessage =
+      "Produtos afiliados estão desativados nesta loja.";
+
+    throw error;
+  }
+
+  if (
+    productType ===
+      "local" &&
+    settings
+      .localOrdersEnabled ===
+      false
+  ) {
+    const error =
+      new Error(
+        "LOCAL_PRODUCTS_DISABLED_FOR_STORE"
+      );
+
+    error.statusCode =
+      409;
+
+    error.publicMessage =
+      "Produtos locais estão desativados nesta loja.";
+
+    throw error;
+  }
+}
+
+function accountAndStoreCanBePublic(
+  accountVisibility,
+  store
+) {
+  return (
+    accountVisibility ===
+      "public" &&
+    safe(
+      store.status
+    ).toLowerCase() ===
+      "approved" &&
+    safe(
+      store.visibility
+    ).toLowerCase() ===
+      "public"
+  );
+}
+
+const blockedAffiliateShorteners =
+  new Set([
+    "bit.ly",
+    "tinyurl.com",
+    "goo.gl",
+    "t.co",
+    "is.gd",
+    "cutt.ly",
+    "encurtador.com.br",
+  ]);
+
+function affiliateAllowedHosts() {
+  return String(
+    process.env
+      .AFFILIATE_ALLOWED_HOSTS ||
+      ""
+  )
+    .split(",")
+    .map(
+      (item) =>
+        item
+          .trim()
+          .toLowerCase()
+          .replace(
+            /^www\./,
+            ""
+          )
     )
-  );
-});
+    .filter(Boolean);
+}
 
-app.get("/reset-password", (_, res) => {
-  res.send(resetPasswordPage());
-});
-
-app.post("/api/auth/request-password-reset", async (req, res) => {
-  const email = safe(req.body?.email).toLowerCase();
-  const t = nowMs();
+function validateAffiliateUrl(
+  value
+) {
+  let url;
 
   try {
-    if (!isValidEmail(email)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Digite um e-mail válido.",
-      });
+    url =
+      new URL(
+        safe(value)
+      );
+  } catch (_) {
+    const error =
+      new Error(
+        "INVALID_AFFILIATE_URL"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Informe um link afiliado HTTPS válido.";
+
+    throw error;
+  }
+
+  if (
+    url.protocol !==
+    "https:"
+  ) {
+    const error =
+      new Error(
+        "AFFILIATE_HTTPS_REQUIRED"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "O link afiliado precisa usar HTTPS.";
+
+    throw error;
+  }
+
+  const host =
+    url.hostname
+      .toLowerCase()
+      .replace(
+        /^www\./,
+        ""
+      );
+
+  if (
+    blockedAffiliateShorteners
+      .has(host)
+  ) {
+    const error =
+      new Error(
+        "AFFILIATE_SHORTENER_BLOCKED"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Links encurtados não são aceitos.";
+
+    throw error;
+  }
+
+  const allowlist =
+    affiliateAllowedHosts();
+
+  if (
+    allowlist.length > 0 &&
+    !allowlist.some(
+      (allowed) =>
+        host === allowed ||
+        host.endsWith(
+          `.${allowed}`
+        )
+    )
+  ) {
+    const error =
+      new Error(
+        "AFFILIATE_HOST_NOT_ALLOWED"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Este domínio afiliado ainda não está autorizado.";
+
+    throw error;
+  }
+
+  let externalStoreName =
+    host.split(".")[0] ||
+    host;
+
+  if (
+    host.includes(
+      "shopee"
+    )
+  ) {
+    externalStoreName =
+      "Shopee";
+  }
+
+  if (
+    host.includes(
+      "amazon"
+    )
+  ) {
+    externalStoreName =
+      "Amazon";
+  }
+
+  if (
+    host.includes(
+      "mercadolivre"
+    ) ||
+    host.includes(
+      "mercadolibre"
+    )
+  ) {
+    externalStoreName =
+      "Mercado Livre";
+  }
+
+  return {
+    url:
+      url.toString(),
+    domain:
+      host,
+    externalStoreName,
+    sourceStore:
+      normalizeSearchTerm(
+        externalStoreName
+      ) || host,
+  };
+}
+
+function normalizePaymentMethods(
+  value
+) {
+  const allowed =
+    new Set([
+      "pix_on_delivery",
+      "cash_on_delivery",
+      "card_machine",
+      "pay_on_pickup",
+      "combine_in_chat",
+    ]);
+
+  const output = {};
+
+  if (
+    Array.isArray(value)
+  ) {
+    for (
+      const item
+      of value
+    ) {
+      const key =
+        safe(item);
+
+      if (
+        allowed.has(key)
+      ) {
+        output[key] =
+          true;
+      }
+    }
+  } else if (
+    isObject(value)
+  ) {
+    for (
+      const [
+        key,
+        enabled,
+      ]
+      of Object.entries(
+        value
+      )
+    ) {
+      if (
+        allowed.has(key) &&
+        enabled === true
+      ) {
+        output[key] =
+          true;
+      }
+    }
+  }
+
+  if (
+    Object.keys(output)
+      .length === 0
+  ) {
+    const error =
+      new Error(
+        "LOCAL_PAYMENT_METHOD_REQUIRED"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Selecione uma forma de pagamento local.";
+
+    throw error;
+  }
+
+  return output;
+}
+
+async function resolveLocalAddress(
+  uid,
+  addressId
+) {
+  const id =
+    safe(
+      addressId ||
+        "primary"
+    ).toLowerCase();
+
+  if (
+    ![
+      "primary",
+      "shipping",
+    ].includes(id)
+  ) {
+    const error =
+      new Error(
+        "INVALID_ADDRESS_ID"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Endereço inválido.";
+
+    throw error;
+  }
+
+  const snap =
+    await db
+      .ref(
+        `user_addresses/${uid}/${id}`
+      )
+      .get();
+
+  const address =
+    map(
+      snap.val()
+    );
+
+  if (
+    !snap.exists() ||
+    address.usableForOrder !==
+      true ||
+    address.needsReview ===
+      true
+  ) {
+    const error =
+      new Error(
+        "ADDRESS_NOT_USABLE_FOR_ORDER"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Salve e valide um endereço antes de publicar um produto local.";
+
+    throw error;
+  }
+
+  if (
+    !safe(
+      address.city
+    ) ||
+    !safe(
+      address.state
+    ) ||
+    !safe(
+      address.neighborhood
+    )
+  ) {
+    const error =
+      new Error(
+        "ADDRESS_REGION_INCOMPLETE"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Complete cidade, estado e bairro do endereço.";
+
+    throw error;
+  }
+
+  return {
+    id,
+    address,
+  };
+}
+
+function validateLocalConfig(
+  rawLocal,
+  rawInventory
+) {
+  const local =
+    map(rawLocal);
+
+  const inventory =
+    map(rawInventory);
+
+  const localType =
+    safe(
+      local.localType
+    ).toLowerCase();
+
+  const allowedLocalTypes =
+    new Set([
+      "food",
+      "custom_order",
+      "physical_product",
+      "clothing",
+      "service",
+      "other",
+    ]);
+
+  if (
+    !allowedLocalTypes.has(
+      localType
+    )
+  ) {
+    const error =
+      new Error(
+        "INVALID_LOCAL_TYPE"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Tipo de produto local inválido.";
+
+    throw error;
+  }
+
+  const deliveryAvailable =
+    local.deliveryAvailable ===
+    true;
+
+  const pickupAvailable =
+    local.pickupAvailable ===
+    true;
+
+  if (
+    !deliveryAvailable &&
+    !pickupAvailable
+  ) {
+    const error =
+      new Error(
+        "LOCAL_FULFILLMENT_REQUIRED"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Ative entrega, retirada ou as duas opções.";
+
+    throw error;
+  }
+
+  const serviceRadiusKm =
+    deliveryAvailable
+      ? finiteNumber(
+          local.serviceRadiusKm,
+          -1
+        )
+      : 0;
+
+  const deliveryFeeCents =
+    deliveryAvailable
+      ? integer(
+          local.deliveryFeeCents,
+          -1
+        )
+      : 0;
+
+  const preparationTimeMin =
+    integer(
+      local.preparationTimeMin,
+      0
+    );
+
+  if (
+    deliveryAvailable &&
+    (
+      serviceRadiusKm <= 0 ||
+      serviceRadiusKm > 300
+    )
+  ) {
+    const error =
+      new Error(
+        "INVALID_SERVICE_RADIUS"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Raio de entrega inválido.";
+
+    throw error;
+  }
+
+  if (
+    deliveryFeeCents < 0 ||
+    deliveryFeeCents >
+      10_000_000
+  ) {
+    const error =
+      new Error(
+        "INVALID_DELIVERY_FEE"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Taxa de entrega inválida.";
+
+    throw error;
+  }
+
+  if (
+    preparationTimeMin < 0 ||
+    preparationTimeMin > 43_200
+  ) {
+    const error =
+      new Error(
+        "INVALID_PREPARATION_TIME"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Tempo de preparo inválido.";
+
+    throw error;
+  }
+
+  if (
+    local
+      .acceptedLocalSafetyNotice !==
+      true
+  ) {
+    const error =
+      new Error(
+        "LOCAL_SAFETY_NOTICE_REQUIRED"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Confirme as regras da venda local.";
+
+    throw error;
+  }
+
+  const usesStock =
+    inventory.usesStock ===
+    true;
+
+  let initialQuantity =
+    0;
+
+  if (usesStock) {
+    initialQuantity =
+      integer(
+        inventory.initialQuantity,
+        -1
+      );
+
+    if (
+      initialQuantity < 1 ||
+      initialQuantity >
+        10_000_000
+    ) {
+      const error =
+        new Error(
+          "INVALID_INITIAL_STOCK"
+        );
+
+      error.statusCode =
+        422;
+
+      error.publicMessage =
+        "Estoque inicial inválido.";
+
+      throw error;
+    }
+  }
+
+  return {
+    localType,
+    orderType:
+      clip(
+        local.orderType ||
+          "quick",
+        40
+      ),
+    addressId:
+      clip(
+        local.sellerAddressKey ||
+          "primary",
+        40
+      ),
+    deliveryAvailable,
+    pickupAvailable,
+    sellerOwnDelivery:
+      local.sellerOwnDelivery ===
+      true,
+    serviceRadiusKm,
+    deliveryFeeCents,
+    preparationTimeMin,
+    paymentMethods:
+      normalizePaymentMethods(
+        local.paymentMethods
+      ),
+    usesStock,
+    initialQuantity,
+  };
+}
+function validateVariationDefinitions(
+  raw
+) {
+  if (
+    !Array.isArray(raw) ||
+    raw.length === 0
+  ) {
+    return [];
+  }
+
+  if (
+    raw.length > 12
+  ) {
+    const error =
+      new Error(
+        "TOO_MANY_VARIATION_GROUPS"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Há variações demais neste produto.";
+
+    throw error;
+  }
+
+  let totalOptions =
+    0;
+
+  const definitions =
+    [];
+
+  for (
+    const item
+    of raw
+  ) {
+    const name =
+      clip(
+        item?.name,
+        60
+      );
+
+    const options =
+      Array.isArray(
+        item?.options
+      )
+        ? [
+            ...new Set(
+              item.options
+                .map(
+                  (x) =>
+                    clip(
+                      x,
+                      80
+                    )
+                )
+                .filter(
+                  Boolean
+                )
+            ),
+          ]
+        : [];
+
+    if (
+      !name ||
+      options.length === 0 ||
+      options.length > 20
+    ) {
+      const error =
+        new Error(
+          "INVALID_VARIATION_DEFINITION"
+        );
+
+      error.statusCode =
+        422;
+
+      error.publicMessage =
+        "Revise as variações do produto.";
+
+      throw error;
     }
 
-    if (!canRequestPasswordReset(email)) {
-      return res.status(429).json({
-        ok: false,
-        error: "Aguarde um pouco antes de pedir outro link.",
-      });
+    totalOptions +=
+      options.length;
+
+    if (
+      totalOptions > 60
+    ) {
+      const error =
+        new Error(
+          "TOO_MANY_VARIATION_OPTIONS"
+        );
+
+      error.statusCode =
+        422;
+
+      error.publicMessage =
+        "Há opções de variação demais.";
+
+      throw error;
     }
 
-    ensureEmailConfig();
+    definitions.push({
+      name,
+      options,
+    });
+  }
 
-    let userRecord = null;
+  return definitions;
+}
+
+function cartesianVariantAttributes(
+  definitions
+) {
+  if (
+    definitions.length === 0
+  ) {
+    return [{}];
+  }
+
+  let combinations =
+    [{}];
+
+  for (
+    const definition
+    of definitions
+  ) {
+    const next = [];
+
+    for (
+      const current
+      of combinations
+    ) {
+      for (
+        const option
+        of definition.options
+      ) {
+        next.push({
+          ...current,
+          [definition.name]:
+            option,
+        });
+
+        if (
+          next.length >
+          MAX_VARIANT_COMBINATIONS
+        ) {
+          const error =
+            new Error(
+              "TOO_MANY_VARIANT_COMBINATIONS"
+            );
+
+          error.statusCode =
+            422;
+
+          error.publicMessage =
+            "As variações geram combinações demais. Reduza as opções.";
+
+          throw error;
+        }
+      }
+    }
+
+    combinations =
+      next;
+  }
+
+  return combinations;
+}
+
+function buildVariantsAndInventory({
+  productId,
+  definitions,
+  priceCents,
+  usesStock,
+  initialQuantity,
+  t,
+}) {
+  const variants = {};
+  const inventory = {};
+
+  const combinations =
+    cartesianVariantAttributes(
+      definitions
+    );
+
+  const sharedSkuId =
+    `${productId}__shared`;
+
+  combinations.forEach(
+    (
+      attributes,
+      index
+    ) => {
+      const variantId =
+        combinations.length === 1 &&
+        definitions.length === 0
+          ? "default"
+          : `v_${String(
+              index + 1
+            ).padStart(
+              3,
+              "0"
+            )}`;
+
+      const name =
+        Object.values(
+          attributes
+        ).join(" / ") ||
+        "Padrão";
+
+      variants[variantId] = {
+        variantId,
+        skuId:
+          sharedSkuId,
+        name:
+          clip(
+            name,
+            160
+          ),
+        attributes,
+        priceCents,
+        status:
+          "active",
+        createdAtMs:
+          t,
+        updatedAtMs:
+          t,
+      };
+    }
+  );
+
+  if (usesStock) {
+    inventory[sharedSkuId] = {
+      skuId:
+        sharedSkuId,
+      productId,
+      stockMode:
+        "shared_across_variants",
+      availableQuantity:
+        initialQuantity,
+      reservedQuantity:
+        0,
+      status:
+        initialQuantity > 0
+          ? "in_stock"
+          : "out_of_stock",
+      updatedAtMs:
+        t,
+    };
+  }
+
+  return {
+    variants,
+    inventory,
+  };
+}
+
+function initialProductStats(
+  t
+) {
+  return {
+    boostClickCount:
+      0,
+    boostViewCount:
+      0,
+    chatStartCount:
+      0,
+    clickCount:
+      0,
+    commentCount:
+      0,
+    favoriteCount:
+      0,
+    likeCount:
+      0,
+    orderStartCount:
+      0,
+    uniqueViewsEstimate:
+      0,
+    viewsCount:
+      0,
+    updatedAtMs:
+      t,
+  };
+}
+
+function publicProductCard(
+  product,
+  coverThumbUrl,
+  t,
+  oldCard = {}
+) {
+  return {
+    productId:
+      product.productId,
+
+    storeId:
+      product.storeId,
+
+    ownerUid:
+      product.ownerUid,
+
+    title:
+      product.title,
+
+    coverUrl:
+      coverThumbUrl,
+
+    priceCents:
+      integer(
+        product.pricing
+          ?.priceCents
+      ),
+
+    currency:
+      "BRL",
+
+    categoryId:
+      product.categoryId,
+
+    productType:
+      product.productType,
+
+    ratingAverage:
+      finiteNumber(
+        oldCard.ratingAverage,
+        0
+      ),
+
+    ratingCount:
+      integer(
+        oldCard.ratingCount,
+        0
+      ),
+
+    city:
+      clip(
+        product.local
+          ?.city || "",
+        100
+      ),
+
+    state:
+      clip(
+        product.local
+          ?.state || "",
+        64
+      ),
+
+    createdAtMs:
+      integer(
+        product.lifecycle
+          ?.createdAtMs,
+        t
+      ),
+
+    updatedAtMs:
+      t,
+
+    rankScore:
+      finiteNumber(
+        oldCard.rankScore,
+        0
+      ),
+  };
+}
+
+function addProjectionRemovals(
+  updates,
+  product,
+  oldSearchTerms = []
+) {
+  const productId =
+    safe(
+      product.productId
+    );
+
+  if (!productId) {
+    return;
+  }
+
+  updates[
+    `product_cards/${productId}`
+  ] =
+    null;
+
+  updates[
+    `feed_index/${productId}`
+  ] =
+    null;
+
+  updates[
+    `active_boost_cards/${productId}`
+  ] =
+    null;
+
+  if (
+    product.categoryId
+  ) {
+    updates[
+      `category_index/${firebaseSafeKey(
+        product.categoryId
+      )}/${productId}`
+    ] =
+      null;
+  }
+
+  for (
+    const term
+    of oldSearchTerms
+  ) {
+    if (term) {
+      updates[
+        `search_index_basic/${firebaseSafeKey(
+          term
+        )}/${productId}`
+      ] =
+        null;
+    }
+  }
+
+  if (
+    product.storeId
+  ) {
+    updates[
+      `store_products/${product.storeId}/${productId}`
+    ] =
+      null;
+  }
+}
+
+function addPublicProjections(
+  updates,
+  product,
+  card,
+  searchTerms,
+  t
+) {
+  const productId =
+    product.productId;
+
+  updates[
+    `product_cards/${productId}`
+  ] =
+    card;
+
+  updates[
+    `feed_index/${productId}`
+  ] = {
+    productId,
+    createdAtMs:
+      product.lifecycle
+        .createdAtMs,
+    score:
+      finiteNumber(
+        card.rankScore,
+        0
+      ),
+  };
+
+  updates[
+    `category_index/${firebaseSafeKey(
+      product.categoryId
+    )}/${productId}`
+  ] = {
+    productId,
+    createdAtMs:
+      product.lifecycle
+        .createdAtMs,
+    score:
+      finiteNumber(
+        card.rankScore,
+        0
+      ),
+  };
+
+  updates[
+    `store_products/${product.storeId}/${productId}`
+  ] = {
+    productId,
+    createdAtMs:
+      product.lifecycle
+        .createdAtMs,
+    status:
+      "active",
+  };
+
+  for (
+    const term
+    of searchTerms
+  ) {
+    updates[
+      `search_index_basic/${firebaseSafeKey(
+        term
+      )}/${productId}`
+    ] = {
+      productId,
+      score:
+        finiteNumber(
+          card.rankScore,
+          0
+        ),
+      createdAtMs:
+        product.lifecycle
+          .createdAtMs,
+    };
+  }
+
+  updates[
+    `product_cards/${productId}/updatedAtMs`
+  ] =
+    t;
+}
+
+async function mediaForNewProduct(
+  bodyMedia,
+  uid,
+  productId,
+  scope
+) {
+  const finalized =
+    await finalizeUploadedMedia(
+      bodyMedia,
+      uid,
+      productId,
+      scope
+    );
+
+  return {
+    detailUrls:
+      finalized.map(
+        (item) =>
+          item.detailUrl
+      ),
+
+    thumbUrls:
+      finalized.map(
+        (item) =>
+          item.thumbUrl
+      ),
+  };
+}
+
+async function mediaForProductUpdate(
+  rawImages,
+  existingProduct,
+  uid,
+  productId,
+  scope
+) {
+  if (
+    !Array.isArray(
+      rawImages
+    ) ||
+    rawImages.length < 1 ||
+    rawImages.length >
+      MAX_PRODUCT_IMAGES
+  ) {
+    const error =
+      new Error(
+        "INVALID_MEDIA_COUNT"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      `Selecione entre 1 e ${MAX_PRODUCT_IMAGES} imagens.`;
+
+    throw error;
+  }
+
+  const existingUrls =
+    new Set(
+      Array.isArray(
+        existingProduct.media
+          ?.images
+      )
+        ? existingProduct
+            .media
+            .images
+            .map(safe)
+        : []
+    );
+
+  if (
+    existingProduct.media
+      ?.coverUrl
+  ) {
+    existingUrls.add(
+      safe(
+        existingProduct.media
+          .coverUrl
+      )
+    );
+  }
+
+  const ordered =
+    [...rawImages].sort(
+      (a, b) =>
+        integer(a.order) -
+        integer(b.order)
+    );
+
+  const detailUrls =
+    [];
+
+  const thumbUrls =
+    [];
+
+  for (
+    const item
+    of ordered
+  ) {
+    const kind =
+      safe(
+        item.kind
+      ).toLowerCase();
+
+    if (
+      kind === "existing"
+    ) {
+      const url =
+        safe(
+          item.url
+        );
+
+      if (
+        !url ||
+        !existingUrls.has(url)
+      ) {
+        const error =
+          new Error(
+            "FOREIGN_EXISTING_MEDIA"
+          );
+
+        error.statusCode =
+          403;
+
+        error.publicMessage =
+          "Uma imagem existente não pertence a este produto.";
+
+        throw error;
+      }
+
+      const rescoped =
+        rescopeExistingMediaUrl(
+          url,
+          uid,
+          productId,
+          scope
+        );
+
+      detailUrls.push(
+        rescoped
+      );
+
+      const own =
+        parseOwnDeliveryUrl(
+          rescoped,
+          uid,
+          productId
+        );
+
+      thumbUrls.push(
+        own
+          ? deliveryMediaUrl({
+              uid,
+              productId,
+              path:
+                own.path.replace(
+                  /detail\.webp$/,
+                  "thumb.webp"
+                ),
+              scope,
+              kind:
+                "thumb",
+            })
+          : rescoped
+      );
+
+      continue;
+    }
+
+    if (
+      kind === "uploaded"
+    ) {
+      const payload =
+        verifyMediaUploadToken(
+          item.mediaId,
+          uid
+        );
+
+      detailUrls.push(
+        deliveryMediaUrl({
+          uid,
+          productId,
+          path:
+            payload.detailPath,
+          scope,
+          kind:
+            "detail",
+        })
+      );
+
+      thumbUrls.push(
+        deliveryMediaUrl({
+          uid,
+          productId,
+          path:
+            payload.thumbPath,
+          scope,
+          kind:
+            "thumb",
+        })
+      );
+
+      continue;
+    }
+
+    const error =
+      new Error(
+        "INVALID_MEDIA_KIND"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Formato de imagem inválido.";
+
+    throw error;
+  }
+
+  return {
+    detailUrls,
+    thumbUrls,
+  };
+}
+
+function publicError(
+  res,
+  error,
+  fallback =
+    "Não foi possível concluir a operação."
+) {
+  if (
+    NODE_ENV !==
+    "production"
+  ) {
+    console.error(
+      error
+    );
+  } else {
+    console.error(
+      error?.message ||
+        fallback
+    );
+  }
+
+  return res
+    .status(
+      error.statusCode ||
+        500
+    )
+    .json({
+      ok: false,
+      code:
+        safe(
+          error.message ||
+            "SERVER_ERROR"
+        ).slice(
+          0,
+          100
+        ),
+      message:
+        error.publicMessage ||
+        fallback,
+    });
+}
+
+app.get(
+  "/v1/media/public/:token",
+  async (
+    req,
+    res
+  ) => {
+    return streamStoredMedia(
+      req,
+      res,
+      "public"
+    );
+  }
+);
+
+app.get(
+  "/v1/media/private/:token",
+  requireUser,
+  async (
+    req,
+    res
+  ) => {
+    return streamStoredMedia(
+      req,
+      res,
+      "private"
+    );
+  }
+);
+
+app.post(
+  "/v1/media/product",
+  requireUser,
+  rateLimit(
+    "media",
+    20,
+    10 * 60 * 1000
+  ),
+  express.raw({
+    type:
+      "multipart/form-data",
+    limit:
+      "14mb",
+  }),
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const uid =
+        req.auth.uid;
+
+      await assertSellerCanPublish(
+        uid
+      );
+
+      const {
+        fields,
+        file,
+      } =
+        parseMultipartSingleFile(
+          req
+        );
+
+      if (
+        file.bytes.length <= 0 ||
+        file.bytes.length >
+          MAX_MEDIA_BYTES
+      ) {
+        return res
+          .status(413)
+          .json({
+            ok: false,
+            code:
+              "MEDIA_TOO_LARGE",
+            message:
+              "A imagem ultrapassa o limite permitido.",
+          });
+      }
+
+      if (
+        !detectImageType(
+          file.bytes
+        )
+      ) {
+        return res
+          .status(415)
+          .json({
+            ok: false,
+            code:
+              "UNSUPPORTED_MEDIA_TYPE",
+            message:
+              "Formato de imagem não aceito.",
+          });
+      }
+
+      const productId =
+        safe(
+          fields.productId
+        );
+
+      if (productId) {
+        const productSnap =
+          await db
+            .ref(
+              `products/${productId}`
+            )
+            .get();
+
+        const product =
+          map(
+            productSnap.val()
+          );
+
+        if (
+          !productSnap.exists()
+        ) {
+          return res
+            .status(404)
+            .json({
+              ok: false,
+              code:
+                "PRODUCT_NOT_FOUND",
+            });
+        }
+
+        if (
+          product.ownerUid !==
+          uid
+        ) {
+          return res
+            .status(403)
+            .json({
+              ok: false,
+              code:
+                "PRODUCT_OWNER_REQUIRED",
+            });
+        }
+      }
+
+      const session =
+        await createMediaUploadSession(
+          uid,
+          file.bytes
+        );
+
+      return res
+        .status(201)
+        .json({
+          ok: true,
+          mediaId:
+            session.mediaId,
+          data: {
+            mediaId:
+              session.mediaId,
+          },
+        });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Não foi possível processar a imagem."
+      );
+    }
+  }
+);
+
+app.post(
+  "/v1/products",
+  requireUser,
+  rateLimit(
+    "product-create",
+    12,
+    10 * 60 * 1000
+  ),
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const uid =
+        req.auth.uid;
+
+      await assertSellerCanPublish(
+        uid
+      );
+
+      const body =
+        map(
+          req.body
+        );
+
+      const productType =
+        safe(
+          body.productType
+        ).toLowerCase();
+
+      if (
+        ![
+          "affiliate",
+          "local",
+        ].includes(
+          productType
+        )
+      ) {
+        const error =
+          new Error(
+            "INVALID_PRODUCT_TYPE"
+          );
+
+        error.statusCode =
+          422;
+
+        error.publicMessage =
+          "Tipo de produto inválido.";
+
+        throw error;
+      }
+
+      const flagName =
+        productType ===
+        "local"
+          ? "localOrders"
+          : "affiliateProducts";
+
+      if (
+        !(await getFeatureFlag(
+          flagName,
+          true
+        ))
+      ) {
+        const error =
+          new Error(
+            "PRODUCT_TYPE_DISABLED"
+          );
+
+        error.statusCode =
+          409;
+
+        error.publicMessage =
+          "Este tipo de produto está temporariamente desativado.";
+
+        throw error;
+      }
+
+      const title =
+        validateProductTitle(
+          body.title
+        );
+
+      const description =
+        validateProductDescription(
+          body.description
+        );
+
+      const priceCents =
+        validatePriceCents(
+          body.priceCents
+        );
+
+      const category =
+        await validateCategory(
+          body.categoryId,
+          productType
+        );
+
+      const storeId =
+        await resolveStoreForUser(
+          uid,
+          body.storeId
+        );
+
+      const {
+        store,
+        settings,
+      } =
+        await getStoreContext(
+          storeId
+        );
+
+      validateStoreFeature(
+        settings,
+        productType
+      );
+
+      const accountVisibility =
+        await getAccountVisibility(
+          uid
+        );
+
+      const publicEligible =
+        accountAndStoreCanBePublic(
+          accountVisibility,
+          store
+        );
+
+      const visibility =
+        publicEligible
+          ? "public"
+          : "private";
+
+      const mediaScope =
+        publicEligible
+          ? "public"
+          : "private";
+
+      const t =
+        nowMs();
+
+      const productId =
+        db
+          .ref(
+            "products"
+          )
+          .push()
+          .key;
+
+      if (!productId) {
+        throw new Error(
+          "PRODUCT_ID_GENERATION_FAILED"
+        );
+      }
+
+      const media =
+        await mediaForNewProduct(
+          body.media,
+          uid,
+          productId,
+          mediaScope
+        );
+
+      const product = {
+        productId,
+        storeId,
+        ownerUid:
+          uid,
+        productType,
+        status:
+          "active",
+        visibility,
+
+        moderation: {
+          status:
+            "approved",
+          reportCount:
+            0,
+          source:
+            "backend_validation",
+        },
+
+        title,
+        description,
+        categoryId:
+          category.id,
+
+        pricing: {
+          currency:
+            "BRL",
+          priceCents,
+        },
+
+        media: {
+          coverUrl:
+            media.detailUrls[0],
+          images:
+            media.detailUrls,
+        },
+
+        commerce: {
+          purchaseMode:
+            productType ===
+            "affiliate"
+              ? "affiliate_redirect"
+              : "local_order",
+
+          allowChat:
+            settings.chatEnabled !==
+            false,
+
+          stockManagedByFireRank:
+            false,
+        },
+
+        lifecycle: {
+          createdAtMs:
+            t,
+          updatedAtMs:
+            t,
+          deletedAtMs:
+            0,
+        },
+      };
+
+      let variants = {};
+      let inventory = {};
+
+      if (
+        productType ===
+        "affiliate"
+      ) {
+        const affiliate =
+          validateAffiliateUrl(
+            body.affiliate
+              ?.url
+          );
+
+        product.affiliate = {
+          ...affiliate,
+          validatedAtMs:
+            t,
+          serverRevalidationRequired:
+            true,
+        };
+      } else {
+        const localConfig =
+          validateLocalConfig(
+            body.local,
+            body.inventory
+          );
+
+        const {
+          id: addressId,
+          address,
+        } =
+          await resolveLocalAddress(
+            uid,
+            localConfig.addressId
+          );
+
+        const definitions =
+          validateVariationDefinitions(
+            body.variations
+          );
+
+        const built =
+          buildVariantsAndInventory({
+            productId,
+            definitions,
+            priceCents,
+            usesStock:
+              localConfig.usesStock,
+            initialQuantity:
+              localConfig.initialQuantity,
+            t,
+          });
+
+        variants =
+          built.variants;
+
+        inventory =
+          built.inventory;
+
+        product.commerce
+          .stockManagedByFireRank =
+          localConfig.usesStock;
+
+        product.local = {
+          localType:
+            localConfig.localType,
+
+          orderType:
+            localConfig.orderType,
+
+          addressId,
+
+          city:
+            clip(
+              address.city,
+              100
+            ),
+
+          state:
+            clip(
+              address.state,
+              64
+            ),
+
+          neighborhood:
+            clip(
+              address.neighborhood,
+              120
+            ),
+
+          locationPrivacy:
+            "approximate_only_public",
+
+          deliveryAvailable:
+            localConfig
+              .deliveryAvailable,
+
+          pickupAvailable:
+            localConfig
+              .pickupAvailable,
+
+          sellerOwnDelivery:
+            localConfig
+              .sellerOwnDelivery,
+
+          serviceRadiusKm:
+            localConfig
+              .serviceRadiusKm,
+
+          preparationTimeMin:
+            localConfig
+              .preparationTimeMin,
+
+          deliveryFeeCents:
+            localConfig
+              .deliveryFeeCents,
+
+          paymentMethods:
+            localConfig
+              .paymentMethods,
+
+          variationDefinitions:
+            definitions,
+        };
+      }
+
+      const updates = {
+        [`products/${productId}`]:
+          product,
+
+        [`product_stats/${productId}`]:
+          initialProductStats(
+            t
+          ),
+      };
+
+      for (
+        const [
+          variantId,
+          variant,
+        ]
+        of Object.entries(
+          variants
+        )
+      ) {
+        updates[
+          `product_variants/${productId}/${variantId}`
+        ] =
+          variant;
+      }
+
+      for (
+        const [
+          skuId,
+          stock,
+        ]
+        of Object.entries(
+          inventory
+        )
+      ) {
+        updates[
+          `inventory/${skuId}`
+        ] =
+          stock;
+      }
+
+      if (
+        publicEligible
+      ) {
+        const card =
+          publicProductCard(
+            product,
+            media.thumbUrls[0],
+            t
+          );
+
+        addPublicProjections(
+          updates,
+          product,
+          card,
+          searchTermsForProduct(
+            title,
+            category.id
+          ),
+          t
+        );
+      }
+
+      await db
+        .ref()
+        .update(
+          updates
+        );
+
+      await appendAudit(
+        "product_created",
+        {
+          actorUid:
+            uid,
+          targetUid:
+            uid,
+          referenceId:
+            productId,
+        }
+      );
+
+      return res
+        .status(201)
+        .json({
+          ok: true,
+          productId,
+          visibility,
+          publicProjected:
+            publicEligible,
+        });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Não foi possível publicar o produto."
+      );
+    }
+  }
+);
+app.post(
+  "/v1/products/update",
+  requireUser,
+  rateLimit(
+    "product-update",
+    20,
+    10 * 60 * 1000
+  ),
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const uid =
+        req.auth.uid;
+
+      await assertSellerCanPublish(
+        uid
+      );
+
+      const body =
+        map(
+          req.body
+        );
+
+      const productId =
+        safe(
+          body.productId
+        );
+
+      if (!productId) {
+        const error =
+          new Error(
+            "PRODUCT_ID_REQUIRED"
+          );
+
+        error.statusCode =
+          400;
+
+        error.publicMessage =
+          "Produto inválido.";
+
+        throw error;
+      }
+
+      const productSnap =
+        await db
+          .ref(
+            `products/${productId}`
+          )
+          .get();
+
+      if (
+        !productSnap.exists()
+      ) {
+        const error =
+          new Error(
+            "PRODUCT_NOT_FOUND"
+          );
+
+        error.statusCode =
+          404;
+
+        error.publicMessage =
+          "Produto não encontrado.";
+
+        throw error;
+      }
+
+      const existing =
+        map(
+          productSnap.val()
+        );
+
+      if (
+        existing.ownerUid !==
+        uid
+      ) {
+        const error =
+          new Error(
+            "PRODUCT_OWNER_REQUIRED"
+          );
+
+        error.statusCode =
+          403;
+
+        error.publicMessage =
+          "Você não pode editar este produto.";
+
+        throw error;
+      }
+
+      const productType =
+        safe(
+          existing.productType
+        ).toLowerCase();
+
+      const expectedType =
+        safe(
+          body.expectedProductType
+        ).toLowerCase();
+
+      if (
+        expectedType &&
+        expectedType !==
+          productType
+      ) {
+        const error =
+          new Error(
+            "PRODUCT_TYPE_CONFLICT"
+          );
+
+        error.statusCode =
+          409;
+
+        error.publicMessage =
+          "O tipo original do produto mudou. Atualize a tela.";
+
+        throw error;
+      }
+
+      if (
+        ![
+          "affiliate",
+          "local",
+        ].includes(
+          productType
+        )
+      ) {
+        const error =
+          new Error(
+            "UNSUPPORTED_PRODUCT_TYPE"
+          );
+
+        error.statusCode =
+          409;
+
+        error.publicMessage =
+          "Este produto usa um formato antigo ainda não suportado.";
+
+        throw error;
+      }
+
+      const title =
+        validateProductTitle(
+          body.title
+        );
+
+      const description =
+        validateProductDescription(
+          body.description
+        );
+
+      const priceCents =
+        validatePriceCents(
+          body.priceCents
+        );
+
+      const category =
+        await validateCategory(
+          body.categoryId,
+          productType
+        );
+
+      const storeId =
+        await resolveStoreForUser(
+          uid,
+          existing.storeId
+        );
+
+      const {
+        store,
+        settings,
+      } =
+        await getStoreContext(
+          storeId
+        );
+
+      validateStoreFeature(
+        settings,
+        productType
+      );
+
+      const accountVisibility =
+        await getAccountVisibility(
+          uid
+        );
+
+      const publicEligible =
+        accountAndStoreCanBePublic(
+          accountVisibility,
+          store
+        );
+
+      const visibility =
+        publicEligible
+          ? "public"
+          : "private";
+
+      const mediaScope =
+        publicEligible
+          ? "public"
+          : "private";
+
+      const t =
+        nowMs();
+
+      const media =
+        await mediaForProductUpdate(
+          body.images,
+          existing,
+          uid,
+          productId,
+          mediaScope
+        );
+
+      const updated = {
+        ...existing,
+
+        productId,
+        storeId,
+
+        ownerUid:
+          uid,
+
+        productType,
+
+        status:
+          existing.status ===
+          "deleted"
+            ? "deleted"
+            : "active",
+
+        visibility:
+          existing.status ===
+          "deleted"
+            ? "hidden"
+            : visibility,
+
+        title,
+        description,
+
+        categoryId:
+          category.id,
+
+        pricing: {
+          ...map(
+            existing.pricing
+          ),
+
+          currency:
+            "BRL",
+
+          priceCents,
+        },
+
+        media: {
+          coverUrl:
+            media.detailUrls[0],
+
+          images:
+            media.detailUrls,
+        },
+
+        commerce: {
+          ...map(
+            existing.commerce
+          ),
+
+          allowChat:
+            settings.chatEnabled !==
+            false,
+        },
+
+        lifecycle: {
+          ...map(
+            existing.lifecycle
+          ),
+
+          createdAtMs:
+            integer(
+              existing.lifecycle
+                ?.createdAtMs,
+              t
+            ),
+
+          updatedAtMs:
+            t,
+
+          deletedAtMs:
+            integer(
+              existing.lifecycle
+                ?.deletedAtMs,
+              0
+            ),
+        },
+      };
+
+      if (
+        productType ===
+        "affiliate"
+      ) {
+        const affiliate =
+          validateAffiliateUrl(
+            body.affiliate
+              ?.url
+          );
+
+        updated.affiliate = {
+          ...map(
+            existing.affiliate
+          ),
+          ...affiliate,
+
+          validatedAtMs:
+            t,
+
+          serverRevalidationRequired:
+            true,
+        };
+
+        delete updated.local;
+      }
+
+      const oldCardSnap =
+        await db
+          .ref(
+            `product_cards/${productId}`
+          )
+          .get();
+
+      const oldCard =
+        map(
+          oldCardSnap.val()
+        );
+
+      const oldTerms =
+        searchTermsForProduct(
+          existing.title,
+          existing.categoryId
+        );
+
+      const updates = {
+        [`products/${productId}`]:
+          updated,
+      };
+
+      addProjectionRemovals(
+        updates,
+        existing,
+        oldTerms
+      );
+
+      if (
+        publicEligible &&
+        updated.status ===
+          "active" &&
+        safe(
+          updated.moderation
+            ?.status
+        ) === "approved"
+      ) {
+        const card =
+          publicProductCard(
+            updated,
+            media.thumbUrls[0],
+            t,
+            oldCard
+          );
+
+        addPublicProjections(
+          updates,
+          updated,
+          card,
+          searchTermsForProduct(
+            title,
+            category.id
+          ),
+          t
+        );
+
+        const sponsoredCardSnap =
+          await db
+            .ref(
+              `active_boost_cards/${productId}`
+            )
+            .get();
+
+        const sponsoredCard =
+          map(
+            sponsoredCardSnap.val()
+          );
+
+        const currentBoostId =
+          safe(
+            sponsoredCard.boostId
+          );
+
+        if (currentBoostId) {
+          const activeBoostSnap =
+            await db
+              .ref(
+                `boosts/${currentBoostId}`
+              )
+              .get();
+
+          const activeBoost =
+            map(
+              activeBoostSnap.val()
+            );
+
+          if (
+            activeBoost.status ===
+              "active" &&
+            finiteNumber(
+              activeBoost.expiresAtMs,
+              0
+            ) > t
+          ) {
+            updates[
+              `active_boost_cards/${productId}`
+            ] = {
+              ...card,
+
+              boostId:
+                currentBoostId,
+
+              startsAtMs:
+                finiteNumber(
+                  activeBoost.startsAtMs,
+                  t
+                ),
+
+              expiresAtMs:
+                finiteNumber(
+                  activeBoost.expiresAtMs,
+                  t
+                ),
+            };
+          }
+        }
+      }
+
+      await db
+        .ref()
+        .update(
+          updates
+        );
+
+      await appendAudit(
+        "product_updated",
+        {
+          actorUid:
+            uid,
+
+          targetUid:
+            uid,
+
+          referenceId:
+            productId,
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        productId,
+
+        visibility:
+          updated.visibility,
+
+        publicProjected:
+          publicEligible &&
+          updated.status ===
+            "active" &&
+          updated.moderation
+            ?.status ===
+            "approved",
+      });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Não foi possível atualizar o produto."
+      );
+    }
+  }
+);
+
+function validateAddressPayload(
+  raw
+) {
+  const address =
+    map(raw);
+
+  const fullName =
+    clip(
+      address.fullName,
+      120
+    );
+
+  const phone =
+    safe(
+      address.phone
+    )
+      .replace(
+        /\D/g,
+        ""
+      )
+      .slice(
+        0,
+        32
+      );
+
+  const cep =
+    safe(
+      address.cep
+    )
+      .replace(
+        /\D/g,
+        ""
+      )
+      .slice(
+        0,
+        16
+      );
+
+  const city =
+    clip(
+      address.city,
+      100
+    );
+
+  const state =
+    clip(
+      address.state,
+      64
+    ).toUpperCase();
+
+  const neighborhood =
+    clip(
+      address.neighborhood,
+      120
+    );
+
+  const street =
+    clip(
+      address.street,
+      180
+    );
+
+  const number =
+    clip(
+      address.number,
+      24
+    );
+
+  const complement =
+    clip(
+      address.complement,
+      160
+    );
+
+  const referencePoint =
+    clip(
+      address.referencePoint,
+      180
+    );
+
+  if (
+    fullName.length < 3
+  ) {
+    throwAddress(
+      "Nome inválido."
+    );
+  }
+
+  if (
+    phone.length < 10 ||
+    phone.length > 15
+  ) {
+    throwAddress(
+      "Telefone inválido."
+    );
+  }
+
+  if (
+    cep &&
+    cep.length !== 8
+  ) {
+    throwAddress(
+      "CEP inválido."
+    );
+  }
+
+  if (
+    street.length < 2
+  ) {
+    throwAddress(
+      "Rua inválida."
+    );
+  }
+
+  if (!number) {
+    throwAddress(
+      "Número do endereço obrigatório."
+    );
+  }
+
+  if (
+    neighborhood.length < 2
+  ) {
+    throwAddress(
+      "Bairro inválido."
+    );
+  }
+
+  if (
+    city.length < 2
+  ) {
+    throwAddress(
+      "Cidade inválida."
+    );
+  }
+
+  const validStates =
+    new Set([
+      "AC",
+      "AL",
+      "AP",
+      "AM",
+      "BA",
+      "CE",
+      "DF",
+      "ES",
+      "GO",
+      "MA",
+      "MT",
+      "MS",
+      "MG",
+      "PA",
+      "PB",
+      "PR",
+      "PE",
+      "PI",
+      "RJ",
+      "RN",
+      "RS",
+      "RO",
+      "RR",
+      "SC",
+      "SP",
+      "SE",
+      "TO",
+    ]);
+
+  if (
+    !validStates.has(
+      state
+    )
+  ) {
+    throwAddress(
+      "UF inválida."
+    );
+  }
+
+  return {
+    cep,
+    city,
+    state,
+    neighborhood,
+    street,
+    number,
+    complement,
+    referencePoint,
+    fullName,
+    phone,
+  };
+}
+
+function throwAddress(
+  message
+) {
+  const error =
+    new Error(
+      "INVALID_ADDRESS"
+    );
+
+  error.statusCode =
+    422;
+
+  error.publicMessage =
+    message;
+
+  throw error;
+}
+
+function normalizePrivateLocation(
+  raw
+) {
+  const value =
+    map(raw);
+
+  const latitude =
+    finiteNumber(
+      value.latitude,
+      0
+    );
+
+  const longitude =
+    finiteNumber(
+      value.longitude,
+      0
+    );
+
+  const accuracyMeters =
+    Math.max(
+      0,
+      Math.min(
+        100000,
+        finiteNumber(
+          value.accuracyMeters,
+          0
+        )
+      )
+    );
+
+  const valid =
+    latitude >= -90 &&
+    latitude <= 90 &&
+    longitude >= -180 &&
+    longitude <= 180 &&
+    latitude !== 0 &&
+    longitude !== 0;
+
+  return valid
+    ? {
+        latitude,
+        longitude,
+        accuracyMeters,
+        source:
+          "device_location",
+      }
+    : {
+        latitude:
+          0,
+        longitude:
+          0,
+        accuracyMeters:
+          0,
+        source:
+          "manual",
+      };
+}
+
+app.post(
+  "/v1/account/address",
+  requireUser,
+  rateLimit(
+    "address-save",
+    15,
+    10 * 60 * 1000
+  ),
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const uid =
+        req.auth.uid;
+
+      const body =
+        map(
+          req.body
+        );
+
+      const addressId =
+        safe(
+          body.addressId ||
+            "primary"
+        ).toLowerCase();
+
+      if (
+        addressId !==
+        "primary"
+      ) {
+        const error =
+          new Error(
+            "PRIMARY_ADDRESS_ONLY"
+          );
+
+        error.statusCode =
+          422;
+
+        error.publicMessage =
+          "Esta tela gerencia o endereço principal.";
+
+        throw error;
+      }
+
+      const address =
+        validateAddressPayload(
+          body.address
+        );
+
+      const location =
+        normalizePrivateLocation(
+          body.deviceLocation
+        );
+
+      const t =
+        nowMs();
+
+      const record = {
+        ...address,
+
+        latitude:
+          location.latitude,
+
+        longitude:
+          location.longitude,
+
+        accuracyMeters:
+          location.accuracyMeters,
+
+        source:
+          location.source,
+
+        confirmedByUser:
+          true,
+
+        confirmedAtMs:
+          t,
+
+        usableForOrder:
+          true,
+
+        needsReview:
+          false,
+      };
+
+      const updates = {
+        [`user_addresses/${uid}/primary`]:
+          record,
+      };
+
+      if (
+        body.alsoUseForShipping ===
+        true
+      ) {
+        updates[
+          `user_addresses/${uid}/shipping`
+        ] =
+          record;
+      }
+
+      await db
+        .ref()
+        .update(
+          updates
+        );
+
+      await appendAudit(
+        "address_updated",
+        {
+          actorUid:
+            uid,
+          targetUid:
+            uid,
+          referenceId:
+            "primary",
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        addressId:
+          "primary",
+
+        usableForOrder:
+          true,
+
+        needsReview:
+          false,
+
+        locationSource:
+          location.source,
+      });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Não foi possível salvar o endereço."
+      );
+    }
+  }
+);
+
+function escapeHtml(
+  value
+) {
+  return String(
+    value ?? ""
+  )
+    .replace(
+      /&/g,
+      "&amp;"
+    )
+    .replace(
+      /</g,
+      "&lt;"
+    )
+    .replace(
+      />/g,
+      "&gt;"
+    )
+    .replace(
+      /"/g,
+      "&quot;"
+    )
+    .replace(
+      /'/g,
+      "&#039;"
+    );
+}
+
+function isValidEmail(
+  email
+) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
+    safe(email).toLowerCase()
+  );
+}
+
+function maskEmail(
+  email
+) {
+  const [
+    name = "",
+    domain = "",
+  ] =
+    safe(email).split("@");
+
+  if (!domain) {
+    return "***";
+  }
+
+  const visible =
+    name.slice(
+      0,
+      Math.min(
+        2,
+        name.length
+      )
+    );
+
+  return `${visible}***@${domain}`;
+}
+function htmlPage(
+  title,
+  message
+) {
+  return `<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>${escapeHtml(title)}</title>
+  <style>
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      min-height:100vh;
+      background:#05070b;
+      color:#fff;
+      font-family:Arial,sans-serif;
+      display:grid;
+      place-items:center;
+      padding:24px
+    }
+    .card{
+      width:min(100%,560px);
+      padding:28px;
+      border-radius:24px;
+      background:#0f1722;
+      border:1px solid #19364b;
+      box-shadow:0 22px 70px rgba(0,0,0,.35)
+    }
+    .brand{
+      display:inline-grid;
+      place-items:center;
+      width:52px;
+      height:52px;
+      border-radius:17px;
+      background:rgba(14,165,255,.12);
+      border:1px solid rgba(14,165,255,.28);
+      color:#0ea5ff;
+      font-weight:900;
+      margin-bottom:16px
+    }
+    h1{
+      margin:0 0 10px;
+      font-size:28px
+    }
+    p{
+      margin:0;
+      color:#aab4c2;
+      line-height:1.5
+    }
+    a{
+      color:#0ea5ff
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="brand">FR</div>
+    <h1>${escapeHtml(title)}</h1>
+    <p>${escapeHtml(message)}</p>
+  </main>
+</body>
+</html>`;
+}
+
+function resetPasswordPage() {
+  return `<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Redefinir senha - FireRank</title>
+  <style>
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      min-height:100vh;
+      background:#05070b;
+      color:#fff;
+      font-family:Arial,sans-serif;
+      display:grid;
+      place-items:center;
+      padding:24px
+    }
+    .card{
+      width:min(100%,470px);
+      padding:28px;
+      border-radius:24px;
+      background:#0f1722;
+      border:1px solid #19364b;
+      box-shadow:0 22px 70px rgba(0,0,0,.35)
+    }
+    .brand{
+      color:#0ea5ff;
+      font-weight:900;
+      font-size:20px;
+      margin-bottom:18px
+    }
+    h1{
+      margin:0 0 8px
+    }
+    .sub{
+      color:#aab4c2;
+      line-height:1.45;
+      margin:0 0 18px
+    }
+    label{
+      display:block;
+      color:#aab4c2;
+      font-weight:700;
+      font-size:13px;
+      margin:12px 0 7px
+    }
+    input{
+      width:100%;
+      height:50px;
+      border-radius:14px;
+      border:1px solid #19364b;
+      background:#152131;
+      color:#fff;
+      padding:0 14px;
+      outline:none
+    }
+    input:focus{
+      border-color:#0ea5ff
+    }
+    button{
+      width:100%;
+      height:50px;
+      border:0;
+      border-radius:14px;
+      background:#0677e8;
+      color:#fff;
+      font-weight:900;
+      margin-top:16px;
+      cursor:pointer
+    }
+    button:disabled{
+      opacity:.55
+    }
+    .msg{
+      display:none;
+      margin-top:13px;
+      padding:11px;
+      border-radius:12px;
+      background:#152131;
+      color:#aab4c2
+    }
+    .msg.show{
+      display:block
+    }
+    .msg.ok{
+      border:1px solid rgba(22,163,106,.35)
+    }
+    .msg.err{
+      border:1px solid rgba(217,61,74,.35)
+    }
+  </style>
+</head>
+
+<body>
+  <main class="card">
+    <div class="brand">FireRank</div>
+
+    <h1>Crie uma nova senha</h1>
+
+    <p class="sub">
+      Digite sua nova senha e confirme.
+    </p>
+
+    <form id="form">
+      <label>Nova senha</label>
+
+      <input
+        id="password"
+        type="password"
+        minlength="6"
+        autocomplete="new-password"
+        required
+      />
+
+      <label>Confirmar senha</label>
+
+      <input
+        id="confirm"
+        type="password"
+        minlength="6"
+        autocomplete="new-password"
+        required
+      />
+
+      <button
+        id="btn"
+        type="submit"
+      >
+        Salvar nova senha
+      </button>
+
+      <div
+        id="msg"
+        class="msg"
+      ></div>
+    </form>
+  </main>
+
+<script>
+const form =
+  document.getElementById('form');
+
+const btn =
+  document.getElementById('btn');
+
+const msg =
+  document.getElementById('msg');
+
+const params =
+  new URLSearchParams(
+    location.search
+  );
+
+const oobCode =
+  params.get('oobCode') ||
+  params.get('oobcode') ||
+  '';
+
+function show(
+  type,
+  text
+) {
+  msg.className =
+    'msg show ' + type;
+
+  msg.textContent =
+    text;
+}
+
+if (!oobCode) {
+  show(
+    'err',
+    'Link inválido. Solicite uma nova recuperação no app.'
+  );
+
+  btn.disabled =
+    true;
+}
+
+form.addEventListener(
+  'submit',
+  async (e) => {
+    e.preventDefault();
+
+    const password =
+      document
+        .getElementById(
+          'password'
+        )
+        .value
+        .trim();
+
+    const confirm =
+      document
+        .getElementById(
+          'confirm'
+        )
+        .value
+        .trim();
+
+    if (
+      password.length < 6
+    ) {
+      return show(
+        'err',
+        'A senha precisa ter pelo menos 6 caracteres.'
+      );
+    }
+
+    if (
+      password !== confirm
+    ) {
+      return show(
+        'err',
+        'As senhas não conferem.'
+      );
+    }
+
+    btn.disabled =
+      true;
+
+    btn.textContent =
+      'Salvando...';
 
     try {
-      userRecord = await admin.auth().getUserByEmail(email);
-    } catch (e) {
-      console.log("Recuperação solicitada para e-mail não encontrado:", maskEmail(email));
+      const r =
+        await fetch(
+          '/api/auth/confirm-password-reset',
+          {
+            method:'POST',
 
-      await db.ref(`password_reset_requests/${firebaseSafeKey(email)}_${t}`).set({
-        emailMasked: maskEmail(email),
-        status: "email_not_found",
-        createdAtMs: t,
+            headers:{
+              'Content-Type':'application/json'
+            },
+
+            body:
+              JSON.stringify({
+                oobCode,
+                newPassword:
+                  password
+              })
+          }
+        );
+
+      const d =
+        await r
+          .json()
+          .catch(
+            () => ({})
+          );
+
+      if (
+        !r.ok ||
+        !d.ok
+      ) {
+        throw new Error(
+          d.error ||
+          'Não foi possível redefinir a senha.'
+        );
+      }
+
+      show(
+        'ok',
+        'Senha redefinida. Volte ao app e entre novamente.'
+      );
+
+      btn.textContent =
+        'Senha salva';
+    } catch (err) {
+      show(
+        'err',
+        err.message ||
+        'Link expirado ou inválido.'
+      );
+
+      btn.disabled =
+        false;
+
+      btn.textContent =
+        'Salvar nova senha';
+    }
+  }
+);
+</script>
+</body>
+</html>`;
+}
+
+function ensureEmailConfig() {
+  const missing = [];
+
+  if (!SMTP_HOST) {
+    missing.push(
+      "SMTP_HOST"
+    );
+  }
+
+  if (!SMTP_PORT) {
+    missing.push(
+      "SMTP_PORT"
+    );
+  }
+
+  if (!SMTP_USER) {
+    missing.push(
+      "SMTP_USER"
+    );
+  }
+
+  if (!SMTP_PASS) {
+    missing.push(
+      "SMTP_PASS"
+    );
+  }
+
+  if (!MAIL_FROM_EMAIL) {
+    missing.push(
+      "MAIL_FROM_EMAIL"
+    );
+  }
+
+  if (!FIREBASE_WEB_API_KEY) {
+    missing.push(
+      "FIREBASE_WEB_API_KEY"
+    );
+  }
+
+  if (
+    missing.length
+  ) {
+    throw new Error(
+      `EMAIL_CONFIG_MISSING:${missing.join(",")}`
+    );
+  }
+}
+
+function mailTransporter() {
+  ensureEmailConfig();
+
+  return nodemailer
+    .createTransport({
+      host:
+        SMTP_HOST,
+
+      port:
+        SMTP_PORT,
+
+      secure:
+        SMTP_SECURE,
+
+      auth: {
+        user:
+          SMTP_USER,
+
+        pass:
+          SMTP_PASS,
+      },
+    });
+}
+
+function extractOobCodeFromFirebaseLink(
+  link
+) {
+  try {
+    const url =
+      new URL(link);
+
+    const direct =
+      url
+        .searchParams
+        .get(
+          "oobCode"
+        );
+
+    if (direct) {
+      return direct;
+    }
+
+    const continuation =
+      url
+        .searchParams
+        .get(
+          "continueUrl"
+        );
+
+    if (!continuation) {
+      return "";
+    }
+
+    return (
+      new URL(
+        continuation
+      )
+        .searchParams
+        .get(
+          "oobCode"
+        ) ||
+      ""
+    );
+  } catch (_) {
+    return "";
+  }
+}
+
+function buildResetEmailHtml(
+  resetUrl
+) {
+  const url =
+    escapeHtml(
+      resetUrl
+    );
+
+  return `<div style="font-family:Arial,sans-serif;background:#f6f8fc;padding:24px">
+  <div style="max-width:560px;margin:auto;background:#fff;border:1px solid #dce5ef;border-radius:20px;overflow:hidden">
+    <div style="background:#05070b;padding:24px;color:#fff">
+      <b style="color:#0ea5ff">FireRank</b>
+      <h1 style="margin:12px 0 0">Redefina sua senha</h1>
+    </div>
+
+    <div style="padding:24px;color:#111827">
+      <p>Recebemos uma solicitação para redefinir sua senha.</p>
+
+      <p>
+        <a
+          href="${url}"
+          style="display:inline-block;background:#0677e8;color:#fff;text-decoration:none;font-weight:900;padding:13px 20px;border-radius:12px"
+        >
+          Redefinir minha senha
+        </a>
+      </p>
+
+      <p style="color:#5a6676;font-size:13px">
+        Se você não pediu essa alteração, ignore este e-mail.
+      </p>
+    </div>
+  </div>
+</div>`;
+}
+
+async function sendPasswordResetEmail(
+  email,
+  resetUrl
+) {
+  const transporter =
+    mailTransporter();
+
+  await transporter.sendMail({
+    from:
+      `"${MAIL_FROM_NAME}" <${MAIL_FROM_EMAIL}>`,
+
+    to:
+      email,
+
+    subject:
+      "Redefina sua senha do FireRank",
+
+    text:
+      `Redefina sua senha do FireRank: ${resetUrl}\n\nSe você não solicitou, ignore este e-mail.`,
+
+    html:
+      buildResetEmailHtml(
+        resetUrl
+      ),
+  });
+}
+
+const passwordResetThrottle =
+  new Map();
+
+function canRequestPasswordReset(
+  email
+) {
+  const key =
+    stableHash(
+      safe(
+        email
+      ).toLowerCase()
+    );
+
+  const last =
+    Number(
+      passwordResetThrottle
+        .get(key) || 0
+    );
+
+  const t =
+    nowMs();
+
+  if (
+    last &&
+    t - last <
+      60 * 1000
+  ) {
+    return false;
+  }
+
+  passwordResetThrottle
+    .set(
+      key,
+      t
+    );
+
+  return true;
+}
+
+app.post(
+  "/api/auth/request-password-reset",
+  rateLimit(
+    "password-reset",
+    8,
+    15 * 60 * 1000
+  ),
+  async (
+    req,
+    res
+  ) => {
+    const email =
+      safe(
+        req.body?.email
+      ).toLowerCase();
+
+    try {
+      if (
+        !isValidEmail(
+          email
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "Digite um e-mail válido.",
+          });
+      }
+
+      if (
+        !canRequestPasswordReset(
+          email
+        )
+      ) {
+        return res
+          .status(429)
+          .json({
+            ok: false,
+            error:
+              "Aguarde antes de pedir outro link.",
+          });
+      }
+
+      ensureEmailConfig();
+
+      let userRecord =
+        null;
+
+      try {
+        userRecord =
+          await admin
+            .auth()
+            .getUserByEmail(
+              email
+            );
+      } catch (_) {
+        await appendAudit(
+          "password_reset_requested",
+          {
+            referenceId:
+              stableHash(
+                email
+              ).slice(
+                0,
+                20
+              ),
+
+            status:
+              "generic_response",
+          }
+        );
+
+        return res.json({
+          ok: true,
+
+          message:
+            "Se existir uma conta com esse e-mail, enviaremos um link de recuperação.",
+        });
+      }
+
+      const firebaseResetLink =
+        await admin
+          .auth()
+          .generatePasswordResetLink(
+            email
+          );
+
+      const oobCode =
+        extractOobCodeFromFirebaseLink(
+          firebaseResetLink
+        );
+
+      if (!oobCode) {
+        throw new Error(
+          "PASSWORD_RESET_CODE_GENERATION_FAILED"
+        );
+      }
+
+      const resetUrl =
+        `${PASSWORD_RESET_URL}?mode=resetPassword&oobCode=${encodeURIComponent(
+          oobCode
+        )}`;
+
+      await sendPasswordResetEmail(
+        email,
+        resetUrl
+      );
+
+      await appendAudit(
+        "password_reset_requested",
+        {
+          targetUid:
+            userRecord.uid,
+
+          referenceId:
+            stableHash(
+              email
+            ).slice(
+              0,
+              20
+            ),
+
+          status:
+            "sent",
+        }
+      );
+
+      return res.json({
+        ok: true,
+
+        message:
+          "Se existir uma conta com esse e-mail, enviaremos um link de recuperação.",
       });
+    } catch (error) {
+      console.error(
+        "Password reset request:",
+        error.message
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+
+          error:
+            "Não foi possível enviar a recuperação agora. Tente novamente mais tarde.",
+        });
+    }
+  }
+);
+
+app.post(
+  "/api/auth/confirm-password-reset",
+  rateLimit(
+    "password-confirm",
+    10,
+    15 * 60 * 1000
+  ),
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const oobCode =
+        safe(
+          req.body?.oobCode ||
+            req.body?.code
+        );
+
+      const newPassword =
+        safe(
+          req.body
+            ?.newPassword ||
+            req.body?.password
+        );
+
+      if (
+        !FIREBASE_WEB_API_KEY
+      ) {
+        throw new Error(
+          "FIREBASE_WEB_API_KEY_MISSING"
+        );
+      }
+
+      if (!oobCode) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "Link inválido.",
+          });
+      }
+
+      if (
+        newPassword.length <
+        6
+      ) {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            error:
+              "A senha precisa ter pelo menos 6 caracteres.",
+          });
+      }
+
+      const response =
+        await axios.post(
+          `https://identitytoolkit.googleapis.com/v1/accounts:resetPassword?key=${encodeURIComponent(
+            FIREBASE_WEB_API_KEY
+          )}`,
+          {
+            oobCode,
+            newPassword,
+          },
+          {
+            headers: {
+              "Content-Type":
+                "application/json",
+            },
+          }
+        );
+
+      const email =
+        safe(
+          response.data?.email
+        );
+
+      let targetUid =
+        "";
+
+      if (email) {
+        try {
+          targetUid =
+            (
+              await admin
+                .auth()
+                .getUserByEmail(
+                  email
+                )
+            ).uid;
+        } catch (_) {}
+      }
+
+      await appendAudit(
+        "password_reset_completed",
+        {
+          targetUid,
+
+          referenceId:
+            email
+              ? stableHash(
+                  email
+                ).slice(
+                  0,
+                  20
+                )
+              : "",
+
+          status:
+            "completed",
+        }
+      );
 
       return res.json({
         ok: true,
         message:
-          "Se existir uma conta com esse e-mail, enviaremos um link de recuperação.",
+          "Senha redefinida com sucesso.",
       });
+    } catch (error) {
+      const apiError =
+        safe(
+          error.response
+            ?.data
+            ?.error
+            ?.message ||
+            error.response
+              ?.data
+              ?.message ||
+            error.message
+        );
+
+      let friendly =
+        "Link expirado ou inválido. Solicite uma nova recuperação.";
+
+      if (
+        apiError.includes(
+          "WEAK_PASSWORD"
+        )
+      ) {
+        friendly =
+          "A senha é muito fraca.";
+      }
+
+      if (
+        apiError.includes(
+          "EXPIRED_OOB_CODE"
+        )
+      ) {
+        friendly =
+          "Esse link expirou.";
+      }
+
+      if (
+        apiError.includes(
+          "INVALID_OOB_CODE"
+        )
+      ) {
+        friendly =
+          "Esse link é inválido ou já foi usado.";
+      }
+
+      return res
+        .status(400)
+        .json({
+          ok: false,
+          error:
+            friendly,
+        });
+    }
+  }
+);
+
+function ensureMP() {
+  if (!MP_ACCESS_TOKEN) {
+    const error =
+      new Error(
+        "MERCADO_PAGO_NOT_CONFIGURED"
+      );
+
+    error.statusCode =
+      503;
+
+    error.publicMessage =
+      "Pagamento temporariamente indisponível.";
+
+    throw error;
+  }
+}
+
+function mpHeaders() {
+  return {
+    Authorization:
+      `Bearer ${MP_ACCESS_TOKEN}`,
+
+    "Content-Type":
+      "application/json",
+  };
+}
+
+function normalizePaymentStatus(
+  status
+) {
+  const value =
+    safe(
+      status
+    ).toLowerCase();
+
+  if (
+    [
+      "approved",
+      "paid",
+      "confirmed",
+      "active",
+    ].includes(
+      value
+    )
+  ) {
+    return "approved";
+  }
+
+  if (
+    [
+      "pending",
+      "in_process",
+    ].includes(
+      value
+    )
+  ) {
+    return value;
+  }
+
+  if (
+    [
+      "cancelled",
+      "canceled",
+    ].includes(
+      value
+    )
+  ) {
+    return "cancelled";
+  }
+
+  if (
+    [
+      "rejected",
+      "refunded",
+      "charged_back",
+    ].includes(
+      value
+    )
+  ) {
+    return value;
+  }
+
+  return value ||
+    "pending";
+}
+
+function paymentRequestType(
+  body
+) {
+  const raw =
+    safe(
+      body.type ||
+        body.paymentType ||
+        body.payment_type ||
+        body.requestType ||
+        body.kind
+    ).toLowerCase();
+
+  if (
+    [
+      "boost",
+      "ad",
+      "ads",
+      "advertisement",
+      "turbinado",
+      "impulsionamento",
+    ].includes(
+      raw
+    )
+  ) {
+    return "boost";
+  }
+
+  if (
+    [
+      "verification",
+      "verified",
+      "selo",
+      "selo_verificado",
+      "subscription",
+    ].includes(
+      raw
+    )
+  ) {
+    return "verification";
+  }
+
+  if (
+    body.productId ||
+    body.product_id
+  ) {
+    return "boost";
+  }
+
+  return "verification";
+}
+async function readSubscriptionPlan(
+  requested
+) {
+  const raw =
+    safe(
+      requested ||
+        "normal"
+    ).toLowerCase();
+
+  const aliases = {
+    verified_normal:
+      "normal",
+
+    verified_plus:
+      "plus",
+
+    verified_pro:
+      "pro",
+  };
+
+  const key =
+    aliases[raw] ||
+    raw;
+
+  const directSnap =
+    await db
+      .ref(
+        `subscription_plans/${key}`
+      )
+      .get();
+
+  if (
+    directSnap.exists()
+  ) {
+    return {
+      key,
+      ...map(
+        directSnap.val()
+      ),
+    };
+  }
+
+  const allSnap =
+    await db
+      .ref(
+        "subscription_plans"
+      )
+      .get();
+
+  const all =
+    map(
+      allSnap.val()
+    );
+
+  for (
+    const [
+      planKey,
+      plan,
+    ]
+    of Object.entries(
+      all
+    )
+  ) {
+    if (
+      safe(
+        plan?.planId
+      ).toLowerCase() ===
+      raw
+    ) {
+      return {
+        key:
+          planKey,
+        ...map(plan),
+      };
+    }
+  }
+
+  const error =
+    new Error(
+      "SUBSCRIPTION_PLAN_NOT_FOUND"
+    );
+
+  error.statusCode =
+    422;
+
+  error.publicMessage =
+    "Plano de verificação inválido.";
+
+  throw error;
+}
+
+async function assertVerificationPurchaseEligible(
+  uid
+) {
+  if (
+    !(await getFeatureFlag(
+      "verificationSubscriptions",
+      false
+    ))
+  ) {
+    const error =
+      new Error(
+        "VERIFICATION_SUBSCRIPTIONS_DISABLED"
+      );
+
+    error.statusCode =
+      409;
+
+    error.publicMessage =
+      "Assinaturas verificadas ainda não estão liberadas.";
+
+    throw error;
+  }
+
+  const [
+    eligibilitySnap,
+    identitySnap,
+  ] =
+    await Promise.all([
+      db
+        .ref(
+          `eligibility/${uid}`
+        )
+        .get(),
+
+      db
+        .ref(
+          `identity_status/${uid}`
+        )
+        .get(),
+    ]);
+
+  const eligibility =
+    map(
+      eligibilitySnap.val()
+    );
+
+  const identity =
+    map(
+      identitySnap.val()
+    );
+
+  if (
+    eligibility.canSubscribeVerified !==
+      true ||
+    eligibility.needsAgeReview ===
+      true ||
+    safe(
+      identity.identityReviewStatus
+    ).toLowerCase() !==
+      "approved"
+  ) {
+    const error =
+      new Error(
+        "VERIFICATION_NOT_ELIGIBLE"
+      );
+
+    error.statusCode =
+      403;
+
+    error.publicMessage =
+      "Sua conta ainda não está elegível para assinar a verificação.";
+
+    throw error;
+  }
+
+  return {
+    eligibility,
+    identity,
+  };
+}
+
+function parseBoostCatalogFromEnv() {
+  if (
+    !BOOST_CATALOG_JSON
+  ) {
+    return {};
+  }
+
+  try {
+    return map(
+      JSON.parse(
+        BOOST_CATALOG_JSON
+      )
+    );
+  } catch (_) {
+    return {};
+  }
+}
+
+async function getBoostCatalog() {
+  const snap =
+    await db
+      .ref(
+        "public_config/boostCatalog"
+      )
+      .get();
+
+  const fromDb =
+    map(
+      snap.val()
+    );
+
+  if (
+    Object.keys(
+      fromDb
+    ).length > 0
+  ) {
+    return fromDb;
+  }
+
+  return parseBoostCatalogFromEnv();
+}
+
+async function readBoostPlan(
+  requested
+) {
+  const planId =
+    safe(
+      requested ||
+        "one_day"
+    ).toLowerCase();
+
+  const catalog =
+    await getBoostCatalog();
+
+  const plan =
+    map(
+      catalog[planId]
+    );
+
+  if (
+    !planId ||
+    Object.keys(plan)
+      .length === 0
+  ) {
+    const error =
+      new Error(
+        "BOOST_CATALOG_NOT_CONFIGURED"
+      );
+
+    error.statusCode =
+      503;
+
+    error.publicMessage =
+      "Os preços de Patrocinado ainda não foram configurados no servidor.";
+
+    throw error;
+  }
+
+  const priceCents =
+    integer(
+      plan.priceCents,
+      -1
+    );
+
+  const days =
+    integer(
+      plan.days,
+      -1
+    );
+
+  if (
+    plan.active ===
+      false ||
+    priceCents <= 0 ||
+    days <= 0 ||
+    days > 365
+  ) {
+    const error =
+      new Error(
+        "BOOST_PLAN_NOT_AVAILABLE"
+      );
+
+    error.statusCode =
+      422;
+
+    error.publicMessage =
+      "Plano de Patrocinado indisponível.";
+
+    throw error;
+  }
+
+  return {
+    planId,
+
+    displayName:
+      clip(
+        plan.displayName ||
+          "Patrocinado",
+        100
+      ),
+
+    priceCents,
+
+    days,
+
+    placement:
+      clip(
+        plan.placement ||
+          "discover_sponsored",
+        80
+      ),
+  };
+}
+
+async function productIsCurrentlyPublic(
+  product
+) {
+  if (
+    !product ||
+    product.status !==
+      "active" ||
+    product.visibility !==
+      "public" ||
+    safe(
+      product.moderation
+        ?.status
+    ).toLowerCase() !==
+      "approved"
+  ) {
+    return false;
+  }
+
+  const [
+    visibility,
+    storeSnap,
+  ] =
+    await Promise.all([
+      getAccountVisibility(
+        product.ownerUid
+      ),
+
+      db
+        .ref(
+          `stores/${product.storeId}`
+        )
+        .get(),
+    ]);
+
+  const store =
+    map(
+      storeSnap.val()
+    );
+
+  return accountAndStoreCanBePublic(
+    visibility,
+    store
+  );
+}
+
+async function createPaymentPreference(
+  req,
+  res
+) {
+  try {
+    ensureMP();
+
+    const uid =
+      req.auth.uid;
+
+    const body =
+      map(
+        req.body
+      );
+
+    const requestType =
+      paymentRequestType(
+        body
+      );
+
+    const clientPlatform =
+      safe(
+        body.clientPlatform ||
+          req.headers[
+            "x-client-platform"
+          ]
+      ).toLowerCase();
+
+    if (
+      ENFORCE_GOOGLE_PLAY_BILLING &&
+      (
+        clientPlatform ===
+          "android" ||
+        clientPlatform ===
+          "flutter_android" ||
+        clientPlatform ===
+          "flutter_app"
+      )
+    ) {
+      return res
+        .status(409)
+        .json({
+          ok: false,
+
+          code:
+            "GOOGLE_PLAY_BILLING_REQUIRED",
+
+          message:
+            "No Android, este serviço digital precisa usar o faturamento da Google Play.",
+        });
     }
 
-    const firebaseResetLink = await admin.auth().generatePasswordResetLink(email);
-    const oobCode = extractOobCodeFromFirebaseLink(firebaseResetLink);
+    const requestId =
+      db
+        .ref(
+          "payments"
+        )
+        .push()
+        .key;
 
-    if (!oobCode) {
-      throw new Error("Não foi possível gerar o código de redefinição.");
+    if (!requestId) {
+      throw new Error(
+        "PAYMENT_ID_GENERATION_FAILED"
+      );
     }
 
-    const resetUrl = `${PASSWORD_RESET_URL}?mode=resetPassword&oobCode=${encodeURIComponent(
-      oobCode
-    )}&email=${encodeURIComponent(email)}`;
+    const t =
+      nowMs();
 
-    await sendPasswordResetEmail({
-      email,
-      resetUrl,
-    });
+    let title =
+      "FireRank";
 
-    await db.ref(`password_reset_requests/${firebaseSafeKey(userRecord.uid)}_${t}`).set({
-      uid: userRecord.uid,
-      emailMasked: maskEmail(email),
-      status: "sent",
-      provider: "railway_smtp",
-      createdAtMs: t,
-    });
+    let amountCents =
+      0;
+
+    let requestRecord =
+      {};
+
+    if (
+      requestType ===
+      "verification"
+    ) {
+      await assertVerificationPurchaseEligible(
+        uid
+      );
+
+      const plan =
+        await readSubscriptionPlan(
+          body.plan ||
+          body.planId
+        );
+
+      if (
+        plan.activeForLaunch !==
+          true ||
+        safe(
+          plan.currency ||
+            "BRL"
+        ) !== "BRL"
+      ) {
+        const error =
+          new Error(
+            "SUBSCRIPTION_PLAN_DISABLED"
+          );
+
+        error.statusCode =
+          409;
+
+        error.publicMessage =
+          "Este plano não está disponível.";
+
+        throw error;
+      }
+
+      amountCents =
+        integer(
+          plan.priceCents,
+          -1
+        );
+
+      if (
+        amountCents <= 0
+      ) {
+        throw new Error(
+          "INVALID_SERVER_PLAN_PRICE"
+        );
+      }
+
+      title =
+        clip(
+          plan.displayName ||
+            "Verificado FireRank",
+          120
+        );
+
+      requestRecord = {
+        requestId,
+
+        uid,
+
+        type:
+          "verification",
+
+        planKey:
+          plan.key,
+
+        planId:
+          safe(
+            plan.planId ||
+              plan.key
+          ),
+
+        amountCents,
+
+        currency:
+          "BRL",
+
+        status:
+          "creating_preference",
+
+        createdAtMs:
+          t,
+
+        updatedAtMs:
+          t,
+      };
+    } else {
+      if (
+        !(await getFeatureFlag(
+          "boosts",
+          true
+        ))
+      ) {
+        const error =
+          new Error(
+            "BOOSTS_DISABLED"
+          );
+
+        error.statusCode =
+          409;
+
+        error.publicMessage =
+          "Patrocinados estão temporariamente desativados.";
+
+        throw error;
+      }
+
+      await assertSellerCanPublish(
+        uid
+      );
+
+      const productId =
+        safe(
+          body.productId ||
+            body.product_id
+        );
+
+      const productSnap =
+        await db
+          .ref(
+            `products/${productId}`
+          )
+          .get();
+
+      const product =
+        map(
+          productSnap.val()
+        );
+
+      if (
+        !productSnap.exists() ||
+        product.ownerUid !==
+          uid
+      ) {
+        const error =
+          new Error(
+            "BOOST_PRODUCT_NOT_OWNED"
+          );
+
+        error.statusCode =
+          403;
+
+        error.publicMessage =
+          "Você não pode patrocinar este produto.";
+
+        throw error;
+      }
+
+      if (
+        !(await productIsCurrentlyPublic(
+          product
+        ))
+      ) {
+        const error =
+          new Error(
+            "BOOST_PRODUCT_NOT_PUBLIC"
+          );
+
+        error.statusCode =
+          409;
+
+        error.publicMessage =
+          "Somente produtos públicos e ativos podem ser patrocinados.";
+
+        throw error;
+      }
+
+      const plan =
+        await readBoostPlan(
+          body.plan ||
+          body.planId
+        );
+
+      amountCents =
+        plan.priceCents;
+
+      title =
+        `${plan.displayName}: ${clip(
+          product.title,
+          80
+        )}`;
+
+      requestRecord = {
+        requestId,
+
+        ownerUid:
+          uid,
+
+        type:
+          "boost",
+
+        productId,
+
+        planId:
+          plan.planId,
+
+        placement:
+          plan.placement,
+
+        days:
+          plan.days,
+
+        amountCents,
+
+        currency:
+          "BRL",
+
+        status:
+          "creating_preference",
+
+        createdAtMs:
+          t,
+
+        updatedAtMs:
+          t,
+      };
+    }
+
+    const mpPayload = {
+      items: [
+        {
+          id:
+            requestId,
+
+          title,
+
+          quantity:
+            1,
+
+          currency_id:
+            "BRL",
+
+          unit_price:
+            amountCents /
+            100,
+        },
+      ],
+
+      external_reference:
+        requestId,
+
+      back_urls: {
+        success:
+          PAYMENT_SUCCESS_URL,
+
+        pending:
+          PAYMENT_PENDING_URL,
+
+        failure:
+          PAYMENT_FAILURE_URL,
+      },
+
+      auto_return:
+        "approved",
+
+      notification_url:
+        MP_WEBHOOK_URL,
+
+      metadata: {
+        type:
+          requestType,
+
+        request_id:
+          requestId,
+      },
+    };
+
+    const mpResponse =
+      await axios.post(
+        "https://api.mercadopago.com/checkout/preferences",
+
+        mpPayload,
+
+        {
+          headers:
+            mpHeaders(),
+
+          timeout:
+            20000,
+        }
+      );
+
+    const preferenceId =
+      safe(
+        mpResponse.data?.id
+      );
+
+    const checkoutUrl =
+      safe(
+        mpResponse.data
+          ?.init_point
+      );
+
+    const sandboxInitPoint =
+      safe(
+        mpResponse.data
+          ?.sandbox_init_point
+      );
+
+    if (
+      !preferenceId ||
+      !checkoutUrl
+    ) {
+      throw new Error(
+        "MP_PREFERENCE_INCOMPLETE"
+      );
+    }
+
+    const paymentRecord = {
+      paymentId:
+        requestId,
+
+      uid,
+
+      type:
+        requestType,
+
+      requestId,
+
+      provider:
+        "mercado_pago",
+
+      gatewayPreferenceId:
+        preferenceId,
+
+      amountCents,
+
+      currency:
+        "BRL",
+
+      status:
+        "pending",
+
+      fulfillmentStatus:
+        "pending_payment",
+
+      createdAtMs:
+        t,
+
+      updatedAtMs:
+        t,
+    };
+
+    const updates = {
+      [`payments/${requestId}`]:
+        paymentRecord,
+
+      [`payment_requests/${uid}/${requestId}`]:
+        {
+          ...requestRecord,
+
+          status:
+            "pending_payment",
+
+          gatewayPreferenceId:
+            preferenceId,
+
+          checkoutUrl,
+
+          updatedAtMs:
+            t,
+        },
+
+      [`payment_events/${requestId}/preference_created`]:
+        {
+          eventId:
+            "preference_created",
+
+          type:
+            "preference_created",
+
+          status:
+            "pending",
+
+          createdAtMs:
+            t,
+
+          immutable:
+            true,
+        },
+    };
+
+    if (
+      requestType ===
+      "boost"
+    ) {
+      updates[
+        `boost_requests/${requestId}`
+      ] = {
+        ...requestRecord,
+
+        status:
+          "pending_payment",
+
+        gatewayPreferenceId:
+          preferenceId,
+      };
+    }
+
+    await db
+      .ref()
+      .update(
+        updates
+      );
+
+    await appendAudit(
+      "payment_preference_created",
+      {
+        actorUid:
+          uid,
+
+        targetUid:
+          uid,
+
+        referenceId:
+          requestId,
+
+        status:
+          requestType,
+      }
+    );
 
     return res.json({
-      ok: true,
-      message:
-        "Se existir uma conta com esse e-mail, enviaremos um link de recuperação.",
-    });
-  } catch (e) {
-    console.error("Erro ao enviar recuperação de senha:", e.message);
+      ok:
+        true,
 
-    await db.ref(`password_reset_errors/${firebaseSafeKey(email || "unknown")}_${t}`).set({
-      emailMasked: email ? maskEmail(email) : "",
-      error: e.message || "Erro desconhecido",
-      createdAtMs: t,
-    });
+      type:
+        requestType,
 
-    return res.status(500).json({
-      ok: false,
-      error:
-        "Não foi possível enviar o e-mail de recuperação agora. Tente novamente em alguns minutos.",
+      publicKey:
+        MP_PUBLIC_KEY,
+
+      preferenceId,
+
+      initPoint:
+        checkoutUrl,
+
+      checkoutUrl,
+
+      sandboxInitPoint,
+
+      externalReference:
+        requestId,
     });
+  } catch (error) {
+    return publicError(
+      res,
+      error,
+      "Não foi possível iniciar o pagamento."
+    );
   }
-});
+}
 
-app.post("/api/auth/confirm-password-reset", async (req, res) => {
-  try {
-    const oobCode = safe(req.body?.oobCode || req.body?.code);
-    const newPassword = safe(req.body?.newPassword || req.body?.password);
+app.post(
+  "/api/mercadopago/create-preference",
+  requireUser,
+  rateLimit(
+    "payment-create",
+    8,
+    10 * 60 * 1000
+  ),
+  createPaymentPreference
+);
 
-    if (!FIREBASE_WEB_API_KEY) {
-      return res.status(500).json({
-        ok: false,
-        error: "FIREBASE_WEB_API_KEY não configurada.",
-      });
-    }
+app.post(
+  "/v1/billing/mercadopago/create-preference",
+  requireUser,
+  rateLimit(
+    "payment-create-v1",
+    8,
+    10 * 60 * 1000
+  ),
+  createPaymentPreference
+);
 
-    if (!oobCode) {
-      return res.status(400).json({
-        ok: false,
-        error: "Link inválido. Solicite uma nova recuperação no app.",
-      });
-    }
+async function fetchMercadoPagoPayment(
+  paymentId
+) {
+  ensureMP();
 
-    if (!newPassword || newPassword.length < 6) {
-      return res.status(400).json({
-        ok: false,
-        error: "A senha precisa ter pelo menos 6 caracteres.",
-      });
-    }
-
-    const response = await axios.post(
-      `https://identitytoolkit.googleapis.com/v1/accounts:resetPassword?key=${encodeURIComponent(
-        FIREBASE_WEB_API_KEY
+  const response =
+    await axios.get(
+      `https://api.mercadopago.com/v1/payments/${encodeURIComponent(
+        paymentId
       )}`,
       {
-        oobCode,
-        newPassword,
-      },
+        headers:
+          mpHeaders(),
+
+        timeout:
+          20000,
+      }
+    );
+
+  return map(
+    response.data
+  );
+}
+
+async function appendFinancialLedgerEvent({
+  uid,
+  requestId,
+  gatewayPaymentId,
+  amountCents,
+  status,
+  type,
+}) {
+  const eventId =
+    `ledger_${stableHash(
+      `${requestId}|${gatewayPaymentId}|${status}|${type}`
+    ).slice(
+      0,
+      28
+    )}`;
+
+  const ref =
+    db.ref(
+      `financial_ledger/${eventId}`
+    );
+
+  const snap =
+    await ref.get();
+
+  if (
+    snap.exists()
+  ) {
+    return;
+  }
+
+  await ref.set({
+    eventId,
+
+    uid,
+
+    type,
+
+    referenceId:
+      requestId,
+
+    gatewayPaymentId,
+
+    amountCents,
+
+    currency:
+      "BRL",
+
+    status,
+
+    createdAtMs:
+      nowMs(),
+
+    immutable:
+      true,
+
+    doesNotGrantEntitlement:
+      status !==
+      "approved",
+  });
+}
+async function activateVerificationFromPayment(
+  payment,
+  paymentDetail,
+  t
+) {
+  const uid =
+    payment.uid;
+
+  const requestId =
+    payment.requestId;
+
+  const requestSnap =
+    await db
+      .ref(
+        `payment_requests/${uid}/${requestId}`
+      )
+      .get();
+
+  const request =
+    map(
+      requestSnap.val()
+    );
+
+  const plan =
+    await readSubscriptionPlan(
+      request.planKey ||
+      request.planId
+    );
+
+  try {
+    await assertVerificationPurchaseEligible(
+      uid
+    );
+  } catch (
+    eligibilityError
+  ) {
+    await db
+      .ref()
+      .update({
+        [`payments/${requestId}/fulfillmentStatus`]:
+          "manual_review",
+
+        [`payments/${requestId}/updatedAtMs`]:
+          t,
+
+        [`payment_requests/${uid}/${requestId}/status`]:
+          "manual_review",
+
+        [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
+          t,
+      });
+
+    await pushNotification(
+      uid,
       {
-        headers: {
-          "Content-Type": "application/json",
+        title:
+          "Pagamento recebido",
+
+        body:
+          "Seu pagamento foi recebido, mas a verificação precisa de revisão antes da ativação.",
+
+        type:
+          "verification_manual_review",
+
+        data: {
+          requestId,
         },
       }
     );
 
-    const email = safe(response.data?.email);
-
-    await db.ref(`password_reset_confirmations/${firebaseSafeKey(email || nowMs())}`).set({
-      emailMasked: email ? maskEmail(email) : "",
-      status: "completed",
-      completedAtMs: nowMs(),
-    });
-
-    return res.json({
-      ok: true,
-      message: "Senha redefinida com sucesso.",
-    });
-  } catch (e) {
-    const apiError =
-      e.response?.data?.error?.message ||
-      e.response?.data?.message ||
-      e.message ||
-      "";
-
-    console.error("Erro ao confirmar nova senha:", apiError);
-
-    let friendly =
-      "Link expirado ou inválido. Solicite uma nova recuperação de senha no app.";
-
-    if (apiError.includes("WEAK_PASSWORD")) {
-      friendly = "A senha é muito fraca. Use pelo menos 6 caracteres.";
-    }
-
-    if (apiError.includes("EXPIRED_OOB_CODE")) {
-      friendly = "Esse link expirou. Solicite uma nova recuperação de senha no app.";
-    }
-
-    if (apiError.includes("INVALID_OOB_CODE")) {
-      friendly = "Esse link é inválido ou já foi usado. Solicite uma nova recuperação.";
-    }
-
-    return res.status(400).json({
-      ok: false,
-      error: friendly,
-    });
-  }
-});
-
-app.post("/api/mercadopago/create-preference", async (req, res) => {
-  try {
-    ensureMP();
-
-    const body = req.body || {};
-    const requestType = detectRequestTypeFromBody(body);
-
-    const externalReference =
-      safe(body.externalReference) ||
-      safe(body.external_reference) ||
-      safe(body.orderId) ||
-      safe(body.requestId) ||
-      safe(body.request_id) ||
-      `${requestType}_${safe(body.uid || body.sellerUid || "unknown")}_${nowMs()}`;
-
-    if (!externalReference) {
-      return res.status(400).json({
-        ok: false,
-        error: "externalReference obrigatório",
-      });
-    }
-
-    const rawItems = Array.isArray(body.items) ? body.items : [];
-
-    if (rawItems.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "items obrigatório",
-      });
-    }
-
-    const items = rawItems.map((item, i) => {
-      const unitPrice = toNumber(item.unit_price || item.unitPrice);
-
-      if (unitPrice <= 0) {
-        throw new Error(`unit_price inválido no item ${i + 1}`);
-      }
-
-      return {
-        id: safe(item.id) || `${requestType}_item_${i + 1}`,
-        title: safe(item.title) || `Item ${i + 1}`,
-        quantity: Math.max(1, Number(item.quantity) || 1),
-        currency_id: "BRL",
-        unit_price: unitPrice,
-      };
-    });
-
-    const metadata = {
-      type: requestType,
-      payment_type: requestType,
-      request_type: requestType,
-      request_id: externalReference,
-      uid: safe(body.uid || body.userUid || body.user_uid || body.sellerUid),
-      seller_uid: safe(body.sellerUid || body.seller_uid || body.uid),
-      product_id: safe(body.productId || body.product_id),
-      ad_id: safe(body.adId || body.ad_id || externalReference),
-      boost_id: safe(body.boostId || body.boost_id || externalReference),
-      plan: safe(body.plan),
-      days: safe(body.days),
-      placement: safe(body.placement),
-      product_title: safe(body.productTitle || body.product_title),
-      product_image: safe(body.productImage || body.product_image),
-    };
-
-    const payload = {
-      items,
-      external_reference: externalReference,
-      back_urls: {
-        success: PAYMENT_SUCCESS_URL,
-        pending: PAYMENT_PENDING_URL,
-        failure: PAYMENT_FAILURE_URL,
-      },
-      auto_return: "approved",
-      notification_url: MP_WEBHOOK_URL,
-      metadata,
-    };
-
-    const response = await axios.post(
-      "https://api.mercadopago.com/checkout/preferences",
-      payload,
-      { headers: mpHeaders() }
-    );
-
-    const data = response.data || {};
-
-    const preferenceId = safe(data.id);
-    const checkoutUrl = safe(data.init_point);
-    const sandboxInitPoint = safe(data.sandbox_init_point);
-
-    if (requestType === "verification") {
-      await savePendingVerificationPreference({
-        externalReference,
-        preferenceId,
-        checkoutUrl,
-        sandboxInitPoint,
-        body,
-      });
-    }
-
-    if (requestType === "boost") {
-      await savePendingBoostPreference({
-        externalReference,
-        preferenceId,
-        checkoutUrl,
-        sandboxInitPoint,
-        body,
-      });
-    }
-
-    return res.json({
-      ok: true,
-      type: requestType,
-      publicKey: MP_PUBLIC_KEY,
-      preferenceId,
-      initPoint: checkoutUrl,
-      checkoutUrl,
-      sandboxInitPoint,
-      webhookUrl: MP_WEBHOOK_URL,
-      externalReference,
-    });
-  } catch (error) {
-    console.error("ERRO MP:", error.response?.data || error.message);
-
-    return res.status(error.response?.status || 500).json({
-      ok: false,
-      error:
-        error.response?.data?.message ||
-        error.response?.data ||
-        error.message ||
-        "Erro ao criar preferência",
-    });
-  }
-});
-
-async function processMercadoPagoWebhookPayment(paymentId) {
-  ensureMP();
-
-  const paymentDetail = await fetchMercadoPagoPayment(paymentId);
-  let requestType = detectRequestTypeFromPayment(paymentDetail);
-
-  const externalReference = getPaymentExternalReference(paymentDetail);
-
-  if (requestType === "unknown") {
-    const uid = extractUidFromVerificationExternalReference(externalReference);
-
-    if (uid) {
-      requestType = "verification";
-    } else {
-      const foundBoost = await findBoostRequest({
-        externalReference,
-        gatewayPreferenceId: getPaymentPreferenceId(paymentDetail),
-        gatewayPaymentId: safe(paymentDetail.id),
-      });
-
-      requestType = foundBoost ? "boost" : "verification";
-    }
-  }
-
-  await logPaymentWebhook(paymentDetail, requestType);
-
-  if (requestType === "boost") {
-    await handleBoostPayment(paymentDetail);
     return;
   }
 
-  await handleVerificationPayment(paymentDetail);
+  const entitlementSnap =
+    await db
+      .ref(
+        `entitlements/${uid}`
+      )
+      .get();
+
+  const current =
+    map(
+      entitlementSnap.val()
+    );
+
+  const currentExpiry =
+    finiteNumber(
+      current.expiresAtMs,
+      0
+    );
+
+  const base =
+    current.subscriptionActive ===
+      true &&
+    currentExpiry > t
+      ? currentExpiry
+      : t;
+
+  const expiresAtMs =
+    base +
+    30 * DAY_MS;
+
+  const eventId =
+    firebaseSafeKey(
+      `activated_${requestId}_${safe(
+        paymentDetail.id
+      )}`
+    );
+
+  await db
+    .ref()
+    .update({
+      [`entitlements/${uid}`]:
+        {
+          ...current,
+
+          verifiedBadge:
+            true,
+
+          verifiedPlan:
+            safe(
+              plan.key ||
+              request.planKey ||
+              "normal"
+            ),
+
+          subscriptionActive:
+            true,
+
+          expiresAtMs,
+
+          source:
+            "backend_validated_mercado_pago",
+
+          sourceRequestId:
+            requestId,
+
+          updatedAtMs:
+            t,
+
+          requiresBackendValidatedReceiptForReactivation:
+            false,
+        },
+
+      [`subscription_events/${uid}/${eventId}`]:
+        {
+          eventId,
+
+          uid,
+
+          type:
+            "activated",
+
+          planId:
+            safe(
+              plan.planId ||
+              plan.key
+            ),
+
+          requestId,
+
+          gatewayPaymentId:
+            safe(
+              paymentDetail.id
+            ),
+
+          startsAtMs:
+            t,
+
+          expiresAtMs,
+
+          createdAtMs:
+            t,
+
+          immutable:
+            true,
+        },
+
+      [`payments/${requestId}/fulfillmentStatus`]:
+        "fulfilled",
+
+      [`payments/${requestId}/updatedAtMs`]:
+        t,
+
+      [`payment_requests/${uid}/${requestId}/status`]:
+        "active",
+
+      [`payment_requests/${uid}/${requestId}/expiresAtMs`]:
+        expiresAtMs,
+
+      [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
+        t,
+    });
+
+  await pushNotification(
+    uid,
+    {
+      title:
+        "Verificação ativada",
+
+      body:
+        "Seu pagamento foi validado e sua assinatura de verificação está ativa.",
+
+      type:
+        "verification_activated",
+
+      data: {
+        requestId,
+      },
+    }
+  );
 }
 
-app.get("/api/mercadopago/webhook", async (req, res) => {
-  try {
-    const type = safe(req.query.type || req.query.topic);
-    const id = safe(req.query["data.id"] || req.query.id);
+async function activateBoostFromPayment(
+  payment,
+  paymentDetail,
+  t
+) {
+  const uid =
+    payment.uid;
 
-    if (type === "payment" && id) {
-      await processMercadoPagoWebhookPayment(id);
+  const requestId =
+    payment.requestId;
+
+  const requestSnap =
+    await db
+      .ref(
+        `boost_requests/${requestId}`
+      )
+      .get();
+
+  const request =
+    map(
+      requestSnap.val()
+    );
+
+  const productId =
+    safe(
+      request.productId
+    );
+
+  const productSnap =
+    await db
+      .ref(
+        `products/${productId}`
+      )
+      .get();
+
+  const product =
+    map(
+      productSnap.val()
+    );
+
+  if (
+    !productSnap.exists() ||
+    product.ownerUid !==
+      uid ||
+    !(await productIsCurrentlyPublic(
+      product
+    ))
+  ) {
+    await db
+      .ref()
+      .update({
+        [`payments/${requestId}/fulfillmentStatus`]:
+          "manual_review",
+
+        [`payments/${requestId}/updatedAtMs`]:
+          t,
+
+        [`boost_requests/${requestId}/status`]:
+          "blocked_after_payment",
+
+        [`boost_requests/${requestId}/updatedAtMs`]:
+          t,
+      });
+
+    await pushNotification(
+      uid,
+      {
+        title:
+          "Patrocinado aguardando revisão",
+
+        body:
+          "O pagamento foi recebido, mas o produto não está público/ativo para iniciar o Patrocinado.",
+
+        type:
+          "boost_manual_review",
+
+        data: {
+          requestId,
+          productId,
+        },
+      }
+    );
+
+    return;
+  }
+
+  const cardSnap =
+    await db
+      .ref(
+        `product_cards/${productId}`
+      )
+      .get();
+
+  const card =
+    map(
+      cardSnap.val()
+    );
+
+  if (
+    !cardSnap.exists()
+  ) {
+    throw new Error(
+      "PUBLIC_PRODUCT_CARD_MISSING"
+    );
+  }
+
+  const boostId =
+    requestId;
+
+  const days =
+    integer(
+      request.days,
+      0
+    );
+
+  if (
+    days <= 0 ||
+    days > 365
+  ) {
+    throw new Error(
+      "INVALID_BOOST_DURATION"
+    );
+  }
+
+  const expiresAtMs =
+    t +
+    days * DAY_MS;
+
+  const eventId =
+    firebaseSafeKey(
+      `activated_${safe(
+        paymentDetail.id
+      )}`
+    );
+
+  await db
+    .ref()
+    .update({
+      [`boosts/${boostId}`]:
+        {
+          boostId,
+
+          ownerUid:
+            uid,
+
+          productId,
+
+          requestId,
+
+          planId:
+            clip(
+              request.planId,
+              80
+            ),
+
+          placement:
+            clip(
+              request.placement ||
+                "discover_sponsored",
+              80
+            ),
+
+          status:
+            "active",
+
+          amountCents:
+            integer(
+              payment.amountCents
+            ),
+
+          currency:
+            "BRL",
+
+          startsAtMs:
+            t,
+
+          expiresAtMs,
+
+          updatedAtMs:
+            t,
+        },
+
+      [`active_boost_cards/${productId}`]:
+        {
+          ...card,
+
+          boostId,
+
+          startsAtMs:
+            t,
+
+          expiresAtMs,
+
+          updatedAtMs:
+            t,
+        },
+
+      [`boost_requests/${requestId}/status`]:
+        "active",
+
+      [`boost_requests/${requestId}/boostId`]:
+        boostId,
+
+      [`boost_requests/${requestId}/startsAtMs`]:
+        t,
+
+      [`boost_requests/${requestId}/expiresAtMs`]:
+        expiresAtMs,
+
+      [`boost_requests/${requestId}/updatedAtMs`]:
+        t,
+
+      [`boost_events/${boostId}/${eventId}`]:
+        {
+          eventId,
+
+          boostId,
+
+          ownerUid:
+            uid,
+
+          productId,
+
+          requestId,
+
+          type:
+            "activated",
+
+          createdAtMs:
+            t,
+
+          immutable:
+            true,
+        },
+
+      [`payments/${requestId}/fulfillmentStatus`]:
+        "fulfilled",
+
+      [`payments/${requestId}/updatedAtMs`]:
+        t,
+
+      [`payment_requests/${uid}/${requestId}/status`]:
+        "active",
+
+      [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
+        t,
+    });
+
+  await pushNotification(
+    uid,
+    {
+      title:
+        "Patrocinado ativado",
+
+      body:
+        "Seu pagamento foi validado e o produto já está na área de Patrocinados.",
+
+      type:
+        "boost_activated",
+
+      data: {
+        requestId,
+        productId,
+        boostId,
+      },
+    }
+  );
+}
+
+async function revokeFulfillmentForPayment(
+  payment,
+  status,
+  t
+) {
+  const uid =
+    safe(
+      payment.uid
+    );
+
+  const requestId =
+    safe(
+      payment.requestId
+    );
+
+  if (
+    payment.type ===
+    "verification"
+  ) {
+    const entitlementSnap =
+      await db
+        .ref(
+          `entitlements/${uid}`
+        )
+        .get();
+
+    const entitlement =
+      map(
+        entitlementSnap.val()
+      );
+
+    const eventId =
+      firebaseSafeKey(
+        `reversed_${requestId}_${status}`
+      );
+
+    if (
+      entitlement.sourceRequestId ===
+        requestId &&
+      entitlement.subscriptionActive ===
+        true
+    ) {
+      await db
+        .ref()
+        .update({
+          [`entitlements/${uid}`]:
+            {
+              ...entitlement,
+
+              verifiedBadge:
+                false,
+
+              verifiedPlan:
+                "none",
+
+              subscriptionActive:
+                false,
+
+              expiresAtMs:
+                t,
+
+              source:
+                `payment_${status}`,
+
+              updatedAtMs:
+                t,
+
+              requiresBackendValidatedReceiptForReactivation:
+                true,
+            },
+
+          [`subscription_events/${uid}/${eventId}`]:
+            {
+              eventId,
+
+              uid,
+
+              type:
+                "payment_reversed",
+
+              requestId,
+
+              paymentStatus:
+                status,
+
+              createdAtMs:
+                t,
+
+              immutable:
+                true,
+            },
+        });
+    } else {
+      await appendAudit(
+        "subscription_reversal_manual_review",
+        {
+          targetUid:
+            uid,
+
+          referenceId:
+            requestId,
+
+          status,
+        }
+      );
+    }
+  }
+
+  if (
+    payment.type ===
+    "boost"
+  ) {
+    const boostSnap =
+      await db
+        .ref(
+          `boosts/${requestId}`
+        )
+        .get();
+
+    const boost =
+      map(
+        boostSnap.val()
+      );
+
+    const productId =
+      safe(
+        boost.productId
+      );
+
+    const updates = {
+      [`boosts/${requestId}/status`]:
+        "payment_reversed",
+
+      [`boosts/${requestId}/paymentStatus`]:
+        status,
+
+      [`boosts/${requestId}/updatedAtMs`]:
+        t,
+
+      [`boost_requests/${requestId}/status`]:
+        "payment_reversed",
+
+      [`boost_requests/${requestId}/updatedAtMs`]:
+        t,
+    };
+
+    if (productId) {
+      const cardSnap =
+        await db
+          .ref(
+            `active_boost_cards/${productId}`
+          )
+          .get();
+
+      if (
+        safe(
+          map(
+            cardSnap.val()
+          ).boostId
+        ) === requestId
+      ) {
+        updates[
+          `active_boost_cards/${productId}`
+        ] =
+          null;
+      }
     }
 
-    return res.status(200).send("ok");
-  } catch (e) {
-    console.error("Erro no webhook GET:", e.response?.data || e.message);
-    return res.status(500).send("webhook error");
-  }
-});
+    const eventId =
+      firebaseSafeKey(
+        `reversed_${status}_${t}`
+      );
 
-app.post("/api/mercadopago/webhook", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const type = safe(
-      body.type || body.topic || req.query.type || req.query.topic
+    updates[
+      `boost_events/${requestId}/${eventId}`
+    ] = {
+      eventId,
+
+      boostId:
+        requestId,
+
+      ownerUid:
+        uid,
+
+      productId,
+
+      type:
+        "payment_reversed",
+
+      paymentStatus:
+        status,
+
+      createdAtMs:
+        t,
+
+      immutable:
+        true,
+    };
+
+    await db
+      .ref()
+      .update(
+        updates
+      );
+  }
+
+  await db
+    .ref()
+    .update({
+      [`payments/${requestId}/fulfillmentStatus`]:
+        "revoked",
+
+      [`payments/${requestId}/updatedAtMs`]:
+        t,
+
+      [`payment_requests/${uid}/${requestId}/status`]:
+        "payment_reversed",
+
+      [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
+        t,
+    });
+
+  await pushNotification(
+    uid,
+    {
+      title:
+        "Pagamento revertido",
+
+      body:
+        "Um pagamento foi revertido e o benefício digital relacionado foi desativado ou enviado para revisão.",
+
+      type:
+        "payment_reversed",
+
+      data: {
+        requestId,
+      },
+    }
+  );
+}
+
+async function processMercadoPagoWebhookPayment(
+  paymentId
+) {
+  const detail =
+    await fetchMercadoPagoPayment(
+      paymentId
     );
-    const id = safe(
+
+  const requestId =
+    safe(
+      detail.external_reference
+    );
+
+  if (!requestId) {
+    await appendAudit(
+      "payment_webhook_ignored",
+      {
+        referenceId:
+          safe(
+            paymentId
+          ),
+
+        status:
+          "missing_external_reference",
+      }
+    );
+
+    return;
+  }
+
+  const paymentSnap =
+    await db
+      .ref(
+        `payments/${requestId}`
+      )
+      .get();
+
+  if (
+    !paymentSnap.exists()
+  ) {
+    await appendAudit(
+      "payment_webhook_ignored",
+      {
+        referenceId:
+          requestId,
+
+        status:
+          "unknown_request",
+      }
+    );
+
+    return;
+  }
+
+  const payment =
+    map(
+      paymentSnap.val()
+    );
+
+  const uid =
+    safe(
+      payment.uid
+    );
+
+  const status =
+    normalizePaymentStatus(
+      detail.status
+    );
+
+  const amountCents =
+    Math.round(
+      finiteNumber(
+        detail.transaction_amount,
+        -1
+      ) * 100
+    );
+
+  const currency =
+    safe(
+      detail.currency_id ||
+        "BRL"
+    ).toUpperCase();
+
+  const expectedAmount =
+    integer(
+      payment.amountCents,
+      -1
+    );
+
+  const gatewayPaymentId =
+    safe(
+      detail.id ||
+        paymentId
+    );
+
+  const t =
+    nowMs();
+
+  const eventId =
+    firebaseSafeKey(
+      `${gatewayPaymentId}_${status}`
+    );
+
+  const existingEvent =
+    await db
+      .ref(
+        `payment_events/${requestId}/${eventId}`
+      )
+      .get();
+
+  if (
+    existingEvent.exists()
+  ) {
+    return;
+  }
+
+  const integrityOk =
+    uid &&
+    expectedAmount > 0 &&
+    amountCents ===
+      expectedAmount &&
+    currency ===
+      "BRL";
+
+  if (!integrityOk) {
+    await db
+      .ref()
+      .update({
+        [`payments/${requestId}/status`]:
+          "integrity_error",
+
+        [`payments/${requestId}/fulfillmentStatus`]:
+          "blocked",
+
+        [`payments/${requestId}/gatewayPaymentId`]:
+          gatewayPaymentId,
+
+        [`payments/${requestId}/updatedAtMs`]:
+          t,
+
+        [`payment_events/${requestId}/${eventId}`]:
+          {
+            eventId,
+
+            type:
+              "integrity_error",
+
+            status,
+
+            createdAtMs:
+              t,
+
+            immutable:
+              true,
+          },
+      });
+
+    await appendAudit(
+      "payment_integrity_error",
+      {
+        targetUid:
+          uid,
+
+        referenceId:
+          requestId,
+
+        status:
+          "blocked",
+      }
+    );
+
+    return;
+  }
+
+  await db
+    .ref()
+    .update({
+      [`payments/${requestId}/status`]:
+        status,
+
+      [`payments/${requestId}/gatewayPaymentId`]:
+        gatewayPaymentId,
+
+      [`payments/${requestId}/gatewayPreferenceId`]:
+        safe(
+          detail.metadata
+            ?.preference_id ||
+          payment.gatewayPreferenceId
+        ),
+
+      [`payments/${requestId}/updatedAtMs`]:
+        t,
+
+      [`payment_requests/${uid}/${requestId}/paymentStatus`]:
+        status,
+
+      [`payment_requests/${uid}/${requestId}/gatewayPaymentId`]:
+        gatewayPaymentId,
+
+      [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
+        t,
+
+      [`payment_events/${requestId}/${eventId}`]:
+        {
+          eventId,
+
+          type:
+            "gateway_status",
+
+          status,
+
+          gatewayPaymentId,
+
+          createdAtMs:
+            t,
+
+          immutable:
+            true,
+        },
+    });
+
+  await appendFinancialLedgerEvent({
+    uid,
+    requestId,
+    gatewayPaymentId,
+    amountCents,
+    status,
+
+    type:
+      `mercado_pago_${safe(
+        payment.type
+      )}`,
+  });
+
+  if (
+    status ===
+    "approved"
+  ) {
+    if (
+      payment.type ===
+      "verification"
+    ) {
+      await activateVerificationFromPayment(
+        payment,
+        detail,
+        t
+      );
+    } else if (
+      payment.type ===
+      "boost"
+    ) {
+      await activateBoostFromPayment(
+        payment,
+        detail,
+        t
+      );
+    }
+  } else if (
+    ![
+      "pending",
+      "in_process",
+    ].includes(
+      status
+    )
+  ) {
+    if (
+      [
+        "refunded",
+        "charged_back",
+        "cancelled",
+      ].includes(
+        status
+      )
+    ) {
+      await revokeFulfillmentForPayment(
+        payment,
+        status,
+        t
+      );
+    } else {
+      const updates = {
+        [`payments/${requestId}/fulfillmentStatus`]:
+          "not_fulfilled",
+
+        [`payment_requests/${uid}/${requestId}/status`]:
+          "payment_failed",
+
+        [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
+          t,
+      };
+
+      if (
+        payment.type ===
+        "boost"
+      ) {
+        updates[
+          `boost_requests/${requestId}/status`
+        ] =
+          "payment_failed";
+
+        updates[
+          `boost_requests/${requestId}/updatedAtMs`
+        ] =
+          t;
+      }
+
+      await db
+        .ref()
+        .update(
+          updates
+        );
+    }
+  }
+}
+function extractWebhookPaymentId(
+  req
+) {
+  const body =
+    map(
+      req.body
+    );
+
+  const type =
+    safe(
+      body.type ||
+        body.topic ||
+        req.query.type ||
+        req.query.topic
+    ).toLowerCase();
+
+  const id =
+    safe(
       body.data?.id ||
         body["data.id"] ||
         req.query["data.id"] ||
         req.query.id
     );
 
-    if (type === "payment" && id) {
-      await processMercadoPagoWebhookPayment(id);
-    }
+  return type ===
+    "payment"
+    ? id
+    : "";
+}
 
-    return res.status(200).json({ ok: true });
-  } catch (e) {
-    console.error("Erro no webhook POST:", e.response?.data || e.message);
-    return res.status(500).json({
-      ok: false,
-      error: e.message || "webhook error",
-    });
+app.get(
+  "/api/mercadopago/webhook",
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const id =
+        extractWebhookPaymentId(
+          req
+        );
+
+      if (id) {
+        await processMercadoPagoWebhookPayment(
+          id
+        );
+      }
+
+      return res
+        .status(200)
+        .send(
+          "ok"
+        );
+    } catch (error) {
+      console.error(
+        "Mercado Pago webhook GET:",
+        error.message
+      );
+
+      return res
+        .status(500)
+        .send(
+          "webhook error"
+        );
+    }
   }
-});
+);
 
-app.post("/api/internal/expire-boosts", async (_, res) => {
-  try {
-    const t = nowMs();
+app.post(
+  "/api/mercadopago/webhook",
+  async (
+    req,
+    res
+  ) => {
+    try {
+      const id =
+        extractWebhookPaymentId(
+          req
+        );
 
-    const { updates, expiredBoosts } = await buildExpireBoostUpdates(t);
+      if (id) {
+        await processMercadoPagoWebhookPayment(
+          id
+        );
+      }
 
-    if (Object.keys(updates).length > 0) {
-      await db.ref().update(updates);
+      return res
+        .status(200)
+        .json({
+          ok: true,
+        });
+    } catch (error) {
+      console.error(
+        "Mercado Pago webhook POST:",
+        error.message
+      );
+
+      return res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            "webhook error",
+        });
     }
+  }
+);
 
-    return res.json({
-      ok: true,
+async function expireBoosts() {
+  const t =
+    nowMs();
+
+  const snap =
+    await db
+      .ref(
+        "boosts"
+      )
+      .orderByChild(
+        "status"
+      )
+      .equalTo(
+        "active"
+      )
+      .get();
+
+  let expiredBoosts =
+    0;
+
+  if (
+    !snap.exists()
+  ) {
+    return {
       expiredBoosts,
-      checkedAtMs: t,
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e.message || "Erro ao expirar anúncios",
-    });
+      checkedAtMs:
+        t,
+    };
   }
-});
 
-app.post("/api/internal/expire-verifications", async (_, res) => {
-  try {
-    const t = nowMs();
+  const work = [];
 
-    const { updates, expiredVerifications } =
-      await buildExpireVerificationUpdates(t);
+  snap.forEach(
+    (child) => {
+      work.push({
+        boostId:
+          child.key,
 
-    if (Object.keys(updates).length > 0) {
-      await db.ref().update(updates);
+        value:
+          map(
+            child.val()
+          ),
+      });
+    }
+  );
+
+  for (
+    const item
+    of work
+  ) {
+    const expiresAtMs =
+      finiteNumber(
+        item.value.expiresAtMs,
+        0
+      );
+
+    if (
+      !expiresAtMs ||
+      expiresAtMs > t
+    ) {
+      continue;
     }
 
-    return res.json({
-      ok: true,
-      expiredVerifications,
-      checkedAtMs: t,
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e.message || "Erro ao expirar selos verificados",
-    });
-  }
-});
+    expiredBoosts +=
+      1;
 
-app.post("/api/internal/run-maintenance", async (_, res) => {
-  try {
-    const t = nowMs();
+    const uid =
+      safe(
+        item.value.ownerUid
+      );
 
-    const boostResult = await buildExpireBoostUpdates(t);
-    const verificationResult = await buildExpireVerificationUpdates(t);
+    const productId =
+      safe(
+        item.value.productId
+      );
+
+    const eventId =
+      firebaseSafeKey(
+        `expired_${t}`
+      );
 
     const updates = {
-      ...boostResult.updates,
-      ...verificationResult.updates,
+      [`boosts/${item.boostId}/status`]:
+        "expired",
+
+      [`boosts/${item.boostId}/expiredAtMs`]:
+        t,
+
+      [`boosts/${item.boostId}/updatedAtMs`]:
+        t,
+
+      [`boost_events/${item.boostId}/${eventId}`]:
+        {
+          eventId,
+
+          boostId:
+            item.boostId,
+
+          ownerUid:
+            uid,
+
+          productId,
+
+          type:
+            "expired",
+
+          createdAtMs:
+            t,
+
+          immutable:
+            true,
+        },
     };
 
-    if (Object.keys(updates).length > 0) {
-      await db.ref().update(updates);
+    if (productId) {
+      const cardSnap =
+        await db
+          .ref(
+            `active_boost_cards/${productId}`
+          )
+          .get();
+
+      const card =
+        map(
+          cardSnap.val()
+        );
+
+      if (
+        safe(
+          card.boostId
+        ) ===
+        item.boostId
+      ) {
+        updates[
+          `active_boost_cards/${productId}`
+        ] =
+          null;
+      }
     }
 
-    return res.json({
-      ok: true,
-      expiredBoosts: boostResult.expiredBoosts,
-      expiredVerifications: verificationResult.expiredVerifications,
-      checkedAtMs: t,
-    });
-  } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: e.message || "Erro ao rodar manutenção",
+    await db
+      .ref()
+      .update(
+        updates
+      );
+
+    if (uid) {
+      await pushNotification(
+        uid,
+        {
+          title:
+            "Patrocinado encerrado",
+
+          body:
+            "O período do seu Patrocinado terminou.",
+
+          type:
+            "boost_expired",
+
+          data: {
+            boostId:
+              item.boostId,
+
+            productId,
+          },
+        }
+      );
+    }
+  }
+
+  return {
+    expiredBoosts,
+    checkedAtMs:
+      t,
+  };
+}
+
+async function expireSubscriptions() {
+  const t =
+    nowMs();
+
+  const snap =
+    await db
+      .ref(
+        "entitlements"
+      )
+      .orderByChild(
+        "subscriptionActive"
+      )
+      .equalTo(
+        true
+      )
+      .get();
+
+  let expiredSubscriptions =
+    0;
+
+  if (
+    !snap.exists()
+  ) {
+    return {
+      expiredSubscriptions,
+      checkedAtMs:
+        t,
+    };
+  }
+
+  const work = [];
+
+  snap.forEach(
+    (child) => {
+      work.push({
+        uid:
+          child.key,
+
+        value:
+          map(
+            child.val()
+          ),
+      });
+    }
+  );
+
+  for (
+    const item
+    of work
+  ) {
+    const expiresAtMs =
+      finiteNumber(
+        item.value.expiresAtMs,
+        0
+      );
+
+    if (
+      !expiresAtMs ||
+      expiresAtMs > t
+    ) {
+      continue;
+    }
+
+    expiredSubscriptions +=
+      1;
+
+    const eventId =
+      firebaseSafeKey(
+        `expired_${expiresAtMs}`
+      );
+
+    await db
+      .ref()
+      .update({
+        [`entitlements/${item.uid}`]:
+          {
+            ...item.value,
+
+            verifiedBadge:
+              false,
+
+            verifiedPlan:
+              "none",
+
+            subscriptionActive:
+              false,
+
+            expiresAtMs,
+
+            source:
+              "backend_expiration",
+
+            updatedAtMs:
+              t,
+
+            requiresBackendValidatedReceiptForReactivation:
+              true,
+          },
+
+        [`subscription_events/${item.uid}/${eventId}`]:
+          {
+            eventId,
+
+            uid:
+              item.uid,
+
+            type:
+              "expired",
+
+            expiresAtMs,
+
+            createdAtMs:
+              t,
+
+            immutable:
+              true,
+          },
+      });
+
+    await pushNotification(
+      item.uid,
+      {
+        title:
+          "Verificação expirada",
+
+        body:
+          "Sua assinatura de verificação terminou.",
+
+        type:
+          "verification_expired",
+      }
+    );
+  }
+
+  return {
+    expiredSubscriptions,
+    checkedAtMs:
+      t,
+  };
+}
+
+app.post(
+  "/api/internal/expire-boosts",
+  requireInternalSecret,
+  async (
+    _,
+    res
+  ) => {
+    try {
+      return res.json({
+        ok: true,
+        ...(await expireBoosts()),
+      });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Erro ao expirar Patrocinados."
+      );
+    }
+  }
+);
+
+app.post(
+  "/api/internal/expire-verifications",
+  requireInternalSecret,
+  async (
+    _,
+    res
+  ) => {
+    try {
+      const result =
+        await expireSubscriptions();
+
+      return res.json({
+        ok:
+          true,
+
+        expiredVerifications:
+          result.expiredSubscriptions,
+
+        ...result,
+      });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Erro ao expirar verificações."
+      );
+    }
+  }
+);
+
+app.post(
+  "/api/internal/expire-subscriptions",
+  requireInternalSecret,
+  async (
+    _,
+    res
+  ) => {
+    try {
+      return res.json({
+        ok:
+          true,
+
+        ...(await expireSubscriptions()),
+      });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Erro ao expirar assinaturas."
+      );
+    }
+  }
+);
+
+app.post(
+  "/api/internal/run-maintenance",
+  requireInternalSecret,
+  async (
+    _,
+    res
+  ) => {
+    try {
+      const [
+        boostResult,
+        subscriptionResult,
+      ] =
+        await Promise.all([
+          expireBoosts(),
+          expireSubscriptions(),
+        ]);
+
+      return res.json({
+        ok:
+          true,
+
+        expiredBoosts:
+          boostResult.expiredBoosts,
+
+        expiredSubscriptions:
+          subscriptionResult
+            .expiredSubscriptions,
+
+        expiredVerifications:
+          subscriptionResult
+            .expiredSubscriptions,
+
+        checkedAtMs:
+          nowMs(),
+      });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Erro ao rodar manutenção."
+      );
+    }
+  }
+);
+
+app.get(
+  "/",
+  (
+    _,
+    res
+  ) => {
+    res.send(
+      htmlPage(
+        "FireRank API",
+        "Backend V4.1 online: autenticação, catálogo, endereços, mídia protegida e serviços digitais."
+      )
+    );
+  }
+);
+
+app.get(
+  "/health",
+  async (
+    _,
+    res
+  ) => {
+    let databaseOk =
+      false;
+
+    try {
+      await db
+        .ref(
+          "public_config/app/schemaVersion"
+        )
+        .get();
+
+      databaseOk =
+        true;
+    } catch (_) {}
+
+    res.json({
+      ok:
+        databaseOk,
+
+      schemaVersion:
+        "4.1.0",
+
+      nodeEnv:
+        NODE_ENV,
+
+      firebaseConfigured:
+        !!FIREBASE_DATABASE_URL,
+
+      storageConfigured:
+        !!resolvedStorageBucket,
+
+      mediaProcessorConfigured:
+        !!sharp,
+
+      mercadoPagoConfigured:
+        !!MP_ACCESS_TOKEN,
+
+      emailConfigured:
+        !!SMTP_HOST &&
+        !!SMTP_USER &&
+        !!SMTP_PASS &&
+        !!MAIL_FROM_EMAIL,
+
+      appCheckRequired:
+        REQUIRE_APP_CHECK,
+
+      googlePlayBillingEnforced:
+        ENFORCE_GOOGLE_PLAY_BILLING,
+
+      maintenanceSecretConfigured:
+        !!INTERNAL_MAINTENANCE_SECRET,
+
+      boostCatalogEnvConfigured:
+        !!BOOST_CATALOG_JSON,
     });
   }
-});
+);
 
-app.listen(PORT, () => {
-  console.log(`Servidor FireRank rodando na porta ${PORT}`);
-  console.log(`Webhook Mercado Pago: ${MP_WEBHOOK_URL}`);
-  console.log(`Reset de senha FireRank: ${PASSWORD_RESET_URL}`);
-});
+app.get(
+  "/success",
+  (
+    _,
+    res
+  ) => {
+    res.send(
+      htmlPage(
+        "Pagamento aprovado",
+        "Pagamento concluído. Você já pode voltar ao app."
+      )
+    );
+  }
+);
+
+app.get(
+  "/pending",
+  (
+    _,
+    res
+  ) => {
+    res.send(
+      htmlPage(
+        "Pagamento pendente",
+        "Seu pagamento está pendente. Volte ao app para acompanhar o status."
+      )
+    );
+  }
+);
+
+app.get(
+  "/failure",
+  (
+    _,
+    res
+  ) => {
+    res.send(
+      htmlPage(
+        "Pagamento não concluído",
+        "O pagamento não foi concluído. Você pode tentar novamente no app."
+      )
+    );
+  }
+);
+
+app.get(
+  "/reset-password",
+  (
+    _,
+    res
+  ) => {
+    res.send(
+      resetPasswordPage()
+    );
+  }
+);
+
+app.use(
+  (
+    error,
+    req,
+    res,
+    next
+  ) => {
+    if (
+      res.headersSent
+    ) {
+      return next(
+        error
+      );
+    }
+
+    if (
+      error?.type ===
+      "entity.too.large"
+    ) {
+      return res
+        .status(413)
+        .json({
+          ok:
+            false,
+
+          code:
+            "REQUEST_TOO_LARGE",
+
+          message:
+            "O arquivo ou conteúdo enviado é grande demais.",
+        });
+    }
+
+    if (
+      error?.message ===
+      "CORS_ORIGIN_NOT_ALLOWED"
+    ) {
+      return res
+        .status(403)
+        .json({
+          ok:
+            false,
+
+          code:
+            "CORS_ORIGIN_NOT_ALLOWED",
+
+          message:
+            "Origem não autorizada.",
+        });
+    }
+
+    console.error(
+      "Unhandled Express error:",
+      error?.message ||
+      error
+    );
+
+    return res
+      .status(500)
+      .json({
+        ok:
+          false,
+
+        code:
+          "SERVER_ERROR",
+
+        message:
+          "Erro interno do servidor.",
+      });
+  }
+);
+
+let server =
+  null;
+
+async function start() {
+  try {
+    await ensurePublicApiConfig();
+  } catch (error) {
+    console.error(
+      "Falha ao sincronizar public_config/api:",
+      error.message
+    );
+  }
+
+  server =
+    app.listen(
+      PORT,
+      () => {
+        console.log(
+          `FireRank V4.1 API online na porta ${PORT}`
+        );
+
+        console.log(
+          `Media processor: ${
+            sharp
+              ? "ready"
+              : "sharp_missing"
+          }`
+        );
+
+        console.log(
+          `App Check enforced: ${REQUIRE_APP_CHECK}`
+        );
+      }
+    );
+}
+
+function shutdown(
+  signal
+) {
+  console.log(
+    `${signal}: encerrando FireRank API...`
+  );
+
+  if (!server) {
+    return process.exit(
+      0
+    );
+  }
+
+  server.close(
+    () =>
+      process.exit(
+        0
+      )
+  );
+
+  setTimeout(
+    () =>
+      process.exit(
+        1
+      ),
+    10_000
+  ).unref();
+}
+
+process.on(
+  "SIGTERM",
+  () =>
+    shutdown(
+      "SIGTERM"
+    )
+);
+
+process.on(
+  "SIGINT",
+  () =>
+    shutdown(
+      "SIGINT"
+    )
+);
+
+start().catch(
+  (error) => {
+    console.error(
+      "Falha ao iniciar FireRank API:",
+      error
+    );
+
+    process.exit(
+      1
+    );
+  }
+);
