@@ -4,7 +4,11 @@ const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
-const admin = require("firebase-admin");
+const { initializeApp, getApps, cert } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+const { getDatabase } = require("firebase-admin/database");
+const { getStorage } = require("firebase-admin/storage");
+const { getAppCheck } = require("firebase-admin/app-check");
 const nodemailer = require("nodemailer");
 const sharp = require("sharp");
 const {
@@ -246,16 +250,19 @@ const serviceAccount = parseServiceAccount();
 const resolvedStorageBucket =
   FIREBASE_STORAGE_BUCKET || `${serviceAccount.project_id}.firebasestorage.app`;
 
-if (admin.apps.length === 0) {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: FIREBASE_DATABASE_URL,
-    storageBucket: resolvedStorageBucket,
-  });
-}
+const firebaseApp =
+  getApps().length > 0
+    ? getApps()[0]
+    : initializeApp({
+        credential: cert(serviceAccount),
+        databaseURL: FIREBASE_DATABASE_URL,
+        storageBucket: resolvedStorageBucket,
+      });
 
-const db = admin.database();
-const storageBucket = admin.storage().bucket(resolvedStorageBucket);
+const db = getDatabase(firebaseApp);
+const firebaseAuth = getAuth(firebaseApp);
+const firebaseAppCheck = getAppCheck(firebaseApp);
+const storageBucket = getStorage(firebaseApp).bucket(resolvedStorageBucket);
 
 const configuredAllowedOrigins = String(
   process.env.CORS_ALLOWED_ORIGINS || ""
