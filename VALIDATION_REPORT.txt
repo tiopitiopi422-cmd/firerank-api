@@ -1,0 +1,85 @@
+FIRERANK BACKEND RAILWAY ULTRA FINAL 01
+VALIDATION REPORT
+Generated: 2026-09-02
+
+Static validation executed in assistant container:
+- Node runtime available: v22.16.0
+- server.js lines: 9106
+- named functions: 109
+- HTTP routes: 22
+- duplicate named functions: NONE
+- TODO/FIXME/HACK/XXX: NONE
+
+CHECKS:
+- PASS node_check
+- PASS package_json
+- PASS railway_json
+- PASS schema_4_2
+- PASS railway_public_domain
+- PASS trust_proxy
+- PASS mp_webhook_secret
+- PASS webhook_signature_validator
+- PASS payment_processing_lock
+- PASS media_secret_prod_required
+- PASS health_503
+- PASS sharp_required
+- PASS no_old_railway_fallback
+- PASS dependency_coverage
+
+REQUIRES DETECTED:
+- axios
+- cors
+- dotenv
+- express
+- firebase-admin
+- mercadopago
+- nodemailer
+- sharp
+
+DEPENDENCIES DECLARED:
+- axios@1.20.0
+- cors@2.8.6
+- dotenv@17.4.2
+- express@4.22.2
+- firebase-admin@14.3.0
+- mercadopago@3.6.0
+- nodemailer@9.0.6
+- sharp@0.35.4
+
+HTTP ROUTES:
+- GET   /v1/media/public/:token
+- GET   /v1/media/private/:token
+- POST  /v1/media/product
+- POST  /v1/products
+- POST  /v1/products/update
+- POST  /v1/account/address
+- POST  /api/auth/request-password-reset
+- POST  /api/auth/confirm-password-reset
+- POST  /api/mercadopago/create-preference
+- POST  /v1/billing/mercadopago/create-preference
+- GET   /api/mercadopago/webhook
+- POST  /api/mercadopago/webhook
+- POST  /api/internal/expire-boosts
+- POST  /api/internal/expire-verifications
+- POST  /api/internal/expire-subscriptions
+- POST  /api/internal/run-maintenance
+- GET   /
+- GET   /health
+- GET   /success
+- GET   /pending
+- GET   /failure
+- GET   /reset-password
+
+SECRET SCAN:
+- Private key PEM: NOT FOUND
+- Google API key: NOT FOUND
+- Mercado Pago production token: NOT FOUND
+- GitHub PAT: NOT FOUND
+
+IMPORTANT:
+- npm install/package-lock generation could NOT be completed in this assistant environment because npm registry access timed out.
+- Therefore runtime loading of all third-party packages was not executed here.
+- package.json pins exact top-level versions.
+- Run npm install on Windows or let Railway install dependencies, and commit the generated package-lock.json.
+- No Firebase, Mercado Pago, SMTP or Railway live integration test was claimed.
+- Final production validation still requires real environment variables and /health returning HTTP 200.

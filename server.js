@@ -6,21 +6,31 @@ const cors = require("cors");
 const axios = require("axios");
 const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
-
-let sharp = null;
-try {
-  sharp = require("sharp");
-} catch (_) {
-  // O servidor continua online. O endpoint de mídia retorna 503 até "sharp" existir.
-}
+const sharp = require("sharp");
+const {
+  WebhookSignatureValidator,
+  InvalidWebhookSignatureError,
+} = require("mercadopago");
 
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", 1);
 
 const PORT = Number(process.env.PORT || 10000);
-const NODE_ENV = String(process.env.NODE_ENV || "development").toLowerCase();
+const NODE_ENV = String(process.env.NODE_ENV || "development")
+  .trim()
+  .toLowerCase();
+
+const FIRERANK_SCHEMA_VERSION = "4.2.0";
+const RAILWAY_PUBLIC_DOMAIN = String(
+  process.env.RAILWAY_PUBLIC_DOMAIN || ""
+).trim();
+
 const APP_BASE_URL = String(
-  process.env.APP_BASE_URL || "https://firerank-api-production.up.railway.app"
+  process.env.APP_BASE_URL ||
+    (RAILWAY_PUBLIC_DOMAIN
+      ? `https://${RAILWAY_PUBLIC_DOMAIN}`
+      : `http://localhost:${PORT}`)
 ).replace(/\/+$/, "");
 
 const FIREBASE_DATABASE_URL = String(process.env.FIREBASE_DATABASE_URL || "");
@@ -31,10 +41,15 @@ const FIREBASE_SERVICE_ACCOUNT_JSON = String(
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON || ""
 );
 const FIREBASE_WEB_API_KEY = String(process.env.FIREBASE_WEB_API_KEY || "");
-const FIREBASE_STORAGE_BUCKET = String(process.env.FIREBASE_STORAGE_BUCKET || "");
+const FIREBASE_STORAGE_BUCKET = String(
+  process.env.FIREBASE_STORAGE_BUCKET || ""
+);
 
 const MP_PUBLIC_KEY = String(process.env.MERCADO_PAGO_PUBLIC_KEY || "");
 const MP_ACCESS_TOKEN = String(process.env.MERCADO_PAGO_ACCESS_TOKEN || "");
+const MP_WEBHOOK_SECRET = String(
+  process.env.MERCADO_PAGO_WEBHOOK_SECRET || ""
+);
 const MP_WEBHOOK_URL = String(
   process.env.MP_WEBHOOK_URL ||
     process.env.MERCADO_PAGO_WEBHOOK_URL ||
@@ -77,6 +92,7 @@ const BOOST_CATALOG_JSON = String(process.env.BOOST_CATALOG_JSON || "");
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const MEDIA_UPLOAD_TOKEN_TTL_MS = 2 * HOUR_MS;
+const PAYMENT_PROCESSING_LOCK_TTL_MS = 2 * 60 * 1000;
 const MAX_MEDIA_BYTES = 12 * 1024 * 1024;
 const MAX_PRODUCT_IMAGES = 8;
 const MAX_VARIANT_COMBINATIONS = 60;
@@ -135,6 +151,60 @@ function timingSafeEqualText(a, b) {
   return crypto.timingSafeEqual(aBuffer, bBuffer);
 }
 
+function isHttpsUrl(value) {
+  try {
+    return new URL(String(value || "")).protocol === "https:";
+  } catch (_) {
+    return false;
+  }
+}
+
+async function bestEffort(label, action) {
+  try {
+    await action();
+  } catch (error) {
+    console.error(
+      `[best-effort:${label}]`,
+      error?.code || error?.message || "error"
+    );
+  }
+}
+
+function validateCriticalRuntimeConfig() {
+  if (!Number.isFinite(PORT) || PORT <= 0 || PORT > 65535) {
+    throw new Error("PORT_INVALID");
+  }
+
+  if (
+    NODE_ENV === "production" &&
+    !isHttpsUrl(APP_BASE_URL)
+  ) {
+    console.warn(
+      "APP_BASE_URL ainda não é HTTPS. Gere o domínio público do Railway ou defina APP_BASE_URL antes de conectar o app."
+    );
+  }
+
+  if (
+    NODE_ENV === "production" &&
+    !MEDIA_TOKEN_SECRET
+  ) {
+    throw new Error(
+      "MEDIA_TOKEN_SECRET_REQUIRED_IN_PRODUCTION"
+    );
+  }
+
+  if (
+    NODE_ENV === "production" &&
+    MP_ACCESS_TOKEN &&
+    !MP_WEBHOOK_SECRET
+  ) {
+    throw new Error(
+      "MERCADO_PAGO_WEBHOOK_SECRET_REQUIRED_WHEN_PAYMENTS_ARE_ENABLED"
+    );
+  }
+}
+
+
 function normalizePrivateKey(privateKey) {
   return String(privateKey || "")
     .replace(/\r/g, "")
@@ -187,18 +257,37 @@ if (admin.apps.length === 0) {
 const db = admin.database();
 const storageBucket = admin.storage().bucket(resolvedStorageBucket);
 
-const allowedOrigins = String(process.env.CORS_ALLOWED_ORIGINS || "")
+const configuredAllowedOrigins = String(
+  process.env.CORS_ALLOWED_ORIGINS || ""
+)
   .split(",")
   .map((item) => item.trim())
   .filter(Boolean);
 
+const allowedOrigins = new Set(configuredAllowedOrigins);
+
+if (isHttpsUrl(APP_BASE_URL)) {
+  try {
+    allowedOrigins.add(new URL(APP_BASE_URL).origin);
+  } catch (_) {}
+}
+
 app.use(
   cors({
     origin(origin, callback) {
+      // Apps nativos, curl e chamadas servidor-servidor normalmente não enviam Origin.
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.has(origin)) {
+        return callback(null, true);
+      }
+
+      // Em desenvolvimento, manter conveniência local. Em produção, fail closed.
       if (
-        !origin ||
-        allowedOrigins.length === 0 ||
-        allowedOrigins.includes(origin)
+        NODE_ENV !== "production" &&
+        configuredAllowedOrigins.length === 0
       ) {
         return callback(null, true);
       }
@@ -216,32 +305,24 @@ app.use(
       "X-Firebase-AppCheck-Token",
       "X-FireRank-Schema",
       "X-FireRank-Internal-Secret",
+      "X-Client-Platform",
+      "Idempotency-Key",
+      "X-Idempotency-Key",
     ],
+    maxAge: 86400,
   })
 );
 
 app.use((req, res, next) => {
-  res.setHeader(
-    "X-Content-Type-Options",
-    "nosniff"
-  );
-  res.setHeader(
-    "X-Frame-Options",
-    "DENY"
-  );
-  res.setHeader(
-    "Referrer-Policy",
-    "no-referrer"
-  );
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader(
     "Permissions-Policy",
     "camera=(), microphone=(), geolocation=()"
   );
-  res.setHeader(
-    "Cross-Origin-Resource-Policy",
-    "cross-origin"
-  );
-
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  res.setHeader("X-FireRank-Schema", FIRERANK_SCHEMA_VERSION);
   next();
 });
 
@@ -610,55 +691,35 @@ async function pushNotification(
 }
 
 async function ensurePublicApiConfig() {
+  if (!isHttpsUrl(APP_BASE_URL) && NODE_ENV === "production") {
+    console.warn(
+      "public_config/api não foi alterado: APP_BASE_URL público HTTPS ainda não está configurado."
+    );
+    return false;
+  }
+
   const t = nowMs();
 
-  await db
-    .ref(
-      "public_config/api"
-    )
-    .update({
-      schemaVersion:
-        "4.1.0",
+  await db.ref("public_config/api").update({
+    schemaVersion: FIRERANK_SCHEMA_VERSION,
+    baseUrl: APP_BASE_URL,
+    gatewayBaseUrl: APP_BASE_URL,
+    backendBaseUrl: APP_BASE_URL,
+    productCreateEndpoint: `${APP_BASE_URL}/v1/products`,
+    createProductEndpoint: `${APP_BASE_URL}/v1/products`,
+    productUpdateEndpoint: `${APP_BASE_URL}/v1/products/update`,
+    updateProductEndpoint: `${APP_BASE_URL}/v1/products/update`,
+    mediaUploadEndpoint: `${APP_BASE_URL}/v1/media/product`,
+    productMediaUploadEndpoint: `${APP_BASE_URL}/v1/media/product`,
+    addressSaveEndpoint: `${APP_BASE_URL}/v1/account/address`,
+    saveAddressEndpoint: `${APP_BASE_URL}/v1/account/address`,
+    userAddressEndpoint: `${APP_BASE_URL}/v1/account/address`,
+    billingMercadoPagoEndpoint:
+      `${APP_BASE_URL}/v1/billing/mercadopago/create-preference`,
+    updatedAtMs: t,
+  });
 
-      baseUrl:
-        APP_BASE_URL,
-
-      gatewayBaseUrl:
-        APP_BASE_URL,
-
-      backendBaseUrl:
-        APP_BASE_URL,
-
-      productCreateEndpoint:
-        `${APP_BASE_URL}/v1/products`,
-
-      createProductEndpoint:
-        `${APP_BASE_URL}/v1/products`,
-
-      productUpdateEndpoint:
-        `${APP_BASE_URL}/v1/products/update`,
-
-      updateProductEndpoint:
-        `${APP_BASE_URL}/v1/products/update`,
-
-      mediaUploadEndpoint:
-        `${APP_BASE_URL}/v1/media/product`,
-
-      productMediaUploadEndpoint:
-        `${APP_BASE_URL}/v1/media/product`,
-
-      addressSaveEndpoint:
-        `${APP_BASE_URL}/v1/account/address`,
-
-      saveAddressEndpoint:
-        `${APP_BASE_URL}/v1/account/address`,
-
-      userAddressEndpoint:
-        `${APP_BASE_URL}/v1/account/address`,
-
-      updatedAtMs:
-        t,
-    });
+  return true;
 }
 
 async function getFeatureFlag(
@@ -1037,14 +1098,16 @@ function verifySignedToken(
 }
 
 function resolvedMediaTokenSecret() {
-  return (
-    MEDIA_TOKEN_SECRET ||
-    stableHash(
-      serviceAccount.private_key
-    ).slice(
-      0,
-      64
-    )
+  if (MEDIA_TOKEN_SECRET) {
+    return MEDIA_TOKEN_SECRET;
+  }
+
+  if (NODE_ENV !== "production") {
+    return stableHash(serviceAccount.private_key).slice(0, 64);
+  }
+
+  throw new Error(
+    "MEDIA_TOKEN_SECRET_REQUIRED_IN_PRODUCTION"
   );
 }
 
@@ -6139,17 +6202,38 @@ app.post(
 
 function ensureMP() {
   if (!MP_ACCESS_TOKEN) {
-    const error =
-      new Error(
-        "MERCADO_PAGO_NOT_CONFIGURED"
-      );
-
-    error.statusCode =
-      503;
-
+    const error = new Error(
+      "MERCADO_PAGO_NOT_CONFIGURED"
+    );
+    error.statusCode = 503;
     error.publicMessage =
       "Pagamento temporariamente indisponível.";
+    throw error;
+  }
 
+  if (
+    NODE_ENV === "production" &&
+    !MP_WEBHOOK_SECRET
+  ) {
+    const error = new Error(
+      "MERCADO_PAGO_WEBHOOK_SECRET_NOT_CONFIGURED"
+    );
+    error.statusCode = 503;
+    error.publicMessage =
+      "Pagamento temporariamente indisponível.";
+    throw error;
+  }
+
+  if (
+    NODE_ENV === "production" &&
+    !isHttpsUrl(MP_WEBHOOK_URL)
+  ) {
+    const error = new Error(
+      "MERCADO_PAGO_WEBHOOK_URL_INVALID"
+    );
+    error.statusCode = 503;
+    error.publicMessage =
+      "Pagamento temporariamente indisponível.";
     throw error;
   }
 }
@@ -7268,211 +7352,137 @@ async function activateVerificationFromPayment(
   paymentDetail,
   t
 ) {
-  const uid =
-    payment.uid;
+  const uid = safe(payment.uid);
+  const requestId = safe(payment.requestId);
 
-  const requestId =
-    payment.requestId;
+  const latestPaymentSnap = await db
+    .ref(`payments/${requestId}`)
+    .get();
+  const latestPayment = map(latestPaymentSnap.val());
 
-  const requestSnap =
-    await db
-      .ref(
-        `payment_requests/${uid}/${requestId}`
-      )
-      .get();
+  if (latestPayment.fulfillmentStatus === "fulfilled") {
+    return;
+  }
 
-  const request =
-    map(
-      requestSnap.val()
-    );
-
-  const plan =
-    await readSubscriptionPlan(
-      request.planKey ||
-      request.planId
-    );
+  const requestSnap = await db
+    .ref(`payment_requests/${uid}/${requestId}`)
+    .get();
+  const request = map(requestSnap.val());
+  const plan = await readSubscriptionPlan(
+    request.planKey || request.planId
+  );
 
   try {
-    await assertVerificationPurchaseEligible(
-      uid
-    );
-  } catch (
-    eligibilityError
-  ) {
-    await db
-      .ref()
-      .update({
-        [`payments/${requestId}/fulfillmentStatus`]:
-          "manual_review",
+    await assertVerificationPurchaseEligible(uid);
+  } catch (_) {
+    await db.ref().update({
+      [`payments/${requestId}/fulfillmentStatus`]:
+        "manual_review",
+      [`payments/${requestId}/updatedAtMs`]:
+        t,
+      [`payment_requests/${uid}/${requestId}/status`]:
+        "manual_review",
+      [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
+        t,
+    });
 
-        [`payments/${requestId}/updatedAtMs`]:
-          t,
-
-        [`payment_requests/${uid}/${requestId}/status`]:
-          "manual_review",
-
-        [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
-          t,
-      });
-
-    await pushNotification(
-      uid,
-      {
-        title:
-          "Pagamento recebido",
-
-        body:
-          "Seu pagamento foi recebido, mas a verificação precisa de revisão antes da ativação.",
-
-        type:
-          "verification_manual_review",
-
-        data: {
-          requestId,
-        },
-      }
+    await bestEffort(
+      "verification-manual-review-notification",
+      () =>
+        pushNotification(uid, {
+          title: "Pagamento recebido",
+          body:
+            "Seu pagamento foi recebido, mas a verificação precisa de revisão antes da ativação.",
+          type: "verification_manual_review",
+          data: { requestId },
+        })
     );
 
     return;
   }
 
-  const entitlementSnap =
-    await db
-      .ref(
-        `entitlements/${uid}`
-      )
-      .get();
+  const entitlementSnap = await db
+    .ref(`entitlements/${uid}`)
+    .get();
+  const current = map(entitlementSnap.val());
 
-  const current =
-    map(
-      entitlementSnap.val()
-    );
+  // Evita estender duas vezes a mesma assinatura em retries do webhook.
+  if (
+    current.sourceRequestId === requestId &&
+    current.subscriptionActive === true &&
+    latestPayment.fulfillmentStatus === "fulfilled"
+  ) {
+    return;
+  }
 
-  const currentExpiry =
-    finiteNumber(
-      current.expiresAtMs,
-      0
-    );
-
+  const currentExpiry = finiteNumber(
+    current.expiresAtMs,
+    0
+  );
   const base =
-    current.subscriptionActive ===
-      true &&
+    current.subscriptionActive === true &&
     currentExpiry > t
       ? currentExpiry
       : t;
+  const expiresAtMs = base + 30 * DAY_MS;
 
-  const expiresAtMs =
-    base +
-    30 * DAY_MS;
+  const eventId = firebaseSafeKey(
+    `activated_${requestId}_${safe(paymentDetail.id)}`
+  );
 
-  const eventId =
-    firebaseSafeKey(
-      `activated_${requestId}_${safe(
-        paymentDetail.id
-      )}`
-    );
+  await db.ref().update({
+    [`entitlements/${uid}`]: {
+      ...current,
+      verifiedBadge: true,
+      verifiedPlan: safe(
+        plan.key ||
+          request.planKey ||
+          "normal"
+      ),
+      subscriptionActive: true,
+      expiresAtMs,
+      source: "backend_validated_mercado_pago",
+      sourceRequestId: requestId,
+      updatedAtMs: t,
+      requiresBackendValidatedReceiptForReactivation:
+        false,
+    },
+    [`subscription_events/${uid}/${eventId}`]: {
+      eventId,
+      uid,
+      type: "activated",
+      planId: safe(plan.planId || plan.key),
+      requestId,
+      gatewayPaymentId: safe(paymentDetail.id),
+      startsAtMs: t,
+      expiresAtMs,
+      createdAtMs: t,
+      immutable: true,
+    },
+    [`payments/${requestId}/fulfillmentStatus`]:
+      "fulfilled",
+    [`payments/${requestId}/fulfilledAtMs`]:
+      t,
+    [`payments/${requestId}/updatedAtMs`]:
+      t,
+    [`payment_requests/${uid}/${requestId}/status`]:
+      "active",
+    [`payment_requests/${uid}/${requestId}/expiresAtMs`]:
+      expiresAtMs,
+    [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
+      t,
+  });
 
-  await db
-    .ref()
-    .update({
-      [`entitlements/${uid}`]:
-        {
-          ...current,
-
-          verifiedBadge:
-            true,
-
-          verifiedPlan:
-            safe(
-              plan.key ||
-              request.planKey ||
-              "normal"
-            ),
-
-          subscriptionActive:
-            true,
-
-          expiresAtMs,
-
-          source:
-            "backend_validated_mercado_pago",
-
-          sourceRequestId:
-            requestId,
-
-          updatedAtMs:
-            t,
-
-          requiresBackendValidatedReceiptForReactivation:
-            false,
-        },
-
-      [`subscription_events/${uid}/${eventId}`]:
-        {
-          eventId,
-
-          uid,
-
-          type:
-            "activated",
-
-          planId:
-            safe(
-              plan.planId ||
-              plan.key
-            ),
-
-          requestId,
-
-          gatewayPaymentId:
-            safe(
-              paymentDetail.id
-            ),
-
-          startsAtMs:
-            t,
-
-          expiresAtMs,
-
-          createdAtMs:
-            t,
-
-          immutable:
-            true,
-        },
-
-      [`payments/${requestId}/fulfillmentStatus`]:
-        "fulfilled",
-
-      [`payments/${requestId}/updatedAtMs`]:
-        t,
-
-      [`payment_requests/${uid}/${requestId}/status`]:
-        "active",
-
-      [`payment_requests/${uid}/${requestId}/expiresAtMs`]:
-        expiresAtMs,
-
-      [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
-        t,
-    });
-
-  await pushNotification(
-    uid,
-    {
-      title:
-        "Verificação ativada",
-
-      body:
-        "Seu pagamento foi validado e sua assinatura de verificação está ativa.",
-
-      type:
-        "verification_activated",
-
-      data: {
-        requestId,
-      },
-    }
+  await bestEffort(
+    "verification-activated-notification",
+    () =>
+      pushNotification(uid, {
+        title: "Verificação ativada",
+        body:
+          "Seu pagamento foi validado e sua assinatura de verificação está ativa.",
+        type: "verification_activated",
+        data: { requestId },
+      })
   );
 }
 
@@ -7481,267 +7491,148 @@ async function activateBoostFromPayment(
   paymentDetail,
   t
 ) {
-  const uid =
-    payment.uid;
+  const uid = safe(payment.uid);
+  const requestId = safe(payment.requestId);
 
-  const requestId =
-    payment.requestId;
+  const latestPaymentSnap = await db
+    .ref(`payments/${requestId}`)
+    .get();
+  const latestPayment = map(latestPaymentSnap.val());
 
-  const requestSnap =
-    await db
-      .ref(
-        `boost_requests/${requestId}`
-      )
-      .get();
+  if (latestPayment.fulfillmentStatus === "fulfilled") {
+    return;
+  }
 
-  const request =
-    map(
-      requestSnap.val()
-    );
+  const requestSnap = await db
+    .ref(`boost_requests/${requestId}`)
+    .get();
+  const request = map(requestSnap.val());
+  const productId = safe(request.productId);
 
-  const productId =
-    safe(
-      request.productId
-    );
-
-  const productSnap =
-    await db
-      .ref(
-        `products/${productId}`
-      )
-      .get();
-
-  const product =
-    map(
-      productSnap.val()
-    );
+  const productSnap = await db
+    .ref(`products/${productId}`)
+    .get();
+  const product = map(productSnap.val());
 
   if (
     !productSnap.exists() ||
-    product.ownerUid !==
-      uid ||
-    !(await productIsCurrentlyPublic(
-      product
-    ))
+    product.ownerUid !== uid ||
+    !(await productIsCurrentlyPublic(product))
   ) {
-    await db
-      .ref()
-      .update({
-        [`payments/${requestId}/fulfillmentStatus`]:
-          "manual_review",
+    await db.ref().update({
+      [`payments/${requestId}/fulfillmentStatus`]:
+        "manual_review",
+      [`payments/${requestId}/updatedAtMs`]:
+        t,
+      [`boost_requests/${requestId}/status`]:
+        "blocked_after_payment",
+      [`boost_requests/${requestId}/updatedAtMs`]:
+        t,
+    });
 
-        [`payments/${requestId}/updatedAtMs`]:
-          t,
-
-        [`boost_requests/${requestId}/status`]:
-          "blocked_after_payment",
-
-        [`boost_requests/${requestId}/updatedAtMs`]:
-          t,
-      });
-
-    await pushNotification(
-      uid,
-      {
-        title:
-          "Patrocinado aguardando revisão",
-
-        body:
-          "O pagamento foi recebido, mas o produto não está público/ativo para iniciar o Patrocinado.",
-
-        type:
-          "boost_manual_review",
-
-        data: {
-          requestId,
-          productId,
-        },
-      }
+    await bestEffort(
+      "boost-manual-review-notification",
+      () =>
+        pushNotification(uid, {
+          title: "Patrocinado aguardando revisão",
+          body:
+            "O pagamento foi recebido, mas o produto não está público/ativo para iniciar o Patrocinado.",
+          type: "boost_manual_review",
+          data: { requestId, productId },
+        })
     );
 
     return;
   }
 
-  const cardSnap =
-    await db
-      .ref(
-        `product_cards/${productId}`
-      )
-      .get();
+  const cardSnap = await db
+    .ref(`product_cards/${productId}`)
+    .get();
+  const card = map(cardSnap.val());
 
-  const card =
-    map(
-      cardSnap.val()
-    );
-
-  if (
-    !cardSnap.exists()
-  ) {
-    throw new Error(
-      "PUBLIC_PRODUCT_CARD_MISSING"
-    );
+  if (!cardSnap.exists()) {
+    throw new Error("PUBLIC_PRODUCT_CARD_MISSING");
   }
 
-  const boostId =
-    requestId;
+  const boostId = requestId;
+  const days = integer(request.days, 0);
 
-  const days =
-    integer(
-      request.days,
-      0
-    );
-
-  if (
-    days <= 0 ||
-    days > 365
-  ) {
-    throw new Error(
-      "INVALID_BOOST_DURATION"
-    );
+  if (days <= 0 || days > 365) {
+    throw new Error("INVALID_BOOST_DURATION");
   }
 
-  const expiresAtMs =
-    t +
-    days * DAY_MS;
+  const expiresAtMs = t + days * DAY_MS;
+  const eventId = firebaseSafeKey(
+    `activated_${safe(paymentDetail.id)}`
+  );
 
-  const eventId =
-    firebaseSafeKey(
-      `activated_${safe(
-        paymentDetail.id
-      )}`
-    );
+  await db.ref().update({
+    [`boosts/${boostId}`]: {
+      boostId,
+      ownerUid: uid,
+      productId,
+      requestId,
+      planId: clip(request.planId, 80),
+      placement: clip(
+        request.placement || "discover_sponsored",
+        80
+      ),
+      status: "active",
+      amountCents: integer(payment.amountCents),
+      currency: "BRL",
+      startsAtMs: t,
+      expiresAtMs,
+      updatedAtMs: t,
+    },
+    [`active_boost_cards/${productId}`]: {
+      ...card,
+      boostId,
+      startsAtMs: t,
+      expiresAtMs,
+      updatedAtMs: t,
+    },
+    [`boost_requests/${requestId}/status`]:
+      "active",
+    [`boost_requests/${requestId}/boostId`]:
+      boostId,
+    [`boost_requests/${requestId}/startsAtMs`]:
+      t,
+    [`boost_requests/${requestId}/expiresAtMs`]:
+      expiresAtMs,
+    [`boost_requests/${requestId}/updatedAtMs`]:
+      t,
+    [`boost_events/${boostId}/${eventId}`]: {
+      eventId,
+      boostId,
+      ownerUid: uid,
+      productId,
+      requestId,
+      type: "activated",
+      createdAtMs: t,
+      immutable: true,
+    },
+    [`payments/${requestId}/fulfillmentStatus`]:
+      "fulfilled",
+    [`payments/${requestId}/fulfilledAtMs`]:
+      t,
+    [`payments/${requestId}/updatedAtMs`]:
+      t,
+    [`payment_requests/${uid}/${requestId}/status`]:
+      "active",
+    [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
+      t,
+  });
 
-  await db
-    .ref()
-    .update({
-      [`boosts/${boostId}`]:
-        {
-          boostId,
-
-          ownerUid:
-            uid,
-
-          productId,
-
-          requestId,
-
-          planId:
-            clip(
-              request.planId,
-              80
-            ),
-
-          placement:
-            clip(
-              request.placement ||
-                "discover_sponsored",
-              80
-            ),
-
-          status:
-            "active",
-
-          amountCents:
-            integer(
-              payment.amountCents
-            ),
-
-          currency:
-            "BRL",
-
-          startsAtMs:
-            t,
-
-          expiresAtMs,
-
-          updatedAtMs:
-            t,
-        },
-
-      [`active_boost_cards/${productId}`]:
-        {
-          ...card,
-
-          boostId,
-
-          startsAtMs:
-            t,
-
-          expiresAtMs,
-
-          updatedAtMs:
-            t,
-        },
-
-      [`boost_requests/${requestId}/status`]:
-        "active",
-
-      [`boost_requests/${requestId}/boostId`]:
-        boostId,
-
-      [`boost_requests/${requestId}/startsAtMs`]:
-        t,
-
-      [`boost_requests/${requestId}/expiresAtMs`]:
-        expiresAtMs,
-
-      [`boost_requests/${requestId}/updatedAtMs`]:
-        t,
-
-      [`boost_events/${boostId}/${eventId}`]:
-        {
-          eventId,
-
-          boostId,
-
-          ownerUid:
-            uid,
-
-          productId,
-
-          requestId,
-
-          type:
-            "activated",
-
-          createdAtMs:
-            t,
-
-          immutable:
-            true,
-        },
-
-      [`payments/${requestId}/fulfillmentStatus`]:
-        "fulfilled",
-
-      [`payments/${requestId}/updatedAtMs`]:
-        t,
-
-      [`payment_requests/${uid}/${requestId}/status`]:
-        "active",
-
-      [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
-        t,
-    });
-
-  await pushNotification(
-    uid,
-    {
-      title:
-        "Patrocinado ativado",
-
-      body:
-        "Seu pagamento foi validado e o produto já está na área de Patrocinados.",
-
-      type:
-        "boost_activated",
-
-      data: {
-        requestId,
-        productId,
-        boostId,
-      },
-    }
+  await bestEffort(
+    "boost-activated-notification",
+    () =>
+      pushNotification(uid, {
+        title: "Patrocinado ativado",
+        body:
+          "Seu pagamento foi validado e o produto já está na área de Patrocinados.",
+        type: "boost_activated",
+        data: { requestId, productId, boostId },
+      })
   );
 }
 
@@ -7915,7 +7806,7 @@ async function revokeFulfillmentForPayment(
 
     const eventId =
       firebaseSafeKey(
-        `reversed_${status}_${t}`
+        `reversed_${requestId}_${status}`
       );
 
     updates[
@@ -7967,7 +7858,9 @@ async function revokeFulfillmentForPayment(
         t,
     });
 
-  await pushNotification(
+  await bestEffort(
+    "payment-reversed-notification",
+    () => pushNotification(
     uid,
     {
       title:
@@ -7983,320 +7876,374 @@ async function revokeFulfillmentForPayment(
         requestId,
       },
     }
+  )
   );
+}
+
+async function acquirePaymentProcessingLock(
+  requestId,
+  eventId
+) {
+  const ref = db.ref(
+    `payment_processing/${requestId}/${eventId}`
+  );
+  const t = nowMs();
+
+  const result = await ref.transaction(
+    (current) => {
+      const value = map(current);
+      const status = safe(value.status);
+      const startedAtMs = finiteNumber(
+        value.startedAtMs,
+        0
+      );
+
+      if (status === "done") {
+        return;
+      }
+
+      if (
+        status === "processing" &&
+        startedAtMs > 0 &&
+        t - startedAtMs <
+          PAYMENT_PROCESSING_LOCK_TTL_MS
+      ) {
+        return;
+      }
+
+      return {
+        status: "processing",
+        startedAtMs: t,
+        updatedAtMs: t,
+      };
+    },
+    undefined,
+    false
+  );
+
+  return {
+    acquired: result.committed === true,
+    ref,
+  };
+}
+
+async function markPaymentProcessingDone(
+  ref
+) {
+  await ref.set({
+    status: "done",
+    completedAtMs: nowMs(),
+    updatedAtMs: nowMs(),
+  });
+}
+
+async function markPaymentProcessingRetryable(
+  ref
+) {
+  await ref.set({
+    status: "retryable_error",
+    updatedAtMs: nowMs(),
+  });
+}
+
+function validateMercadoPagoWebhookSignature(req) {
+  if (!MP_WEBHOOK_SECRET) {
+    if (
+      NODE_ENV === "production" &&
+      MP_ACCESS_TOKEN
+    ) {
+      const error = new Error(
+        "MERCADO_PAGO_WEBHOOK_SECRET_REQUIRED"
+      );
+      error.statusCode = 503;
+      throw error;
+    }
+
+    return true;
+  }
+
+  const dataId = safe(
+    req.query["data.id"] ||
+      req.body?.data?.id ||
+      req.body?.["data.id"]
+  );
+
+  const xSignature = safe(
+    req.headers["x-signature"]
+  );
+  const xRequestId = safe(
+    req.headers["x-request-id"]
+  );
+
+  if (
+    !dataId ||
+    !xSignature ||
+    !xRequestId
+  ) {
+    const error = new Error(
+      "INVALID_MERCADO_PAGO_WEBHOOK_SIGNATURE"
+    );
+    error.statusCode = 401;
+    throw error;
+  }
+
+  try {
+    WebhookSignatureValidator.validate({
+      xSignature,
+      xRequestId,
+      dataId,
+      secret: MP_WEBHOOK_SECRET,
+    });
+  } catch (error) {
+    if (
+      error instanceof
+        InvalidWebhookSignatureError
+    ) {
+      const signatureError = new Error(
+        "INVALID_MERCADO_PAGO_WEBHOOK_SIGNATURE"
+      );
+      signatureError.statusCode = 401;
+      throw signatureError;
+    }
+
+    throw error;
+  }
+
+  return true;
 }
 
 async function processMercadoPagoWebhookPayment(
   paymentId
 ) {
-  const detail =
-    await fetchMercadoPagoPayment(
-      paymentId
-    );
-
-  const requestId =
-    safe(
-      detail.external_reference
-    );
+  const detail = await fetchMercadoPagoPayment(
+    paymentId
+  );
+  const requestId = safe(
+    detail.external_reference
+  );
 
   if (!requestId) {
-    await appendAudit(
-      "payment_webhook_ignored",
-      {
-        referenceId:
-          safe(
-            paymentId
-          ),
-
-        status:
-          "missing_external_reference",
-      }
+    await bestEffort(
+      "payment-webhook-missing-reference-audit",
+      () =>
+        appendAudit(
+          "payment_webhook_ignored",
+          {
+            referenceId: safe(paymentId),
+            status: "missing_external_reference",
+          }
+        )
     );
-
     return;
   }
 
-  const paymentSnap =
-    await db
-      .ref(
-        `payments/${requestId}`
-      )
-      .get();
+  const paymentSnap = await db
+    .ref(`payments/${requestId}`)
+    .get();
 
-  if (
-    !paymentSnap.exists()
-  ) {
-    await appendAudit(
-      "payment_webhook_ignored",
-      {
-        referenceId:
-          requestId,
-
-        status:
-          "unknown_request",
-      }
+  if (!paymentSnap.exists()) {
+    await bestEffort(
+      "payment-webhook-unknown-request-audit",
+      () =>
+        appendAudit(
+          "payment_webhook_ignored",
+          {
+            referenceId: requestId,
+            status: "unknown_request",
+          }
+        )
     );
-
     return;
   }
 
-  const payment =
-    map(
-      paymentSnap.val()
-    );
-
-  const uid =
-    safe(
-      payment.uid
-    );
-
-  const status =
-    normalizePaymentStatus(
-      detail.status
-    );
-
-  const amountCents =
-    Math.round(
-      finiteNumber(
-        detail.transaction_amount,
-        -1
-      ) * 100
-    );
-
-  const currency =
-    safe(
-      detail.currency_id ||
-        "BRL"
-    ).toUpperCase();
-
-  const expectedAmount =
-    integer(
-      payment.amountCents,
+  const payment = map(paymentSnap.val());
+  const uid = safe(payment.uid);
+  const status = normalizePaymentStatus(
+    detail.status
+  );
+  const amountCents = Math.round(
+    finiteNumber(
+      detail.transaction_amount,
       -1
-    );
+    ) * 100
+  );
+  const currency = safe(
+    detail.currency_id || "BRL"
+  ).toUpperCase();
+  const expectedAmount = integer(
+    payment.amountCents,
+    -1
+  );
+  const gatewayPaymentId = safe(
+    detail.id || paymentId
+  );
+  const t = nowMs();
+  const eventId = firebaseSafeKey(
+    `${gatewayPaymentId}_${status}`
+  );
 
-  const gatewayPaymentId =
-    safe(
-      detail.id ||
-        paymentId
-    );
+  const lock = await acquirePaymentProcessingLock(
+    requestId,
+    eventId
+  );
 
-  const t =
-    nowMs();
-
-  const eventId =
-    firebaseSafeKey(
-      `${gatewayPaymentId}_${status}`
-    );
-
-  const existingEvent =
-    await db
-      .ref(
-        `payment_events/${requestId}/${eventId}`
-      )
-      .get();
-
-  if (
-    existingEvent.exists()
-  ) {
+  if (!lock.acquired) {
     return;
   }
 
-  const integrityOk =
-    uid &&
-    expectedAmount > 0 &&
-    amountCents ===
-      expectedAmount &&
-    currency ===
-      "BRL";
+  let completed = false;
 
-  if (!integrityOk) {
-    await db
-      .ref()
-      .update({
+  try {
+    const integrityOk =
+      uid &&
+      expectedAmount > 0 &&
+      amountCents === expectedAmount &&
+      currency === "BRL";
+
+    if (!integrityOk) {
+      await db.ref().update({
         [`payments/${requestId}/status`]:
           "integrity_error",
-
         [`payments/${requestId}/fulfillmentStatus`]:
           "blocked",
-
         [`payments/${requestId}/gatewayPaymentId`]:
           gatewayPaymentId,
-
         [`payments/${requestId}/updatedAtMs`]:
           t,
-
         [`payment_events/${requestId}/${eventId}`]:
           {
             eventId,
-
-            type:
-              "integrity_error",
-
+            type: "integrity_error",
             status,
-
-            createdAtMs:
-              t,
-
-            immutable:
-              true,
+            createdAtMs: t,
+            immutable: true,
           },
       });
 
-    await appendAudit(
-      "payment_integrity_error",
-      {
-        targetUid:
-          uid,
+      await bestEffort(
+        "payment-integrity-audit",
+        () =>
+          appendAudit(
+            "payment_integrity_error",
+            {
+              targetUid: uid,
+              referenceId: requestId,
+              status: "blocked",
+            }
+          )
+      );
 
-        referenceId:
-          requestId,
+      completed = true;
+      return;
+    }
 
-        status:
-          "blocked",
-      }
-    );
-
-    return;
-  }
-
-  await db
-    .ref()
-    .update({
+    await db.ref().update({
       [`payments/${requestId}/status`]:
         status,
-
       [`payments/${requestId}/gatewayPaymentId`]:
         gatewayPaymentId,
-
       [`payments/${requestId}/gatewayPreferenceId`]:
         safe(
-          detail.metadata
-            ?.preference_id ||
-          payment.gatewayPreferenceId
+          detail.metadata?.preference_id ||
+            payment.gatewayPreferenceId
         ),
-
       [`payments/${requestId}/updatedAtMs`]:
         t,
-
       [`payment_requests/${uid}/${requestId}/paymentStatus`]:
         status,
-
       [`payment_requests/${uid}/${requestId}/gatewayPaymentId`]:
         gatewayPaymentId,
-
       [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
         t,
-
       [`payment_events/${requestId}/${eventId}`]:
         {
           eventId,
-
-          type:
-            "gateway_status",
-
+          type: "gateway_status",
           status,
-
           gatewayPaymentId,
-
-          createdAtMs:
-            t,
-
-          immutable:
-            true,
+          createdAtMs: t,
+          immutable: true,
         },
     });
 
-  await appendFinancialLedgerEvent({
-    uid,
-    requestId,
-    gatewayPaymentId,
-    amountCents,
-    status,
+    await appendFinancialLedgerEvent({
+      uid,
+      requestId,
+      gatewayPaymentId,
+      amountCents,
+      status,
+      type:
+        `mercado_pago_${safe(payment.type)}`,
+    });
 
-    type:
-      `mercado_pago_${safe(
-        payment.type
-      )}`,
-  });
-
-  if (
-    status ===
-    "approved"
-  ) {
-    if (
-      payment.type ===
-      "verification"
-    ) {
-      await activateVerificationFromPayment(
-        payment,
-        detail,
-        t
-      );
+    if (status === "approved") {
+      if (payment.type === "verification") {
+        await activateVerificationFromPayment(
+          payment,
+          detail,
+          t
+        );
+      } else if (payment.type === "boost") {
+        await activateBoostFromPayment(
+          payment,
+          detail,
+          t
+        );
+      }
     } else if (
-      payment.type ===
-      "boost"
-    ) {
-      await activateBoostFromPayment(
-        payment,
-        detail,
-        t
-      );
-    }
-  } else if (
-    ![
-      "pending",
-      "in_process",
-    ].includes(
-      status
-    )
-  ) {
-    if (
-      [
-        "refunded",
-        "charged_back",
-        "cancelled",
-      ].includes(
+      !["pending", "in_process"].includes(
         status
       )
     ) {
-      await revokeFulfillmentForPayment(
-        payment,
-        status,
-        t
+      if (
+        [
+          "refunded",
+          "charged_back",
+          "cancelled",
+        ].includes(status)
+      ) {
+        await revokeFulfillmentForPayment(
+          payment,
+          status,
+          t
+        );
+      } else {
+        const updates = {
+          [`payments/${requestId}/fulfillmentStatus`]:
+            "not_fulfilled",
+          [`payment_requests/${uid}/${requestId}/status`]:
+            "payment_failed",
+          [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
+            t,
+        };
+
+        if (payment.type === "boost") {
+          updates[
+            `boost_requests/${requestId}/status`
+          ] = "payment_failed";
+          updates[
+            `boost_requests/${requestId}/updatedAtMs`
+          ] = t;
+        }
+
+        await db.ref().update(updates);
+      }
+    }
+
+    completed = true;
+  } finally {
+    if (completed) {
+      await markPaymentProcessingDone(
+        lock.ref
       );
     } else {
-      const updates = {
-        [`payments/${requestId}/fulfillmentStatus`]:
-          "not_fulfilled",
-
-        [`payment_requests/${uid}/${requestId}/status`]:
-          "payment_failed",
-
-        [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
-          t,
-      };
-
-      if (
-        payment.type ===
-        "boost"
-      ) {
-        updates[
-          `boost_requests/${requestId}/status`
-        ] =
-          "payment_failed";
-
-        updates[
-          `boost_requests/${requestId}/updatedAtMs`
-        ] =
-          t;
-      }
-
-      await db
-        .ref()
-        .update(
-          updates
-        );
+      await bestEffort(
+        "payment-processing-retryable",
+        () =>
+          markPaymentProcessingRetryable(
+            lock.ref
+          )
+      );
     }
   }
 }
@@ -8330,82 +8277,81 @@ function extractWebhookPaymentId(
     : "";
 }
 
+async function handleMercadoPagoWebhook(
+  req,
+  res,
+  wantsJson
+) {
+  try {
+    validateMercadoPagoWebhookSignature(req);
+
+    const id = extractWebhookPaymentId(req);
+
+    if (id) {
+      await processMercadoPagoWebhookPayment(id);
+    }
+
+    if (wantsJson) {
+      return res.status(200).json({
+        ok: true,
+      });
+    }
+
+    return res.status(200).send("ok");
+  } catch (error) {
+    const statusCode =
+      error?.statusCode === 401
+        ? 401
+        : error?.statusCode === 503
+          ? 503
+          : 500;
+
+    console.error(
+      "Mercado Pago webhook:",
+      error?.message || "webhook_error"
+    );
+
+    if (wantsJson) {
+      return res.status(statusCode).json({
+        ok: false,
+        code:
+          statusCode === 401
+            ? "INVALID_WEBHOOK_SIGNATURE"
+            : statusCode === 503
+              ? "WEBHOOK_NOT_CONFIGURED"
+              : "WEBHOOK_ERROR",
+      });
+    }
+
+    return res
+      .status(statusCode)
+      .send(
+        statusCode === 401
+          ? "unauthorized"
+          : "webhook error"
+      );
+  }
+}
+
+// Mantido para compatibilidade. Em produção, também exige assinatura válida.
 app.get(
   "/api/mercadopago/webhook",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const id =
-        extractWebhookPaymentId(
-          req
-        );
-
-      if (id) {
-        await processMercadoPagoWebhookPayment(
-          id
-        );
-      }
-
-      return res
-        .status(200)
-        .send(
-          "ok"
-        );
-    } catch (error) {
-      console.error(
-        "Mercado Pago webhook GET:",
-        error.message
-      );
-
-      return res
-        .status(500)
-        .send(
-          "webhook error"
-        );
-    }
-  }
+  (req, res) =>
+    handleMercadoPagoWebhook(
+      req,
+      res,
+      false
+    )
 );
 
 app.post(
   "/api/mercadopago/webhook",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const id =
-        extractWebhookPaymentId(
-          req
-        );
-
-      if (id) {
-        await processMercadoPagoWebhookPayment(
-          id
-        );
-      }
-
-      return res
-        .status(200)
-        .json({
-          ok: true,
-        });
-    } catch (error) {
-      console.error(
-        "Mercado Pago webhook POST:",
-        error.message
-      );
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            "webhook error",
-        });
-    }
-  }
+  (req, res) =>
+    handleMercadoPagoWebhook(
+      req,
+      res,
+      true
+    )
 );
 
 async function expireBoosts() {
@@ -8856,7 +8802,7 @@ app.get(
     res.send(
       htmlPage(
         "FireRank API",
-        "Backend V4.1 online: autenticação, catálogo, endereços, mídia protegida e serviços digitais."
+        `Backend V${FIRERANK_SCHEMA_VERSION} online: autenticação, catálogo, endereços, mídia protegida e serviços digitais.`
       )
     );
   }
@@ -8864,64 +8810,83 @@ app.get(
 
 app.get(
   "/health",
-  async (
-    _,
-    res
-  ) => {
-    let databaseOk =
-      false;
+  async (_, res) => {
+    let databaseOk = false;
+    let databaseError = "";
 
     try {
       await db
-        .ref(
-          "public_config/app/schemaVersion"
-        )
+        .ref("public_config/app/schemaVersion")
         .get();
+      databaseOk = true;
+    } catch (error) {
+      databaseError =
+        error?.code ||
+        "database_unavailable";
+    }
 
-      databaseOk =
-        true;
-    } catch (_) {}
+    const publicBaseUrlConfigured =
+      NODE_ENV !== "production" ||
+      isHttpsUrl(APP_BASE_URL);
 
-    res.json({
-      ok:
+    const mediaSecretConfigured =
+      NODE_ENV !== "production" ||
+      !!MEDIA_TOKEN_SECRET;
+
+    const mercadoPagoWebhookReady =
+      !MP_ACCESS_TOKEN ||
+      !!MP_WEBHOOK_SECRET;
+
+    const ready =
+      databaseOk &&
+      !!resolvedStorageBucket &&
+      !!sharp &&
+      mediaSecretConfigured &&
+      mercadoPagoWebhookReady;
+
+    return res
+      .status(ready ? 200 : 503)
+      .json({
+        ok: ready,
+        schemaVersion:
+          FIRERANK_SCHEMA_VERSION,
+        nodeEnv: NODE_ENV,
         databaseOk,
-
-      schemaVersion:
-        "4.1.0",
-
-      nodeEnv:
-        NODE_ENV,
-
-      firebaseConfigured:
-        !!FIREBASE_DATABASE_URL,
-
-      storageConfigured:
-        !!resolvedStorageBucket,
-
-      mediaProcessorConfigured:
-        !!sharp,
-
-      mercadoPagoConfigured:
-        !!MP_ACCESS_TOKEN,
-
-      emailConfigured:
-        !!SMTP_HOST &&
-        !!SMTP_USER &&
-        !!SMTP_PASS &&
-        !!MAIL_FROM_EMAIL,
-
-      appCheckRequired:
-        REQUIRE_APP_CHECK,
-
-      googlePlayBillingEnforced:
-        ENFORCE_GOOGLE_PLAY_BILLING,
-
-      maintenanceSecretConfigured:
-        !!INTERNAL_MAINTENANCE_SECRET,
-
-      boostCatalogEnvConfigured:
-        !!BOOST_CATALOG_JSON,
-    });
+        databaseError:
+          databaseOk
+            ? undefined
+            : databaseError,
+        firebaseConfigured:
+          !!FIREBASE_DATABASE_URL,
+        storageConfigured:
+          !!resolvedStorageBucket,
+        mediaProcessorConfigured:
+          !!sharp,
+        mediaTokenSecretConfigured:
+          !!MEDIA_TOKEN_SECRET,
+        publicBaseUrlConfigured,
+        publicBaseUrl: APP_BASE_URL,
+        railwayDomainDetected:
+          !!RAILWAY_PUBLIC_DOMAIN,
+        mercadoPagoConfigured:
+          !!MP_ACCESS_TOKEN,
+        mercadoPagoWebhookSecretConfigured:
+          !!MP_WEBHOOK_SECRET,
+        mercadoPagoWebhookReady,
+        emailConfigured:
+          !!SMTP_HOST &&
+          !!SMTP_USER &&
+          !!SMTP_PASS &&
+          !!MAIL_FROM_EMAIL,
+        appCheckRequired:
+          REQUIRE_APP_CHECK,
+        googlePlayBillingEnforced:
+          ENFORCE_GOOGLE_PLAY_BILLING,
+        maintenanceSecretConfigured:
+          !!INTERNAL_MAINTENANCE_SECRET,
+        boostCatalogEnvConfigured:
+          !!BOOST_CATALOG_JSON,
+      });
   }
 );
 
@@ -9054,96 +9019,88 @@ app.use(
   }
 );
 
-let server =
-  null;
+let server = null;
 
 async function start() {
+  validateCriticalRuntimeConfig();
+
   try {
     await ensurePublicApiConfig();
   } catch (error) {
     console.error(
       "Falha ao sincronizar public_config/api:",
-      error.message
+      error?.code ||
+        error?.message ||
+        "unknown_error"
     );
   }
 
-  server =
-    app.listen(
-      PORT,
-      () => {
-        console.log(
-          `FireRank V4.1 API online na porta ${PORT}`
-        );
-
-        console.log(
-          `Media processor: ${
-            sharp
-              ? "ready"
-              : "sharp_missing"
-          }`
-        );
-
-        console.log(
-          `App Check enforced: ${REQUIRE_APP_CHECK}`
-        );
-      }
-    );
+  server = app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+      console.log(
+        `FireRank API ${FIRERANK_SCHEMA_VERSION} online na porta ${PORT}`
+      );
+      console.log(
+        `Railway public domain: ${
+          RAILWAY_PUBLIC_DOMAIN ||
+          "not_detected"
+        }`
+      );
+      console.log(
+        `App Check enforced: ${REQUIRE_APP_CHECK}`
+      );
+    }
+  );
 }
 
-function shutdown(
-  signal
-) {
+function shutdown(signal) {
   console.log(
     `${signal}: encerrando FireRank API...`
   );
 
   if (!server) {
-    return process.exit(
-      0
-    );
+    return process.exit(0);
   }
 
-  server.close(
-    () =>
-      process.exit(
-        0
-      )
+  server.close(() =>
+    process.exit(0)
   );
 
   setTimeout(
-    () =>
-      process.exit(
-        1
-      ),
+    () => process.exit(1),
     10_000
   ).unref();
 }
 
 process.on(
   "SIGTERM",
-  () =>
-    shutdown(
-      "SIGTERM"
-    )
+  () => shutdown("SIGTERM")
+);
+process.on(
+  "SIGINT",
+  () => shutdown("SIGINT")
 );
 
 process.on(
-  "SIGINT",
-  () =>
-    shutdown(
-      "SIGINT"
-    )
-);
-
-start().catch(
-  (error) => {
+  "unhandledRejection",
+  (reason) => {
     console.error(
-      "Falha ao iniciar FireRank API:",
-      error
-    );
-
-    process.exit(
-      1
+      "Unhandled rejection:",
+      reason?.code ||
+        reason?.message ||
+        "unknown"
     );
   }
 );
+
+start().catch((error) => {
+  console.error(
+    "Falha ao iniciar FireRank API:",
+    error?.code ||
+      error?.message ||
+      "unknown_error"
+  );
+  process.exit(1);
+});
