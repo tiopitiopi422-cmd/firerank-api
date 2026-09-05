@@ -2,7 +2,7 @@
   "name": "firerank-api",
   "version": "4.2.0",
   "private": true,
-  "description": "Backend FireRank V4.2 para Railway/Firebase",
+  "description": "Backend FireRank V4.2 para Render/Firebase/Cloudinary",
   "main": "server.js",
   "type": "commonjs",
   "engines": {
@@ -22,6 +22,8 @@
     "firebase-admin": "14.3.0",
     "mercadopago": "3.6.0",
     "nodemailer": "9.0.6",
-    "sharp": "0.35.4"
+    "sharp": "0.35.4",
+    "cloudinary": "2.7.0",
+    "multer": "2.0.2"
   }
 }

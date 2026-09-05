@@ -73,14 +73,14 @@ Corrigido para uma constante única:
 FIRERANK_SCHEMA_VERSION=4.2.0
 ```
 
-### CRÍTICO — domínio antigo Railway
+### CRÍTICO — domínio antigo Render
 
-Havia fallback permanente para um domínio Railway específico antigo.
+Havia fallback permanente para um domínio Render específico antigo.
 
 Corrigido:
 
 1. `APP_BASE_URL` explícito, se informado;
-2. senão `RAILWAY_PUBLIC_DOMAIN`;
+2. senão `RENDER_PUBLIC_DOMAIN`;
 3. local host somente para ambiente local.
 
 Em produção, `public_config/api` não é sobrescrito com URL HTTP/local.
@@ -151,7 +151,7 @@ Agora:
 
 - dependência crítica indisponível => HTTP 503;
 - saudável => HTTP 200;
-- Railway usa `/health`.
+- Render usa `/health`.
 
 ### MÉDIO — proxy
 
@@ -161,7 +161,7 @@ Adicionado:
 app.set("trust proxy", 1)
 ```
 
-para que `req.ip` faça sentido atrás do proxy do Railway.
+para que `req.ip` faça sentido atrás do proxy do Render.
 
 ## Problemas que permanecem fora deste pacote
 
@@ -224,7 +224,7 @@ Bom para:
 
 Não é suficiente para:
 
-- múltiplas réplicas Railway;
+- múltiplas réplicas Render;
 - rate limit global.
 
 Próxima fase: Redis/Valkey ou limiter central.
@@ -286,11 +286,11 @@ O pacote melhora fortemente segurança e confiabilidade, porém não deve ser ro
 
 SIM, após gerar `package-lock.json` com `npm install` e revisar `git status`.
 
-### Pronto para criar serviço Railway
+### Pronto para criar serviço Render
 
 SIM.
 
-### Pronto para apontar o APK ao novo Railway
+### Pronto para apontar o APK ao novo Render
 
 SOMENTE quando `/health` retornar `ok:true` e os fluxos usados pelo APK forem testados.
 

@@ -1,4 +1,4 @@
-# FireRank API V4.2 — Railway Ultra Final 01
+# FireRank API V4.2 — Render Ultra Final 01
 
 Pacote de deploy do backend atualmente integrado ao FireRank.
 
@@ -26,10 +26,10 @@ O `server.js` mantém o escopo já existente e funcional do backend:
 ## Correções críticas aplicadas nesta versão
 
 1. Schema do backend atualizado para `4.2.0`.
-2. Removido fallback fixo para um Railway antigo.
-3. `APP_BASE_URL` passa a usar `RAILWAY_PUBLIC_DOMAIN` quando disponível.
+2. Removido fallback fixo para um Render antigo.
+3. `APP_BASE_URL` passa a usar `RENDER_PUBLIC_DOMAIN` quando disponível.
 4. `sharp` é dependência obrigatória.
-5. `trust proxy` ativado para Railway.
+5. `trust proxy` ativado para Render.
 6. CORS em produção passa a falhar fechado para origens de navegador não autorizadas.
 7. `MEDIA_TOKEN_SECRET` é obrigatório em produção e não depende mais da rotação da service account.
 8. Webhook do Mercado Pago valida `x-signature` com `MERCADO_PAGO_WEBHOOK_SECRET`.
@@ -37,7 +37,7 @@ O `server.js` mantém o escopo já existente e funcional do backend:
 10. Entitlement/boost não é concedido duas vezes no retry do mesmo pagamento.
 11. Notificações pós-fulfillment são best-effort e não provocam concessão duplicada.
 12. `/health` retorna HTTP 503 quando uma dependência crítica falha.
-13. `railway.json` já aponta o healthcheck para `/health`.
+13. `render.json` já aponta o healthcheck para `/health`.
 14. Headers incluem `X-FireRank-Schema: 4.2.0`.
 
 ## Requisitos
@@ -45,7 +45,7 @@ O `server.js` mantém o escopo já existente e funcional do backend:
 - Node.js 22.x
 - npm
 - Projeto Firebase configurado
-- Railway
+- Render
 - Mercado Pago somente se o módulo de pagamentos estiver habilitado
 
 ## Estrutura
@@ -55,7 +55,7 @@ server.js
 package.json
 .gitignore
 .env.example
-railway.json
+render.json
 README_DEPLOY.md
 AUDITORIA_BACKEND.md
 VALIDATION_REPORT.txt
@@ -115,14 +115,14 @@ node_modules
 Quando `git status` estiver correto:
 
 ```powershell
-git add server.js package.json package-lock.json railway.json .gitignore .env.example README_DEPLOY.md AUDITORIA_BACKEND.md VALIDATION_REPORT.txt scripts
-git commit -m "FireRank API V4.2 Railway production baseline"
+git add server.js package.json package-lock.json render.json .gitignore .env.example README_DEPLOY.md AUDITORIA_BACKEND.md VALIDATION_REPORT.txt scripts
+git commit -m "FireRank API V4.2 Render production baseline"
 git push
 ```
 
-## 4. Criar o Railway
+## 4. Criar o Render
 
-No Railway:
+No Render:
 
 1. `New Project`
 2. `Deploy from GitHub Repo`
@@ -133,7 +133,7 @@ No Railway:
 7. configure as variáveis abaixo
 8. faça um redeploy
 
-O backend detecta automaticamente `RAILWAY_PUBLIC_DOMAIN`. Se quiser usar domínio próprio, defina `APP_BASE_URL=https://seu-dominio`.
+O backend detecta automaticamente `RENDER_PUBLIC_DOMAIN`. Se quiser usar domínio próprio, defina `APP_BASE_URL=https://seu-dominio`.
 
 ## 5. Variáveis essenciais
 
@@ -177,7 +177,7 @@ Webhook:
 https://SEU-DOMINIO/api/mercadopago/webhook
 ```
 
-No Mercado Pago, configure a chave secreta do Webhook e coloque-a **somente** em `MERCADO_PAGO_WEBHOOK_SECRET` no Railway.
+No Mercado Pago, configure a chave secreta do Webhook e coloque-a **somente** em `MERCADO_PAGO_WEBHOOK_SECRET` no Render.
 
 ### CORS
 
@@ -232,7 +232,7 @@ Copie o resultado diretamente para a variável:
 FIREBASE_SERVICE_ACCOUNT_JSON_BASE64
 ```
 
-no Railway.
+no Render.
 
 ## 7. Gerar secrets
 
@@ -251,13 +251,13 @@ Não versione os valores.
 
 ## 8. Healthcheck
 
-Railway já está configurado para:
+Render já está configurado para:
 
 ```text
 /health
 ```
 
-O Railway espera HTTP 200 para considerar o deploy saudável.
+O Render espera HTTP 200 para considerar o deploy saudável.
 
 Depois de gerar o domínio, acesse:
 
@@ -288,7 +288,7 @@ Na inicialização, quando `APP_BASE_URL` é HTTPS, o backend atualiza:
 public_config/api
 ```
 
-com o novo domínio Railway e os endpoints atualmente suportados.
+com o novo domínio Render e os endpoints atualmente suportados.
 
 Isso substitui URLs antigas do backend **somente depois que o novo domínio estiver configurado**.
 

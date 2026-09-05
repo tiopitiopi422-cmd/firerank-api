@@ -13,9 +13,9 @@ Static validation executed in assistant container:
 CHECKS:
 - PASS node_check
 - PASS package_json
-- PASS railway_json
+- PASS render_json
 - PASS schema_4_2
-- PASS railway_public_domain
+- PASS render_public_domain
 - PASS trust_proxy
 - PASS mp_webhook_secret
 - PASS webhook_signature_validator
@@ -23,7 +23,7 @@ CHECKS:
 - PASS media_secret_prod_required
 - PASS health_503
 - PASS sharp_required
-- PASS no_old_railway_fallback
+- PASS no_old_render_fallback
 - PASS dependency_coverage
 
 REQUIRES DETECTED:
@@ -80,6 +80,6 @@ IMPORTANT:
 - npm install/package-lock generation could NOT be completed in this assistant environment because npm registry access timed out.
 - Therefore runtime loading of all third-party packages was not executed here.
 - package.json pins exact top-level versions.
-- Run npm install on Windows or let Railway install dependencies, and commit the generated package-lock.json.
-- No Firebase, Mercado Pago, SMTP or Railway live integration test was claimed.
+- Run npm install on Windows or let Render install dependencies, and commit the generated package-lock.json.
+- No Firebase, Mercado Pago, SMTP or Render live integration test was claimed.
 - Final production validation still requires real environment variables and /health returning HTTP 200.

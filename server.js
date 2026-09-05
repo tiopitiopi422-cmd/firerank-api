@@ -7,10 +7,11 @@ const axios = require("axios");
 const { initializeApp, getApps, cert } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getDatabase } = require("firebase-admin/database");
-const { getStorage } = require("firebase-admin/storage");
 const { getAppCheck } = require("firebase-admin/app-check");
 const nodemailer = require("nodemailer");
 const sharp = require("sharp");
+const multer = require("multer");
+const { v2: cloudinary } = require("cloudinary");
 const {
   WebhookSignatureValidator,
   InvalidWebhookSignatureError,
@@ -26,14 +27,12 @@ const NODE_ENV = String(process.env.NODE_ENV || "development")
   .toLowerCase();
 
 const FIRERANK_SCHEMA_VERSION = "4.2.0";
-const RAILWAY_PUBLIC_DOMAIN = String(
-  process.env.RAILWAY_PUBLIC_DOMAIN || ""
-).trim();
+const OFFICIAL_RENDER_BASE_URL = "https://firerank-api-oxy1.onrender.com";
 
 const APP_BASE_URL = String(
   process.env.APP_BASE_URL ||
-    (RAILWAY_PUBLIC_DOMAIN
-      ? `https://${RAILWAY_PUBLIC_DOMAIN}`
+    (NODE_ENV === "production"
+      ? OFFICIAL_RENDER_BASE_URL
       : `http://localhost:${PORT}`)
 ).replace(/\/+$/, "");
 
@@ -45,9 +44,6 @@ const FIREBASE_SERVICE_ACCOUNT_JSON = String(
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON || ""
 );
 const FIREBASE_WEB_API_KEY = String(process.env.FIREBASE_WEB_API_KEY || "");
-const FIREBASE_STORAGE_BUCKET = String(
-  process.env.FIREBASE_STORAGE_BUCKET || ""
-);
 
 const MP_PUBLIC_KEY = String(process.env.MERCADO_PAGO_PUBLIC_KEY || "");
 const MP_ACCESS_TOKEN = String(process.env.MERCADO_PAGO_ACCESS_TOKEN || "");
@@ -92,6 +88,14 @@ const INTERNAL_MAINTENANCE_SECRET = String(
 );
 const MEDIA_TOKEN_SECRET = String(process.env.MEDIA_TOKEN_SECRET || "");
 const BOOST_CATALOG_JSON = String(process.env.BOOST_CATALOG_JSON || "");
+
+const CLOUDINARY_CLOUD_NAME = String(process.env.CLOUDINARY_CLOUD_NAME || "dkrwufqxc").trim();
+const CLOUDINARY_API_KEY = String(process.env.CLOUDINARY_API_KEY || "").trim();
+const CLOUDINARY_API_SECRET = String(process.env.CLOUDINARY_API_SECRET || "").trim();
+const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || "").trim();
+const GEMINI_MODEL = String(process.env.GEMINI_MODEL || "").trim();
+const CLOUDINARY_CONFIGURED = !!(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET);
+cloudinary.config({ cloud_name: CLOUDINARY_CLOUD_NAME, api_key: CLOUDINARY_API_KEY, api_secret: CLOUDINARY_API_SECRET, secure: true });
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
@@ -184,7 +188,7 @@ function validateCriticalRuntimeConfig() {
     !isHttpsUrl(APP_BASE_URL)
   ) {
     console.warn(
-      "APP_BASE_URL ainda não é HTTPS. Gere o domínio público do Railway ou defina APP_BASE_URL antes de conectar o app."
+      "APP_BASE_URL ainda não é HTTPS. Defina APP_BASE_URL para o domínio público do Render antes de conectar o app."
     );
   }
 
@@ -247,22 +251,17 @@ if (!FIREBASE_DATABASE_URL) {
 }
 
 const serviceAccount = parseServiceAccount();
-const resolvedStorageBucket =
-  FIREBASE_STORAGE_BUCKET || `${serviceAccount.project_id}.firebasestorage.app`;
-
 const firebaseApp =
   getApps().length > 0
     ? getApps()[0]
     : initializeApp({
         credential: cert(serviceAccount),
         databaseURL: FIREBASE_DATABASE_URL,
-        storageBucket: resolvedStorageBucket,
       });
 
 const db = getDatabase(firebaseApp);
 const firebaseAuth = getAuth(firebaseApp);
 const firebaseAppCheck = getAppCheck(firebaseApp);
-const storageBucket = getStorage(firebaseApp).bucket(resolvedStorageBucket);
 
 const configuredAllowedOrigins = String(
   process.env.CORS_ALLOWED_ORIGINS || ""
@@ -467,9 +466,7 @@ async function verifyAppCheckIfRequired(
     throw error;
   }
 
-  await admin
-    .appCheck()
-    .verifyToken(token);
+  await firebaseAppCheck.verifyToken(token);
 }
 
 async function requireUser(
@@ -498,12 +495,7 @@ async function requireUser(
     );
 
     const decoded =
-      await admin
-        .auth()
-        .verifyIdToken(
-          token,
-          true
-        );
+      await firebaseAuth.verifyIdToken(token, true);
 
     const provider =
       safe(
@@ -718,11 +710,20 @@ async function ensurePublicApiConfig() {
     updateProductEndpoint: `${APP_BASE_URL}/v1/products/update`,
     mediaUploadEndpoint: `${APP_BASE_URL}/v1/media/product`,
     productMediaUploadEndpoint: `${APP_BASE_URL}/v1/media/product`,
+    mediaSignEndpoint: `${APP_BASE_URL}/v1/media/sign`,
     addressSaveEndpoint: `${APP_BASE_URL}/v1/account/address`,
     saveAddressEndpoint: `${APP_BASE_URL}/v1/account/address`,
     userAddressEndpoint: `${APP_BASE_URL}/v1/account/address`,
     billingMercadoPagoEndpoint:
       `${APP_BASE_URL}/v1/billing/mercadopago/create-preference`,
+    sellerApplicationEndpoint: `${APP_BASE_URL}/v1/applications/seller`,
+    deliveryApplicationEndpoint: `${APP_BASE_URL}/v1/applications/delivery`,
+    accountPrivacyEndpoint: `${APP_BASE_URL}/v1/account/privacy`,
+    supportChatEndpoint: `${APP_BASE_URL}/v1/support/chat`,
+    aiAssistantEndpoint: `${APP_BASE_URL}/v1/ai/v2/chat`,
+    analyticsBannerEndpoint: `${APP_BASE_URL}/v1/analytics/banner`,
+    mediaProvider: "cloudinary",
+    firebaseStorageUsed: false,
     updatedAtMs: t,
   });
 
@@ -1555,81 +1556,41 @@ async function processProductImage(
   };
 }
 
-async function uploadPrivateObject(
-  path,
-  bytes
-) {
-  const file =
-    storageBucket.file(
-      path
-    );
-
-  await file.save(
-    bytes,
-    {
-      resumable:
-        false,
-      metadata: {
-        contentType:
-          "image/webp",
-        cacheControl:
-          "private, max-age=0, no-store",
-      },
-    }
-  );
+function cloudinaryUploadBuffer(bytes, options = {}) {
+  if (!CLOUDINARY_CONFIGURED) {
+    const error = new Error("CLOUDINARY_NOT_CONFIGURED");
+    error.statusCode = 503;
+    error.publicMessage = "O serviço de mídia ainda não está configurado.";
+    throw error;
+  }
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream({
+      resource_type: "image",
+      type: options.type || "authenticated",
+      folder: options.folder || "firerank/private",
+      public_id: options.publicId,
+      overwrite: false,
+      format: "webp",
+    }, (error, result) => error ? reject(error) : resolve(result));
+    stream.end(bytes);
+  });
 }
 
-async function createMediaUploadSession(
-  uid,
-  fileBytes
-) {
-  const mediaId =
-    crypto
-      .randomBytes(18)
-      .toString("hex");
-
-  const processed =
-    await processProductImage(
-      fileBytes
-    );
-
-  const detailPath =
-    `product_media/${uid}/${mediaId}/detail.webp`;
-
-  const thumbPath =
-    `product_media/${uid}/${mediaId}/thumb.webp`;
-
-  await Promise.all([
-    uploadPrivateObject(
-      detailPath,
-      processed.detail
-    ),
-    uploadPrivateObject(
-      thumbPath,
-      processed.thumb
-    ),
+async function createMediaUploadSession(uid, fileBytes) {
+  const mediaId = crypto.randomBytes(18).toString("hex");
+  const processed = await processProductImage(fileBytes);
+  const folder = `firerank/products/${uid}/${mediaId}`;
+  const [detail, thumb] = await Promise.all([
+    cloudinaryUploadBuffer(processed.detail, {folder, publicId: "detail", type: "authenticated"}),
+    cloudinaryUploadBuffer(processed.thumb, {folder, publicId: "thumb", type: "authenticated"}),
   ]);
-
-  const token =
-    makeSignedToken(
-      {
-        v: 1,
-        type: "upload",
-        uid,
-        mediaId,
-        detailPath,
-        thumbPath,
-        exp:
-          nowMs() +
-          MEDIA_UPLOAD_TOKEN_TTL_MS,
-      },
-      resolvedMediaTokenSecret()
-    );
-
-  return {
-    mediaId:
-      token,
-  };
+  const token = makeSignedToken({
+    v: 2, type: "upload", uid, mediaId,
+    detailPath: detail.public_id, thumbPath: thumb.public_id,
+    detailVersion: detail.version, thumbVersion: thumb.version,
+    provider: "cloudinary", exp: nowMs() + MEDIA_UPLOAD_TOKEN_TTL_MS,
+  }, resolvedMediaTokenSecret());
+  return { mediaId: token };
 }
 
 function verifyMediaUploadToken(
@@ -2013,42 +1974,16 @@ async function streamStoredMedia(
       );
     }
 
-    const file =
-      storageBucket.file(
-        payload.path
-      );
-
-    const [exists] =
-      await file.exists();
-
-    if (!exists) {
-      return res
-        .status(404)
-        .end();
-    }
-
-    res.setHeader(
-      "Content-Type",
-      "image/webp"
-    );
-
-    return file
-      .createReadStream()
-      .on(
-        "error",
-        () => {
-          if (
-            !res.headersSent
-          ) {
-            res
-              .status(500)
-              .end();
-          } else {
-            res.end();
-          }
-        }
-      )
-      .pipe(res);
+    if (!CLOUDINARY_CONFIGURED) return res.status(503).end();
+    const transform = safe(payload.kind) === "thumb"
+      ? [{width:480,height:480,crop:"fill",gravity:"auto",quality:"auto",fetch_format:"auto"}]
+      : [{width:1080,height:1080,crop:"fill",gravity:"auto",quality:"auto",fetch_format:"auto"}];
+    const signedUrl = cloudinary.url(payload.path, {
+      resource_type: "image", type: "authenticated", sign_url: true,
+      secure: true, expires_at: Math.floor(Date.now() / 1000) + 120,
+      transformation: transform,
+    });
+    return res.redirect(302, signedUrl);
   } catch (_) {
     return res
       .status(404)
@@ -3759,6 +3694,122 @@ app.get(
       res,
       "private"
     );
+  }
+);
+
+app.post(
+  "/v1/media/sign",
+  requireUser,
+  rateLimit("media-sign", 30, 10 * 60 * 1000),
+  async (req, res) => {
+    try {
+      if (!CLOUDINARY_CONFIGURED || !CLOUDINARY_API_SECRET) {
+        return res.status(503).json({
+          ok: false,
+          code: "CLOUDINARY_NOT_CONFIGURED",
+          message: "O serviço de mídia ainda não está configurado.",
+        });
+      }
+
+      const uid = req.auth.uid;
+      const purpose = safe(req.body?.purpose).toLowerCase();
+      const allowed = new Set([
+        "product_image",
+        "seller_identity",
+        "delivery_identity",
+        "profile_image",
+      ]);
+
+      if (!allowed.has(purpose)) {
+        return res.status(422).json({
+          ok: false,
+          code: "INVALID_MEDIA_PURPOSE",
+          message: "Finalidade de mídia inválida.",
+        });
+      }
+
+      if (purpose === "product_image") {
+        await assertSellerCanPublish(uid);
+      }
+
+      const timestamp = Math.floor(Date.now() / 1000);
+      const nonce = crypto.randomBytes(10).toString("hex");
+      const privateIdentity = purpose === "seller_identity" || purpose === "delivery_identity";
+      const folder = privateIdentity
+        ? `firerank/private/identity/${uid}/${purpose}`
+        : purpose === "profile_image"
+          ? `firerank/profiles/${uid}`
+          : `firerank/products/${uid}`;
+      const publicId = `${purpose}_${timestamp}_${nonce}`;
+      const type = purpose === "profile_image" ? "upload" : "authenticated";
+      const paramsToSign = {
+        timestamp,
+        folder,
+        public_id: publicId,
+        type,
+      };
+      const signature = cloudinary.utils.api_sign_request(
+        paramsToSign,
+        CLOUDINARY_API_SECRET
+      );
+
+      return res.json({
+        ok: true,
+        provider: "cloudinary",
+        cloudName: CLOUDINARY_CLOUD_NAME,
+        apiKey: CLOUDINARY_API_KEY,
+        timestamp,
+        signature,
+        folder,
+        publicId,
+        type,
+        resourceType: "image",
+        uploadUrl: `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`,
+        expiresInSeconds: 300,
+      });
+    } catch (error) {
+      return publicError(res, error, "Não foi possível autorizar o upload.");
+    }
+  }
+);
+
+app.post(
+  "/v1/media/complete",
+  requireUser,
+  rateLimit("media-complete", 40, 10 * 60 * 1000),
+  async (req, res) => {
+    try {
+      if (!CLOUDINARY_CONFIGURED || !CLOUDINARY_API_SECRET) {
+        return res.status(503).json({ok:false,code:"CLOUDINARY_NOT_CONFIGURED",message:"O serviço de mídia ainda não está configurado."});
+      }
+      const uid=req.auth.uid;
+      const purpose=safe(req.body?.purpose).toLowerCase();
+      const publicId=safe(req.body?.publicId);
+      const requestedType=safe(req.body?.type).toLowerCase();
+      const allowed=new Set(["product_image","seller_identity","delivery_identity","profile_image"]);
+      if(!allowed.has(purpose)||!publicId)return res.status(422).json({ok:false,code:"INVALID_MEDIA_COMPLETE"});
+      if(purpose==="product_image")await assertSellerCanPublish(uid);
+      const expectedPrefix=purpose==="seller_identity"||purpose==="delivery_identity"
+        ?`firerank/private/identity/${uid}/${purpose}/`
+        :purpose==="profile_image"?`firerank/profiles/${uid}/`:`firerank/products/${uid}/`;
+      if(!publicId.startsWith(expectedPrefix))return res.status(403).json({ok:false,code:"MEDIA_OWNER_MISMATCH"});
+      const expectedType=purpose==="profile_image"?"upload":"authenticated";
+      if(requestedType&&requestedType!==expectedType)return res.status(422).json({ok:false,code:"MEDIA_TYPE_MISMATCH"});
+      const resource=await cloudinary.api.resource(publicId,{resource_type:"image",type:expectedType});
+      const bytes=integer(resource?.bytes,0);
+      if(!resource?.public_id||bytes<=0||bytes>15*1024*1024)return res.status(422).json({ok:false,code:"MEDIA_RESOURCE_INVALID"});
+      const t=nowMs();
+      const mediaAssetRef=db.ref(`media_assets/${uid}`).push();
+      const assetId=mediaAssetRef.key;
+      const asset={assetId,ownerUid:uid,purpose,provider:"cloudinary",publicId:resource.public_id,resourceType:"image",type:expectedType,version:resource.version||0,bytes,format:safe(resource.format),width:integer(resource.width,0),height:integer(resource.height,0),createdAtMs:t,status:"ready"};
+      await mediaAssetRef.set(asset);
+      if(purpose==="product_image"){
+        const mediaId=makeSignedToken({v:3,type:"upload",uid,mediaId:assetId,detailPath:resource.public_id,thumbPath:resource.public_id,detailVersion:resource.version,thumbVersion:resource.version,provider:"cloudinary",exp:t+MEDIA_UPLOAD_TOKEN_TTL_MS},resolvedMediaTokenSecret());
+        return res.status(201).json({ok:true,mediaId,assetId});
+      }
+      const secureUrl=purpose==="profile_image"?safe(resource.secure_url):"";
+      return res.status(201).json({ok:true,mediaId:assetId,assetId,publicId:resource.public_id,type:expectedType,secureUrl});
+    }catch(error){return publicError(res,error,"Não foi possível confirmar a mídia.");}
   }
 );
 
@@ -8361,6 +8412,766 @@ app.post(
     )
 );
 
+
+const professionalUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 12 * 1024 * 1024, files: 3, fields: 30 },
+}).fields([
+  { name: "documentFront", maxCount: 1 },
+  { name: "documentBack", maxCount: 1 },
+  { name: "selfie", maxCount: 1 },
+]);
+
+function requireAdmin(req, res, next) {
+  if (req.auth?.admin === true) return next();
+  return res.status(403).json({ok:false, code:"ADMIN_REQUIRED", message:"Acesso administrativo necessário."});
+}
+
+function ageFromBirthDate(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(safe(value));
+  if (!m) return -1;
+  const b = new Date(Number(m[1]), Number(m[2])-1, Number(m[3]));
+  if (Number.isNaN(b.getTime())) return -1;
+  const n = new Date(); let age=n.getFullYear()-b.getFullYear();
+  const before=n.getMonth()<b.getMonth() || (n.getMonth()===b.getMonth() && n.getDate()<b.getDate());
+  return age-(before?1:0);
+}
+
+async function uploadIdentityFile(uid, role, applicationId, label, file) {
+  if (!file?.buffer?.length) throw Object.assign(new Error("DOCUMENT_REQUIRED"), {statusCode:422, publicMessage:"Envie todos os documentos obrigatórios."});
+  const folder=`firerank/private/identity/${uid}/${role}/${applicationId}`;
+  const result=await cloudinaryUploadBuffer(file.buffer,{folder, publicId:label, type:"authenticated"});
+  return {provider:"cloudinary", publicId:result.public_id, version:result.version, resourceType:"image", type:"authenticated", bytes:result.bytes||file.size||0, format:result.format||""};
+}
+
+async function loadIdentityMediaAsset(uid, role, assetId, label) {
+  const cleanId = safe(assetId);
+  if (!cleanId) {
+    const error = new Error("DOCUMENT_REQUIRED");
+    error.statusCode = 422;
+    error.publicMessage = "Envie todos os documentos obrigatórios.";
+    throw error;
+  }
+  const purpose = role === "seller" ? "seller_identity" : "delivery_identity";
+  const snap = await db.ref(`media_assets/${uid}/${cleanId}`).get();
+  const asset = map(snap.val());
+  if (!snap.exists() || safe(asset.ownerUid) !== uid || safe(asset.purpose) !== purpose || safe(asset.status) !== "ready" || safe(asset.type) !== "authenticated") {
+    const error = new Error("IDENTITY_MEDIA_INVALID");
+    error.statusCode = 403;
+    error.publicMessage = "Um dos documentos enviados não pôde ser validado.";
+    throw error;
+  }
+  return {
+    provider:"cloudinary", assetId:cleanId, publicId:safe(asset.publicId),
+    version:asset.version||0, resourceType:"image", type:"authenticated",
+    bytes:integer(asset.bytes,0), format:safe(asset.format), label,
+  };
+}
+
+async function handleProfessionalApplication(role, req, res) {
+  try {
+    const uid=req.auth.uid; const body=req.body||{}; const t=nowMs();
+    const age=ageFromBirthDate(body.birthDate);
+    if (age < 18) return res.status(422).json({ok:false,code:"AGE_NOT_ELIGIBLE",message:"É necessário ter 18 anos ou mais."});
+    if (!safe(body.fullName) || !safe(body.cpf) || !safe(body.phone) || !safe(body.city) || !safe(body.state)) return res.status(422).json({ok:false,code:"REQUIRED_FIELDS",message:"Preencha todos os dados obrigatórios."});
+    if (!bool(body.termsAccepted) || !bool(body.dataProcessingAccepted)) return res.status(422).json({ok:false,code:"CONSENT_REQUIRED",message:"Aceite os termos e o tratamento de dados."});
+    const appRef=db.ref(`application_history/${uid}/${role}`).push(); const applicationId=appRef.key;
+    const files=req.files||{};
+    const directMedia = safe(body.documentFrontMediaId) && safe(body.documentBackMediaId) && safe(body.selfieMediaId);
+    const [front,back,selfie]=directMedia
+      ? await Promise.all([
+          loadIdentityMediaAsset(uid,role,body.documentFrontMediaId,"document_front"),
+          loadIdentityMediaAsset(uid,role,body.documentBackMediaId,"document_back"),
+          loadIdentityMediaAsset(uid,role,body.selfieMediaId,"selfie"),
+        ])
+      : await Promise.all([
+          uploadIdentityFile(uid,role,applicationId,"document_front",files.documentFront?.[0]),
+          uploadIdentityFile(uid,role,applicationId,"document_back",files.documentBack?.[0]),
+          uploadIdentityFile(uid,role,applicationId,"selfie",files.selfie?.[0]),
+        ]);
+    const common={applicationId,uid,role,status:"pending",fullName:clip(body.fullName,120),birthDate:safe(body.birthDate),phone:clip(body.phone,32),city:clip(body.city,100),state:clip(body.state,8),createdAtMs:t,updatedAtMs:t,source:clip(body.source,40)};
+    const roleData=role==="seller"?{storeName:clip(body.storeName,120),sellerBio:clip(body.sellerBio,500)}:{vehicleType:clip(body.vehicleType,60),vehiclePlate:clip(body.vehiclePlate,16)};
+    const privateData={cpf:clip(body.cpf,20),documents:{documentFront:front,documentBack:back,selfie}};
+    const updates={
+      [`current_applications/${role}/${uid}`]:{...common,...roleData},
+      [`application_history/${uid}/${role}/${applicationId}`]:{...common,...roleData,immutable:true},
+      [`identity_private/${uid}/applications/${role}/${applicationId}`]:privateData,
+      [`role_state/${uid}/${role}`]:{active:false,accessEnabled:false,applicationOpen:true,uiState:"pending",updatedAtMs:t},
+    };
+    if (role==="seller") updates[`admin_seller_requests/${uid}`]={...common,...roleData};
+    else { updates[`admin_delivery_requests/${uid}`]={...common,...roleData}; updates[`delivery_private_profiles/${uid}`]={...roleData,phone:common.phone,city:common.city,state:common.state,status:"pending",updatedAtMs:t}; }
+    await db.ref().update(updates); await appendAudit(`${role}_application_submitted`,{actorUid:uid,targetUid:uid,referenceId:applicationId,status:"pending"});
+    return res.status(201).json({ok:true,applicationId,status:"pending"});
+  } catch(e){ return publicError(res,e,"Não foi possível enviar o cadastro."); }
+}
+
+app.post("/v1/applications/seller", requireUser, rateLimit("seller-application",3,60*60*1000), professionalUpload, (req,res)=>handleProfessionalApplication("seller",req,res));
+app.post("/v1/applications/delivery", requireUser, rateLimit("delivery-application",3,60*60*1000), professionalUpload, (req,res)=>handleProfessionalApplication("delivery",req,res));
+
+async function ensureDeliveryPublicCode(uid) {
+  const existingSnap = await db.ref(`delivery_public_profiles/${uid}/publicCode`).get();
+  const existing = safe(existingSnap.val()).toUpperCase();
+  if (existing) return existing;
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    const suffix = crypto.randomBytes(5).toString("hex").slice(0, 8).toUpperCase();
+    const code = `FRD-${suffix}`;
+    const codeRef = db.ref(`delivery_public_codes/${firebaseSafeKey(code)}`);
+    const tx = await codeRef.transaction((value) => value ? undefined : uid, {applyLocally:false});
+    if (tx.committed && tx.snapshot.val() === uid) return code;
+  }
+  const error = new Error("DELIVERY_CODE_GENERATION_FAILED");
+  error.statusCode = 503;
+  error.publicMessage = "Não foi possível gerar o código público do entregador.";
+  throw error;
+}
+
+app.post("/v1/admin/applications/:role/:uid/decision", requireUser, requireAdmin, async(req,res)=>{
+  try{
+    const role=safe(req.params.role).toLowerCase();
+    const uid=safe(req.params.uid);
+    const rawDecision=safe(req.body?.decision).toLowerCase();
+    const decisionMap={approve:"approved",approved:"approved",reject:"rejected",rejected:"rejected",suspend:"suspended",suspended:"suspended",reactivate:"reactivated",reactivated:"reactivated",reopen:"reopened",reopened:"reopened",under_review:"reopened",pending:"reopened"};
+    const decision=decisionMap[rawDecision]||"";
+    const t=nowMs();
+    if(!["seller","delivery"].includes(role)||!decision) return res.status(422).json({ok:false,code:"INVALID_DECISION",message:"Decisão administrativa inválida."});
+
+    const currentSnap=await db.ref(`current_applications/${role}/${uid}`).get();
+    const cur=map(currentSnap.val());
+    const activating=decision==="approved"||decision==="reactivated";
+    const suspended=decision==="suspended";
+    const rejected=decision==="rejected";
+    const reopened=decision==="reopened";
+    const status=activating?"approved":reopened?"pending":decision;
+    const uiState=activating?"active":reopened?"pending":decision;
+    const deliveryPublicCode = role === "delivery" && activating ? await ensureDeliveryPublicCode(uid) : "";
+    const updates={
+      [`role_state/${uid}/${role}/active`]:activating,
+      [`role_state/${uid}/${role}/accessEnabled`]:activating,
+      [`role_state/${uid}/${role}/applicationOpen`]:reopened,
+      [`role_state/${uid}/${role}/status`]:status,
+      [`role_state/${uid}/${role}/uiState`]:uiState,
+      [`role_state/${uid}/${role}/canReapply`]:rejected,
+      [`role_state/${uid}/${role}/updatedAtMs`]:t,
+      [`eligibility/${uid}/${role==="seller"?"canSell":"canDeliver"}`]:activating,
+      [`eligibility/${uid}/updatedAtMs`]:t,
+    };
+
+    if(activating){
+      updates[`user_roles/${uid}/${role}`]=true;
+      updates[`eligibility/${uid}/needsAgeReview`]=false;
+      if(safe(cur.applicationId)){
+        updates[`identity_status/${uid}/identityReviewStatus`]="approved";
+        updates[`identity_status/${uid}/source`]=`${role}_application`;
+        updates[`identity_status/${uid}/reviewedAtMs`]=t;
+        updates[`identity_status/${uid}/reviewedBy`]=req.auth.uid;
+        updates[`eligibility/${uid}/canSubscribeVerified`]=true;
+      }
+    } else if(rejected||reopened||suspended){
+      updates[`user_roles/${uid}/${role}`]=false;
+    }
+
+    if(currentSnap.exists){
+      updates[`current_applications/${role}/${uid}/status`]=status;
+      updates[`current_applications/${role}/${uid}/updatedAtMs`]=t;
+    }
+
+    if(role==="seller"){
+      updates[`admin_seller_requests/${uid}/status`]=status;
+      updates[`admin_seller_requests/${uid}/updatedAtMs`]=t;
+      if(activating){
+        const storesByUser=map((await db.ref(`stores_by_user/${uid}`).get()).val());
+        let storeId=safe(cur.storeId)||Object.keys(storesByUser)[0]||`store_${uid}`;
+        const storeName=clip(cur.storeName||"Minha Loja",120);
+        updates[`stores_by_user/${uid}/${storeId}`]=true;
+        updates[`store_members/${storeId}/${uid}`]={role:"owner",active:true,updatedAtMs:t};
+        updates[`stores/${storeId}/storeId`]=storeId;
+        updates[`stores/${storeId}/ownerUid`]=uid;
+        updates[`stores/${storeId}/name`]=storeName;
+        updates[`stores/${storeId}/status`]="approved";
+        updates[`stores/${storeId}/visibility`]="public";
+        updates[`stores/${storeId}/updatedAtMs`]=t;
+        if(!storesByUser[storeId]) updates[`stores/${storeId}/createdAtMs`]=t;
+      }
+    } else {
+      updates[`admin_delivery_requests/${uid}/status`]=status;
+      updates[`admin_delivery_requests/${uid}/updatedAtMs`]=t;
+      updates[`delivery_public_profiles/${uid}/status`]=activating?"active":suspended?"suspended":reopened?"pending":"rejected";
+      updates[`delivery_public_profiles/${uid}/updatedAtMs`]=t;
+      if (deliveryPublicCode) {
+        updates[`delivery_public_profiles/${uid}/publicCode`]=deliveryPublicCode;
+        updates[`delivery_public_codes/${firebaseSafeKey(deliveryPublicCode)}`]=uid;
+      } else {
+        const currentCode=safe((await db.ref(`delivery_public_profiles/${uid}/publicCode`).get()).val()).toUpperCase();
+        if(currentCode) updates[`delivery_public_codes/${firebaseSafeKey(currentCode)}`]=null;
+      }
+    }
+
+    const decisionRef=db.ref(`application_decisions/${uid}/${role}`).push();
+    updates[`application_decisions/${uid}/${role}/${decisionRef.key}`]={decision,status,actorUid:req.auth.uid,applicationId:safe(cur.applicationId),reason:clip(req.body?.reason,500),createdAtMs:t};
+    await db.ref().update(updates);
+    await appendAudit(`${role}_${decision}`,{actorUid:req.auth.uid,targetUid:uid,referenceId:cur.applicationId||"",status});
+    await pushNotification(uid,{title:activating?"Cadastro aprovado":suspended?"Acesso suspenso":reopened?"Cadastro reaberto":"Cadastro analisado",body:activating?`Seu acesso de ${role==="seller"?"vendedor":"entregador"} foi liberado.`:suspended?"Seu acesso foi suspenso pela equipe FireRank.":reopened?"Seu cadastro voltou para análise.":"Sua solicitação não foi aprovada.",type:`${role}_${decision}`});
+    return res.json({ok:true,role,uid,status,decision});
+  }catch(e){return publicError(res,e,"Não foi possível concluir a análise.");}
+});
+
+app.post("/v1/account/privacy", requireUser, rateLimit("account-privacy",12,60*60*1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid, visibility=safe(req.body?.visibility).toLowerCase(), t=nowMs();
+    if(!["public","private"].includes(visibility)) return res.status(422).json({ok:false,code:"INVALID_VISIBILITY",message:"Privacidade inválida."});
+
+    const updates={
+      [`account_visibility/${uid}`]:visibility,
+      [`public_users/${uid}/accountVisibility`]:visibility,
+      [`public_users/${uid}/updatedAtMs`]:t,
+    };
+
+    const productsSnap=await db.ref("products").orderByChild("ownerUid").equalTo(uid).get();
+    productsSnap.forEach(child=>{
+      const product=map(child.val());
+      const productId=child.key;
+      const categoryId=safe(product.categoryId);
+      const isPublishable=product.status==="active" && safe(product.visibility||"public")==="public" && safe(product.moderation?.status||"approved")==="approved" && finiteNumber(product.lifecycle?.deletedAtMs,0)===0;
+
+      if(visibility==="private" || !isPublishable){
+        updates[`product_cards/${productId}`]=null;
+        updates[`feed_index/${productId}`]=null;
+        updates[`search_index_basic/${productId}`]=null;
+        updates[`active_boost_cards/${productId}`]=null;
+        if(categoryId) updates[`category_index/${categoryId}/${productId}`]=null;
+        return;
+      }
+
+      const pricing=map(product.pricing);
+      const media=map(product.media);
+      const card={
+        productId,
+        ownerUid:uid,
+        storeId:safe(product.storeId),
+        categoryId,
+        title:clip(product.title,180),
+        productType:safe(product.productType),
+        coverUrl:safe(media.coverUrl),
+        priceCents:integer(pricing.priceCents,0),
+        currency:safe(pricing.currency)||"BRL",
+        createdAtMs:finiteNumber(product.lifecycle?.createdAtMs,t),
+        updatedAtMs:t,
+        accountVisibility:"public",
+      };
+      updates[`product_cards/${productId}`]=card;
+      updates[`feed_index/${productId}`]={productId,createdAtMs:card.createdAtMs,score:0};
+      updates[`search_index_basic/${productId}`]={productId,title:card.title.toLowerCase(),categoryId,storeId:card.storeId,ownerUid:uid,updatedAtMs:t};
+      if(categoryId) updates[`category_index/${categoryId}/${productId}`]={productId,createdAtMs:card.createdAtMs,score:0};
+    });
+
+    await db.ref().update(updates);
+    await appendAudit("account_privacy_changed",{actorUid:uid,targetUid:uid,status:visibility});
+    return res.json({ok:true,visibility});
+  }catch(e){return publicError(res,e,"Não foi possível alterar a privacidade.");}
+});
+
+app.post("/v1/support/chat", requireUser, rateLimit("support-chat",15,60*60*1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,t=nowMs(); const ent=map((await db.ref(`entitlements/${uid}`).get()).val());
+    const active=ent.subscriptionActive===true && (!finiteNumber(ent.expiresAtMs,0)||finiteNumber(ent.expiresAtMs,0)>t); const plan=safe(ent.verifiedPlan).replace(/^verified_/,"").toLowerCase();
+    if(!active || !["plus","pro"].includes(plan)) return res.status(403).json({ok:false,code:"SUPPORT_ENTITLEMENT_REQUIRED",message:"O chat humano é exclusivo dos planos Plus e Pro."});
+    const existing=safe((await db.ref(`support_active_by_user/${uid}`).get()).val()); const chatId=existing||`support_${uid}`; const otherUid="firerank_support";
+    const priority=plan==="pro"?"highest":"priority";
+    await db.ref().update({
+      [`chats/${chatId}`]:{chatId,type:"support",participants:{[uid]:true,[otherUid]:true},ownerUid:uid,status:"open",priority,createdAtMs:t,updatedAtMs:t},
+      [`chats_by_user/${uid}/${chatId}`]:{chatId,type:"support",otherUid,updatedAtMs:t,lastMessageAtMs:t},
+      [`support_tickets/${uid}/${chatId}`]:{ticketId:chatId,uid,chatId,status:"open",plan,priority,createdAtMs:t,updatedAtMs:t},
+      [`support_admin_index/${chatId}`]:{ticketId:chatId,uid,chatId,status:"open",plan,priority,createdAtMs:t,updatedAtMs:t},
+      [`support_active_by_user/${uid}`]:chatId,
+    });
+    return res.json({ok:true,chatId,otherUid,priority});
+  }catch(e){return publicError(res,e,"Não foi possível abrir o atendimento.");}
+});
+
+app.post("/v1/ai/v2/chat", requireUser, rateLimit("gemini-chat",30,60*60*1000), async(req,res)=>{
+  try{
+    if(!GEMINI_API_KEY || !GEMINI_MODEL) return res.status(503).json({ok:false,code:"AI_NOT_CONFIGURED",message:"A IA ainda não está configurada."});
+    const uid=req.auth.uid,t=nowMs(); const message=clip(req.body?.message||req.body?.text,6000); if(!message) return res.status(422).json({ok:false,code:"MESSAGE_REQUIRED"});
+    const ent=map((await db.ref(`entitlements/${uid}`).get()).val()); let quota=20; const plan=safe(ent.verifiedPlan).replace(/^verified_/,"").toLowerCase(); if(ent.subscriptionActive===true){if(plan==="plus")quota=100;if(plan==="pro")quota=300;}
+    const day=new Date().toISOString().slice(0,10); const usageRef=db.ref(`ai_usage/${uid}/${day}`); const usage=map((await usageRef.get()).val()); const used=integer(usage.messages,0); if(used>=quota) return res.status(429).json({ok:false,code:"AI_DAILY_QUOTA",message:"Sua cota diária de IA foi atingida.",quota,used});
+    const history=Array.isArray(req.body?.history)?req.body.history.slice(-6):[];
+    const contents=[...history.map(x=>({role:safe(x.role)==="assistant"?"model":"user",parts:[{text:clip(x.text,3000)}]})),{role:"user",parts:[{text:message}]}];
+    const url=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    const gr=await axios.post(url,{contents,systemInstruction:{parts:[{text:"Você é o FireRank AI. Ajude usuários do aplicativo FireRank com respostas úteis e seguras. Nunca afirme ter alterado pagamentos, permissões, cadastros ou banco de dados. Não peça nem exponha segredos."}]},generationConfig:{temperature:0.5,maxOutputTokens:900}},{timeout:30000});
+    const answer=safe(gr.data?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n"))||"Não consegui gerar uma resposta agora.";
+    await usageRef.set({messages:used+1,quota,plan:plan||"normal",updatedAtMs:t});
+    return res.json({ok:true,text:answer,answer,usage:{used:used+1,quota}});
+  }catch(e){return publicError(res,e,"A IA não conseguiu responder agora.");}
+});
+
+app.post("/v1/analytics/banner", rateLimit("banner-analytics",120,60*60*1000), async(req,res)=>{
+  try{const bannerId=clip(req.body?.bannerId,160),event=clip(req.body?.event||req.body?.type,40);if(!bannerId||!["impression","click"].includes(event))return res.status(422).json({ok:false});const ref=db.ref("home_banner_events").push();await ref.set({eventId:ref.key,bannerId,event,createdAtMs:nowMs(),clientPlatform:clip(req.body?.clientPlatform,40)});return res.status(202).json({ok:true});}catch(e){return publicError(res,e,"Evento não registrado.");}
+});
+
+
+
+
+// Conta oficial e benefícios por contrato são conceitos separados.
+// O badge oficial sai em public_badges; Pro por contrato é opcional e auditável.
+app.post('/v1/admin/official-accounts/grant', requireUser, requireAdmin, rateLimit('admin-official-grant', 30, 60 * 60 * 1000), async(req,res)=>{
+  try{
+    const adminUid=req.auth.uid,body=map(req.body),uid=safe(body.uid),t=nowMs();
+    if(!uid)return res.status(422).json({ok:false,code:'UID_REQUIRED'});
+    const [pubSnap,userSnap,entSnap]=await Promise.all([db.ref(`public_users/${uid}`).get(),db.ref(`users/${uid}`).get(),db.ref(`entitlements/${uid}`).get()]);
+    const user={...map(userSnap.val()),...map(pubSnap.val())};
+    if(!pubSnap.exists()&&!userSnap.exists())return res.status(404).json({ok:false,code:'USER_NOT_FOUND',message:'Conta não encontrada.'});
+    const grantRef=db.ref(`partner_contracts/${uid}`).push(); const grantId=grantRef.key;
+    const grantPro=bool(body.grantPro); const plan=grantPro?'pro':'normal'; const previousEntitlement=map(entSnap.val());
+    const partnerName=clip(body.partnerName||user.displayName||user.username,120);
+    const official={uid,official:true,active:true,entityType:clip(body.entityType||'account',40),storeId:clip(body.storeId,160),partnerName,displayName:clip(user.displayName,120),benefitPlan:grantPro?plan:'none',contractRef:clip(body.contractRef,160),note:clip(body.note,500),sourceGrantId:grantId,grantedByAdminUid:adminUid,createdAtMs:t,updatedAtMs:t};
+    const updates={
+      [`official_accounts/${uid}`]:official,
+      [`public_badges/${uid}`]:{uid,official:true,active:true,badgeType:'official',label:'Oficial',entityType:official.entityType,updatedAtMs:t},
+      [`partner_contracts/${uid}/${grantId}`]:{grantId,uid,storeId:official.storeId,entityType:official.entityType,partnerName,contractRef:official.contractRef,note:official.note,officialBadge:true,benefitPlan:grantPro?plan:'none',active:true,source:'admin_contract_grant',grantedByAdminUid:adminUid,createdAtMs:t,updatedAtMs:t,previousEntitlement},
+    };
+    if(grantPro){
+      updates[`entitlements/${uid}`]={...previousEntitlement,verifiedBadge:true,verifiedPlan:'pro',subscriptionActive:true,expiresAtMs:Date.UTC(2100,0,1),permanent:true,contractGrantActive:true,paymentRequired:false,source:'admin_contract_grant',sourceGrantId:grantId,grantedByAdminUid:adminUid,updatedAtMs:t};
+    }
+    await db.ref().update(updates); await appendAudit('official_account_granted',{actorUid:adminUid,targetUid:uid,referenceId:grantId,status:'active'});
+    return res.status(201).json({ok:true,uid,grantId,official:true,proGranted:grantPro});
+  }catch(e){return publicError(res,e,'Não foi possível conceder a conta oficial.');}
+});
+
+app.post('/v1/admin/official-accounts/revoke', requireUser, requireAdmin, rateLimit('admin-official-revoke', 30, 60 * 60 * 1000), async(req,res)=>{
+  try{
+    const adminUid=req.auth.uid,uid=safe(req.body?.uid),grantId=safe(req.body?.grantId),t=nowMs();
+    if(!uid||!grantId)return res.status(422).json({ok:false,code:'UID_GRANT_REQUIRED'});
+    const [grantSnap,entSnap]=await Promise.all([db.ref(`partner_contracts/${uid}/${grantId}`).get(),db.ref(`entitlements/${uid}`).get()]);
+    const grant=map(grantSnap.val()),current=map(entSnap.val()),previous=map(grant.previousEntitlement);
+    const updates={
+      [`public_badges/${uid}/active`]:false,[`public_badges/${uid}/updatedAtMs`]:t,
+      [`official_accounts/${uid}/active`]:false,[`official_accounts/${uid}/revokedAtMs`]:t,[`official_accounts/${uid}/revokedByAdminUid`]:adminUid,[`official_accounts/${uid}/updatedAtMs`]:t,
+      [`partner_contracts/${uid}/${grantId}/active`]:false,[`partner_contracts/${uid}/${grantId}/revokedAtMs`]:t,[`partner_contracts/${uid}/${grantId}/revokedByAdminUid`]:adminUid,[`partner_contracts/${uid}/${grantId}/updatedAtMs`]:t,
+    };
+    if(safe(current.source)==='admin_contract_grant'&&safe(current.sourceGrantId)===grantId){updates[`entitlements/${uid}`]=Object.keys(previous).length?previous:{verifiedBadge:false,verifiedPlan:'normal',subscriptionActive:false,expiresAtMs:t,permanent:false,contractGrantActive:false,source:'admin_contract_revoked',updatedAtMs:t};}
+    await db.ref().update(updates); await appendAudit('official_account_revoked',{actorUid:adminUid,targetUid:uid,referenceId:grantId,status:'revoked'});
+    return res.json({ok:true,uid,grantId});
+  }catch(e){return publicError(res,e,'Não foi possível revogar a conta oficial.');}
+});
+
+// ============================================================================
+// FireRank production closure V4.2 — rotas esperadas pelo Flutter atual.
+// Mantem Render como backend oficial e Firebase RTDB como persistencia.
+// ============================================================================
+
+const V42_ORDER_LIMIT = 50;
+const V42_GUEST_LIMIT = 50;
+
+function v42NormalizeStatus(value) {
+  const status = safe(value).toLowerCase();
+  const aliases = {
+    created: 'sent', pending: 'sent', sent: 'sent',
+    accepted: 'accepted', seller_accepted: 'accepted',
+    preparing: 'preparing', in_preparation: 'preparing',
+    ready: 'ready', ready_for_delivery: 'ready',
+    assigned: 'assigned', assigned_delivery: 'assigned',
+    driver_accepted: 'delivery_accepted', accepted_by_delivery: 'delivery_accepted', delivery_accepted: 'delivery_accepted',
+    picked_up: 'picked_up', collected: 'picked_up',
+    on_route: 'on_route', out_for_delivery: 'on_route',
+    arriving: 'arriving',
+    delivered: 'delivered', completed: 'delivered',
+    cancelled: 'cancelled', canceled: 'cancelled',
+    rejected: 'rejected', declined: 'rejected',
+    archived: 'archived',
+  };
+  return aliases[status] || status;
+}
+
+function v42OrderIndexValue(orderId, status, t) {
+  return { orderId, status, updatedAtMs: t, createdAtMs: t };
+}
+
+async function v42SellerOwnsStore(uid, storeId) {
+  if (!uid || !storeId) return false;
+  const [storeSnap, memberSnap] = await Promise.all([
+    db.ref(`stores/${storeId}`).get(),
+    db.ref(`store_members/${storeId}/${uid}`).get(),
+  ]);
+  const store = map(storeSnap.val());
+  const member = map(memberSnap.val());
+  return safe(store.ownerUid) === uid || (member.active === true && ['owner','admin','manager'].includes(safe(member.role).toLowerCase()));
+}
+
+async function v42AssertDeliveryActive(uid) {
+  const [roleSnap, stateSnap, eligibilitySnap] = await Promise.all([
+    db.ref(`user_roles/${uid}/delivery`).get(),
+    db.ref(`role_state/${uid}/delivery`).get(),
+    db.ref(`eligibility/${uid}`).get(),
+  ]);
+  const state = map(stateSnap.val());
+  const eligibility = map(eligibilitySnap.val());
+  if (roleSnap.val() !== true || state.active !== true || state.accessEnabled !== true || eligibility.canDeliver !== true || eligibility.needsAgeReview === true) {
+    const error = new Error('DELIVERY_NOT_ELIGIBLE');
+    error.statusCode = 403;
+    error.publicMessage = 'Seu acesso de entregador não está ativo.';
+    throw error;
+  }
+}
+
+async function v42CanBuyerAccessProduct(uid, product) {
+  if (safe(product.ownerUid) === uid) return true;
+  if (safe(product.visibility || 'public') === 'public') return true;
+  const followSnap = await db.ref(`follow_edges/${safe(product.ownerUid)}/${uid}`).get();
+  if (followSnap.val() === true) return true;
+  const follow = map(followSnap.val());
+  const status = safe(follow.status).toLowerCase();
+  return follow.approved === true || follow.active === true || status === 'approved' || status === 'active';
+}
+
+async function v42LoadOrder(orderId) {
+  const snap = await db.ref(`orders/${orderId}`).get();
+  if (!snap.exists()) {
+    const error = new Error('ORDER_NOT_FOUND');
+    error.statusCode = 404;
+    error.publicMessage = 'Pedido não encontrado.';
+    throw error;
+  }
+  return map(snap.val());
+}
+
+async function v42WriteOrderState(orderId, order, nextStatus, actorUid, actorRole, action, extra = {}) {
+  const t = nowMs();
+  const eventRef = db.ref(`order_events/${orderId}`).push();
+  const buyerUid = safe(order.buyerUid);
+  const sellerUid = safe(order.sellerUid || order.ownerUid);
+  const storeId = safe(order.storeId);
+  const deliveryUid = safe(extra.deliveryUid || order.deliveryUid);
+  const updates = {
+    [`orders/${orderId}/status`]: nextStatus,
+    [`orders/${orderId}/updatedAtMs`]: t,
+    [`orders/${orderId}/timestamps/updatedAtMs`]: t,
+    [`orders_by_buyer/${buyerUid}/${orderId}`]: { orderId, status: nextStatus, updatedAtMs: t, createdAtMs: finiteNumber(order.createdAtMs || order.timestamps?.createdAtMs, t) },
+    [`orders_by_store/${storeId}/${orderId}`]: { orderId, status: nextStatus, updatedAtMs: t, createdAtMs: finiteNumber(order.createdAtMs || order.timestamps?.createdAtMs, t) },
+    [`order_events/${orderId}/${eventRef.key}`]: { eventId: eventRef.key, orderId, action, status: nextStatus, actorUid, actorRole, createdAtMs: t, immutable: true },
+  };
+  if (sellerUid) updates[`orders/${orderId}/sellerUid`] = sellerUid;
+  if (deliveryUid) {
+    updates[`orders/${orderId}/deliveryUid`] = deliveryUid;
+    updates[`orders_by_delivery/${deliveryUid}/${orderId}`] = { orderId, status: nextStatus, updatedAtMs: t, createdAtMs: finiteNumber(order.createdAtMs || order.timestamps?.createdAtMs, t) };
+  }
+  for (const [key, value] of Object.entries(extra)) {
+    if (key === 'deliveryUid') continue;
+    updates[`orders/${orderId}/${key}`] = value;
+  }
+  await db.ref().update(updates);
+  return { t, updates };
+}
+
+function v42PublicUserProjection(uid, source, t) {
+  return {
+    uid,
+    displayName: clip(source.displayName || source.name, 120),
+    username: clip(source.username, 40),
+    bio: clip(source.bio, 500),
+    profileLink: clip(source.profileLink, 500),
+    photoUrl: safe(source.photoUrl || source.profilePhotoUrl),
+    accountVisibility: safe(source.accountVisibility || 'public') === 'private' ? 'private' : 'public',
+    updatedAtMs: t,
+  };
+}
+
+app.post('/v1/account/guest-merge', requireUser, rateLimit('guest-merge', 10, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const body = map(req.body);
+    const cart = map(body.cart);
+    const favorites = map(body.favorites);
+    const currentCart = map((await db.ref(`carts/${uid}`).get()).val());
+    const currentFavorites = map((await db.ref(`favorites/${uid}`).get()).val());
+    const updates = {};
+    let cartMerged = 0;
+    let favoritesMerged = 0;
+    for (const [rawProductId, raw] of Object.entries(cart).slice(0, V42_GUEST_LIMIT)) {
+      const productId = firebaseSafeKey(rawProductId).slice(0, 180);
+      if (!productId || currentCart[productId]) continue;
+      const value = map(raw);
+      const quantity = Math.max(1, Math.min(99, integer(value.quantity, 1)));
+      updates[`carts/${uid}/${productId}`] = { productId, quantity, updatedAtMs: nowMs(), source: 'guest_merge' };
+      cartMerged++;
+    }
+    for (const [rawProductId] of Object.entries(favorites).slice(0, V42_GUEST_LIMIT)) {
+      const productId = firebaseSafeKey(rawProductId).slice(0, 180);
+      if (!productId || currentFavorites[productId]) continue;
+      updates[`favorites/${uid}/${productId}`] = { productId, createdAtMs: nowMs(), source: 'guest_merge' };
+      favoritesMerged++;
+    }
+    if (Object.keys(updates).length) await db.ref().update(updates);
+    await appendAudit('guest_state_merged', { actorUid: uid, targetUid: uid, status: 'ok' });
+    return res.json({ ok: true, cartMerged, favoritesMerged });
+  } catch (e) { return publicError(res, e, 'Não foi possível sincronizar o modo visitante.'); }
+});
+
+app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const body = map(req.body);
+    const username = safe(body.username).toLowerCase();
+    const displayName = clip(body.displayName, 120);
+    const bio = clip(body.bio, 500);
+    const profileLink = safe(body.profileLink);
+    const removePhoto = bool(body.removePhoto);
+    if (!/^[a-z][a-z0-9._]{2,19}$/.test(username)) return res.status(422).json({ ok:false, code:'INVALID_USERNAME', message:'Username inválido.' });
+    if (!displayName) return res.status(422).json({ ok:false, code:'DISPLAY_NAME_REQUIRED', message:'Nome obrigatório.' });
+    if (profileLink && !isHttpsUrl(profileLink)) return res.status(422).json({ ok:false, code:'INVALID_PROFILE_LINK', message:'Use um link HTTPS válido.' });
+    const current = map((await db.ref(`user_profiles/${uid}`).get()).val());
+    const oldUsername = safe(current.username).toLowerCase();
+    const indexRef = db.ref(`username_index/${firebaseSafeKey(username)}`);
+    const tx = await indexRef.transaction((value) => (!value || value === uid ? uid : value), { applyLocally:false });
+    if (!tx.committed || tx.snapshot.val() !== uid) return res.status(409).json({ ok:false, code:'USERNAME_TAKEN', message:'Esse username já está em uso.' });
+    const t = nowMs();
+    let photoUrl = safe(current.photoUrl);
+    if (removePhoto) photoUrl = '';
+    const profileMediaId = safe(body.profileMediaId);
+    if (profileMediaId) {
+      let media = map((await db.ref(`media_assets/${uid}/${profileMediaId}`).get()).val());
+      if (!safe(media.assetId)) media = map((await db.ref(`media_assets/${profileMediaId}`).get()).val());
+      if (safe(media.ownerUid) !== uid || safe(media.purpose) !== 'profile_image') return res.status(403).json({ok:false,code:'PROFILE_MEDIA_INVALID',message:'Foto inválida.'});
+      if (safe(media.type) === 'upload') {
+        photoUrl = cloudinary.url(safe(media.publicId), {resource_type:'image',type:'upload',secure:true,transformation:[{width:400,height:400,crop:'fill',gravity:'face',quality:'auto',fetch_format:'auto'}]});
+      } else {
+        photoUrl = safe(media.deliveryUrl || media.secureUrl);
+      }
+    }
+    const profile = { uid, username, displayName, bio, profileLink, photoUrl, updatedAtMs:t, createdAtMs: finiteNumber(current.createdAtMs,t) };
+    const visibility = await getAccountVisibility(uid);
+    const updates = {
+      [`user_profiles/${uid}`]: profile,
+      [`public_users/${uid}`]: v42PublicUserProjection(uid, { ...profile, accountVisibility: visibility }, t),
+    };
+    if (oldUsername && oldUsername !== username) updates[`username_index/${firebaseSafeKey(oldUsername)}`] = null;
+    await db.ref().update(updates);
+    await firebaseAuth.updateUser(uid, { displayName, photoURL: photoUrl || null });
+    await appendAudit('profile_updated', { actorUid: uid, targetUid: uid, status:'ok' });
+    return res.json({ ok:true, profile });
+  } catch (e) { return publicError(res, e, 'Não foi possível salvar o perfil.'); }
+});
+
+app.post('/v1/account/delete-request', requireUser, rateLimit('account-delete-request', 3, 24 * 60 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    if (req.body?.confirmation !== true) return res.status(422).json({ok:false,code:'CONFIRMATION_REQUIRED',message:'Confirme a exclusão.'});
+    const t = nowMs();
+    const ref = db.ref(`account_deletion_requests/${uid}`).push();
+    const requestId = ref.key;
+    await ref.set({ requestId, uid, status:'requested', createdAtMs:t, updatedAtMs:t, immutable:true });
+    await db.ref(`account_state/${uid}`).update({ deletionRequested:true, deletionRequestId:requestId, updatedAtMs:t });
+    await appendAudit('account_deletion_requested', { actorUid:uid, targetUid:uid, referenceId:requestId, status:'requested' });
+    return res.status(202).json({ok:true,requestId,status:'requested'});
+  } catch (e) { return publicError(res, e, 'Não foi possível registrar a exclusão.'); }
+});
+
+app.post('/v1/account/export', requireUser, rateLimit('account-export', 3, 60 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const paths = ['user_profiles','user_preferences','account_visibility','carts','favorites','orders_by_buyer','notifications','entitlements','user_roles','role_state','eligibility','current_applications'];
+    const data = {};
+    for (const root of paths) data[root] = (await db.ref(`${root}/${uid}`).get()).val() ?? null;
+    const ref = db.ref(`data_export_requests/${uid}`).push();
+    const requestId = ref.key;
+    const t = nowMs();
+    await ref.set({ requestId, uid, status:'completed_inline', createdAtMs:t, completedAtMs:t, immutable:true });
+    return res.json({ok:true,requestId,generatedAtMs:t,data});
+  } catch (e) { return publicError(res, e, 'Não foi possível gerar a exportação.'); }
+});
+
+app.get('/v1/boost/catalog', requireUser, rateLimit('boost-catalog', 60, 10 * 60 * 1000), async (_req, res) => {
+  try {
+    let raw = {};
+    if (BOOST_CATALOG_JSON) { try { raw = JSON.parse(BOOST_CATALOG_JSON); } catch (_) {} }
+    if (!Object.keys(map(raw)).length) raw = map((await db.ref('public_config/boostCatalog').get()).val());
+    const plans = Object.entries(map(raw)).map(([id, value]) => ({ id, ...map(value) })).filter((x) => integer(x.days,0) > 0 && integer(x.priceCents,0) > 0).slice(0,20);
+    return res.json({ok:true,plans});
+  } catch (e) { return publicError(res,e,'Não foi possível carregar os Patrocinados.'); }
+});
+
+app.post('/v1/chats/start', requireUser, rateLimit('chat-start', 30, 10 * 60 * 1000), async (req,res) => {
+  try {
+    const uid=req.auth.uid, productId=safe(req.body?.productId), type=clip(req.body?.type||'product_question',40), t=nowMs();
+    const product=map((await db.ref(`products/${productId}`).get()).val());
+    if (!productId || !safe(product.ownerUid)) return res.status(404).json({ok:false,code:'PRODUCT_NOT_FOUND'});
+    const otherUid=safe(product.ownerUid); if(otherUid===uid) return res.status(409).json({ok:false,code:'SELF_CHAT'});
+    const key=[uid,otherUid,productId].sort().join(':'); const chatId=`product_${stableHash(key).slice(0,32)}`;
+    await db.ref().update({
+      [`chats/${chatId}`]:{chatId,type,productId,participants:{[uid]:true,[otherUid]:true},status:'open',createdAtMs:t,updatedAtMs:t},
+      [`chats_by_user/${uid}/${chatId}`]:{chatId,type,productId,otherUid,updatedAtMs:t,lastMessageAtMs:t},
+      [`chats_by_user/${otherUid}/${chatId}`]:{chatId,type,productId,otherUid:uid,updatedAtMs:t,lastMessageAtMs:t},
+    });
+    return res.json({ok:true,chatId,otherUid});
+  }catch(e){return publicError(res,e,'Não foi possível iniciar a conversa.');}
+});
+
+app.post('/v1/reports', requireUser, rateLimit('report-create', 10, 60 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,targetType=clip(req.body?.targetType,40),targetId=clip(req.body?.targetId,180),reason=clip(req.body?.reason,80),description=clip(req.body?.description,1500),t=nowMs();
+    if(!targetType||!targetId||!reason||description.length<3)return res.status(422).json({ok:false,code:'REPORT_INVALID'});
+    const ref=db.ref('moderation_reports').push(); const reportId=ref.key;
+    await ref.set({reportId,reporterUid:uid,targetType,targetId,reason,description,status:'open',createdAtMs:t,updatedAtMs:t});
+    await appendAudit('report_created',{actorUid:uid,referenceId:reportId,status:'open'});
+    return res.status(201).json({ok:true,reportId});
+  }catch(e){return publicError(res,e,'Não foi possível enviar a denúncia.');}
+});
+
+app.post('/v1/products/event', rateLimit('product-event', 180, 60 * 60 * 1000), async(req,res)=>{
+  try{
+    const productId=clip(req.body?.productId,180),event=clip(req.body?.event,40),allowed=new Set(['view','affiliate_click','share','favorite']);
+    if(!productId||!allowed.has(event))return res.status(422).json({ok:false});
+    const ref=db.ref(`product_events/${productId}`).push(); const t=nowMs();
+    await ref.set({eventId:ref.key,productId,event,createdAtMs:t,clientPlatform:clip(req.body?.clientPlatform,40)});
+    const statKey=event==='view'?'views':event==='affiliate_click'?'affiliateClicks':event==='share'?'shares':'favorites';
+    await db.ref(`product_stats/${productId}/${statKey}`).transaction((v)=>integer(v,0)+1,{applyLocally:false});
+    return res.status(202).json({ok:true});
+  }catch(e){return publicError(res,e,'Evento não registrado.');}
+});
+
+app.post('/v1/products/action', requireUser, rateLimit('product-action', 30, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,productId=safe(req.body?.productId),action=safe(req.body?.action).toLowerCase(),t=nowMs();
+    const snap=await db.ref(`products/${productId}`).get(); const product=map(snap.val());
+    if(!snap.exists())return res.status(404).json({ok:false,code:'PRODUCT_NOT_FOUND'});
+    if(safe(product.ownerUid)!==uid)return res.status(403).json({ok:false,code:'PRODUCT_OWNER_REQUIRED'});
+    if(!['pause','reactivate','delete'].includes(action))return res.status(422).json({ok:false,code:'INVALID_ACTION'});
+    const nextStatus=action==='pause'?'paused':action==='reactivate'?'active':'deleted';
+    const updates={
+      [`products/${productId}/status`]:nextStatus,[`products/${productId}/lifecycle/updatedAtMs`]:t,
+      [`product_cards/${productId}`]:null,[`feed_index/${productId}`]:null,[`search_index_basic/${productId}`]:null,[`active_boost_cards/${productId}`]:null,
+    };
+    const categoryId=safe(product.categoryId); if(categoryId)updates[`category_index/${categoryId}/${productId}`]=null;
+    if(action==='delete')updates[`products/${productId}/lifecycle/deletedAtMs`]=t;
+    if(action==='reactivate'){
+      const visibility=await getAccountVisibility(uid); const store=map((await db.ref(`stores/${safe(product.storeId)}`).get()).val());
+      if(accountAndStoreCanBePublic(visibility,store) && safe(product.moderation?.status||'approved')==='approved'){
+        const card=publicProductCard({...product,status:'active',visibility:'public'},safe(product.media?.coverUrl),t); addPublicProjections(updates,{...product,status:'active',visibility:'public'},card,searchTermsForProduct(safe(product.title),categoryId),t);
+      }
+    }
+    await db.ref().update(updates); await appendAudit(`product_${action}`,{actorUid:uid,targetUid:uid,referenceId:productId,status:nextStatus});
+    return res.json({ok:true,productId,status:nextStatus});
+  }catch(e){return publicError(res,e,'Não foi possível atualizar o produto.');}
+});
+
+app.post('/v1/orders', requireUser, rateLimit('order-create', 12, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid, body=map(req.body), productId=safe(body.productId), quantity=Math.max(1,Math.min(99,integer(body.quantity,1))), fulfillmentType=safe(body.fulfillmentType).toLowerCase(), paymentMethod=clip(body.paymentMethod,60), buyerNote=clip(body.buyerNote,1000), t=nowMs();
+    const productSnap=await db.ref(`products/${productId}`).get(); const product=map(productSnap.val());
+    if(!productSnap.exists()||safe(product.status)!=='active'||safe(product.productType)!=='local')return res.status(404).json({ok:false,code:'PRODUCT_NOT_AVAILABLE'});
+    if(safe(product.ownerUid)===uid)return res.status(403).json({ok:false,code:'OWN_PRODUCT'});
+    if(!(await v42CanBuyerAccessProduct(uid,product)))return res.status(403).json({ok:false,code:'PRODUCT_PRIVATE'});
+    const local=map(product.local); if(!['delivery','pickup'].includes(fulfillmentType))return res.status(422).json({ok:false,code:'INVALID_FULFILLMENT'});
+    if(fulfillmentType==='delivery'&&local.deliveryAvailable!==true)return res.status(422).json({ok:false,code:'DELIVERY_UNAVAILABLE'});
+    if(fulfillmentType==='pickup'&&local.pickupAvailable!==true)return res.status(422).json({ok:false,code:'PICKUP_UNAVAILABLE'});
+    const unitPriceCents=integer(product.pricing?.priceCents,0); if(unitPriceCents<=0)return res.status(409).json({ok:false,code:'PRICE_CHANGED'});
+    const storeId=safe(product.storeId), sellerUid=safe(product.ownerUid); const store=map((await db.ref(`stores/${storeId}`).get()).val());
+    const addressKey=safe(body.addressKey||'primary'); let address={};
+    if(fulfillmentType==='delivery'){
+      const addressSnap=await db.ref(`user_addresses/${uid}/${addressKey}`).get(); address=map(addressSnap.val());
+      if(!addressSnap.exists()||!safe(address.city)||!safe(address.state))return res.status(422).json({ok:false,code:'ADDRESS_REQUIRED',message:'Cadastre um endereço válido.'});
+    }
+    const deliveryFeeCents=fulfillmentType==='delivery'?Math.max(0,integer(local.deliveryFeeCents,0)):0; const productAmountCents=unitPriceCents*quantity; const totalCents=productAmountCents+deliveryFeeCents;
+    const orderId=db.ref('orders').push().key; const code=String(crypto.randomInt(100000,999999)); const codeHash=stableHash(`${orderId}:${code}`);
+    const order={orderId,buyerUid:uid,sellerUid,storeId,productId,quantity,status:'sent',fulfillmentType,paymentMethod,productAmountCents,deliveryFeeCents,totalCents,deliveryCodeRequired:fulfillmentType==='delivery',deliveryCodeVerified:false,productSnapshot:{productId,title:safe(product.title),coverUrl:safe(product.media?.coverUrl),priceCents:unitPriceCents},storeSnapshot:{storeId,name:safe(store.name)},review:{status:'pending'},createdAtMs:t,updatedAtMs:t,timestamps:{createdAtMs:t,updatedAtMs:t}};
+    const privateData={buyer:{uid},buyerNote,payment:{method:paymentMethod,totalCents,productAmountCents,deliveryFeeCents},deliveryAddress:fulfillmentType==='delivery'?address:null,deliveryCode:fulfillmentType==='delivery'?{plainForBuyer:code,codeHash,required:true,verified:false}:null};
+    const updates={
+      [`orders/${orderId}`]:order,[`order_private/${orderId}`]:privateData,
+      [`orders_by_buyer/${uid}/${orderId}`]:v42OrderIndexValue(orderId,'sent',t),
+      [`orders_by_store/${storeId}/${orderId}`]:v42OrderIndexValue(orderId,'sent',t),
+      [`buyer_orders/${uid}/${orderId}`]:{orderId,status:'sent',updatedAtMs:t},
+    };
+    await db.ref().update(updates); await appendAudit('order_created',{actorUid:uid,targetUid:sellerUid,referenceId:orderId,status:'sent'});
+    await pushNotification(sellerUid,{title:'Novo pedido',body:`Você recebeu um novo pedido de ${clip(product.title,80)}.`,type:'order_created',data:{orderId,productId}});
+    return res.status(201).json({ok:true,orderId,status:'sent'});
+  }catch(e){return publicError(res,e,'Não foi possível criar o pedido.');}
+});
+
+app.post('/v1/orders/action', requireUser, rateLimit('order-action', 40, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,orderId=safe(req.body?.orderId),actorRole=safe(req.body?.actorRole).toLowerCase(),action=safe(req.body?.action).toLowerCase();
+    const order=await v42LoadOrder(orderId); const status=v42NormalizeStatus(order.status); const buyerUid=safe(order.buyerUid), sellerUid=safe(order.sellerUid||order.ownerUid), storeId=safe(order.storeId);
+    if(actorRole==='buyer'&&buyerUid!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});
+    if(actorRole==='seller'&&!(sellerUid===uid||await v42SellerOwnsStore(uid,storeId)))return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});
+    if(actorRole==='delivery'){await v42AssertDeliveryActive(uid); if(safe(order.deliveryUid)&&safe(order.deliveryUid)!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});}
+    const transitions={
+      buyer:{cancel:{from:['sent'],to:'cancelled'},archive:{from:['delivered','cancelled','rejected'],to:'archived'}},
+      seller:{accept:{from:['sent'],to:'accepted'},reject:{from:['sent'],to:'rejected'},mark_preparing:{from:['accepted'],to:'preparing'},mark_ready:{from:['preparing'],to:'ready'},complete_pickup:{from:['ready'],to:'delivered'},archive:{from:['delivered','cancelled','rejected'],to:'archived'}},
+      delivery:{accept_delivery:{from:['assigned'],to:'delivery_accepted'},accept:{from:['assigned'],to:'delivery_accepted'},mark_picked_up:{from:['delivery_accepted'],to:'picked_up'},start_route:{from:['picked_up'],to:'on_route'},mark_arriving:{from:['on_route'],to:'arriving'},confirm_delivery:{from:['arriving','on_route'],to:'delivered'},archive:{from:['delivered','cancelled','rejected'],to:'archived'}},
+    };
+    if(action==='assign_delivery'){
+      if(actorRole!=='seller'||status!=='ready')return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});
+      const code=safe(req.body?.deliveryCode).toUpperCase(); const codeSnap=await db.ref(`delivery_public_codes/${firebaseSafeKey(code)}`).get(); let deliveryUid='';
+      if(typeof codeSnap.val()==='string')deliveryUid=safe(codeSnap.val());else deliveryUid=safe(map(codeSnap.val()).uid||map(codeSnap.val()).deliveryUid);
+      if(!deliveryUid)return res.status(404).json({ok:false,code:'DELIVERY_NOT_FOUND'});
+      const connection=map((await db.ref(`delivery_connections/${storeId}/${deliveryUid}`).get()).val()); if(!['active','accepted'].includes(safe(connection.status).toLowerCase()))return res.status(403).json({ok:false,code:'DELIVERY_NOT_CONNECTED'});
+      await v42WriteOrderState(orderId,order,'assigned',uid,'seller',action,{deliveryUid}); await pushNotification(deliveryUid,{title:'Nova entrega',body:'Uma loja conectada enviou um pedido para você.',type:'delivery_assigned',data:{orderId}}); return res.json({ok:true,orderId,status:'assigned',deliveryUid});
+    }
+    if(action==='verify_delivery_code'){
+      if(actorRole!=='delivery'||!['arriving','on_route'].includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});
+      const typed=safe(req.body?.code||req.body?.deliveryCode).replace(/[^0-9A-Za-z]/g,''); const priv=map((await db.ref(`order_private/${orderId}`).get()).val()); const codeData=map(priv.deliveryCode||priv.deliveryConfirmation); const expected=safe(codeData.codeHash||priv.deliveryCodeHash||priv.confirmationCodeHash);
+      if(!typed||!expected||stableHash(`${orderId}:${typed}`)!==expected)return res.status(422).json({ok:false,code:'DELIVERY_CODE_INVALID',message:'Código de entrega inválido.'});
+      await db.ref().update({[`orders/${orderId}/deliveryCodeVerified`]:true,[`order_private/${orderId}/deliveryCode/verified`]:true,[`order_private/${orderId}/deliveryCode/verifiedAtMs`]:nowMs()}); await v42WriteOrderState(orderId,order,'delivered',uid,'delivery',action,{deliveryCodeVerified:true}); await pushNotification(buyerUid,{title:'Entrega concluída',body:'Seu pedido foi marcado como entregue.',type:'order_delivered',data:{orderId}}); return res.json({ok:true,orderId,status:'delivered'});
+    }
+    const tr=transitions[actorRole]?.[action]; if(!tr)return res.status(422).json({ok:false,code:'INVALID_ACTION'}); if(!tr.from.includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION',status});
+    if(actorRole==='delivery'&&!safe(order.deliveryUid))return res.status(409).json({ok:false,code:'DELIVERY_NOT_ASSIGNED'});
+    await v42WriteOrderState(orderId,order,tr.to,uid,actorRole,action,actorRole==='delivery'?{deliveryUid:uid}:{});
+    if(tr.to==='delivered')await pushNotification(buyerUid,{title:'Pedido entregue',body:'Seu pedido foi concluído.',type:'order_delivered',data:{orderId}});
+    else if(actorRole==='seller')await pushNotification(buyerUid,{title:'Pedido atualizado',body:`Novo status: ${tr.to}.`,type:'order_status',data:{orderId,status:tr.to}});
+    return res.json({ok:true,orderId,status:tr.to});
+  }catch(e){return publicError(res,e,'Não foi possível atualizar o pedido.');}
+});
+
+app.post('/v1/delivery/orders/action', requireUser, rateLimit('delivery-order-action', 40, 10 * 60 * 1000), async(req,res)=>{
+  req.body={...map(req.body),actorRole:'delivery'};
+  // Reutiliza a mesma lógica por chamada interna HTTP-less: replica apenas o formato esperado.
+  const orderId=safe(req.body.orderId); const action=safe(req.body.action).toLowerCase();
+  try{
+    const uid=req.auth.uid; await v42AssertDeliveryActive(uid); const order=await v42LoadOrder(orderId); const assigned=safe(order.deliveryUid); if(assigned&&assigned!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});
+    const mapAction={accept:'accept_delivery',reject:'reject_delivery',mark_picked_up:'mark_picked_up',start_route:'start_route',mark_arriving:'mark_arriving',verify_delivery_code:'verify_delivery_code',confirm_delivery:'confirm_delivery',archive:'archive'}; const normalized=mapAction[action]||action;
+    if(normalized==='reject_delivery'){
+      if(v42NormalizeStatus(order.status)!=='assigned')return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});
+      await db.ref(`orders_by_delivery/${uid}/${orderId}`).remove(); await v42WriteOrderState(orderId,order,'ready',uid,'delivery','reject_delivery',{deliveryUid:null}); await db.ref(`orders/${orderId}/deliveryUid`).remove(); return res.json({ok:true,orderId,status:'ready'});
+    }
+    // Implementacao direta das demais transicoes.
+    const status=v42NormalizeStatus(order.status); const transitions={accept_delivery:{from:['assigned'],to:'delivery_accepted'},mark_picked_up:{from:['delivery_accepted'],to:'picked_up'},start_route:{from:['picked_up'],to:'on_route'},mark_arriving:{from:['on_route'],to:'arriving'},confirm_delivery:{from:['arriving','on_route'],to:'delivered'},archive:{from:['delivered','cancelled','rejected'],to:'archived'}};
+    if(normalized==='verify_delivery_code'){
+      const typed=safe(req.body.code||req.body.deliveryCode).replace(/[^0-9A-Za-z]/g,''); const priv=map((await db.ref(`order_private/${orderId}`).get()).val()); const codeData=map(priv.deliveryCode||priv.deliveryConfirmation); const expected=safe(codeData.codeHash||priv.deliveryCodeHash||priv.confirmationCodeHash); if(!typed||!expected||stableHash(`${orderId}:${typed}`)!==expected)return res.status(422).json({ok:false,code:'DELIVERY_CODE_INVALID',message:'Código de entrega inválido.'}); await db.ref().update({[`orders/${orderId}/deliveryCodeVerified`]:true,[`order_private/${orderId}/deliveryCode/verified`]:true,[`order_private/${orderId}/deliveryCode/verifiedAtMs`]:nowMs()}); await v42WriteOrderState(orderId,order,'delivered',uid,'delivery','verify_delivery_code',{deliveryUid:uid,deliveryCodeVerified:true}); return res.json({ok:true,orderId,status:'delivered'});
+    }
+    const tr=transitions[normalized]; if(!tr)return res.status(422).json({ok:false,code:'INVALID_ACTION'}); if(!tr.from.includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION',status}); await v42WriteOrderState(orderId,order,tr.to,uid,'delivery',normalized,{deliveryUid:uid}); return res.json({ok:true,orderId,status:tr.to});
+  }catch(e){return publicError(res,e,'Não foi possível atualizar a entrega.');}
+});
+
+app.post('/v1/delivery/connections/request', requireUser, rateLimit('delivery-connection-request', 20, 60 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,storeId=safe(req.body?.storeId),code=safe(req.body?.publicCode).toUpperCase(),t=nowMs(); await assertSellerCanPublish(uid); if(!(await v42SellerOwnsStore(uid,storeId)))return res.status(403).json({ok:false,code:'STORE_ACCESS_DENIED'});
+    const codeSnap=await db.ref(`delivery_public_codes/${firebaseSafeKey(code)}`).get(); let deliveryUid=typeof codeSnap.val()==='string'?safe(codeSnap.val()):safe(map(codeSnap.val()).uid||map(codeSnap.val()).deliveryUid); if(!deliveryUid)return res.status(404).json({ok:false,code:'DELIVERY_NOT_FOUND'}); await v42AssertDeliveryActive(deliveryUid);
+    const connectionId=stableHash(`${storeId}:${deliveryUid}`).slice(0,32); const item={connectionId,storeId,deliveryUid,sellerUid:uid,status:'pending',requestedAtMs:t,updatedAtMs:t}; await db.ref().update({[`delivery_connections/${storeId}/${deliveryUid}`]:item,[`delivery_connections_by_user/${uid}/${connectionId}`]:item,[`delivery_connections_by_user/${deliveryUid}/${connectionId}`]:item}); await pushNotification(deliveryUid,{title:'Nova conexão de loja',body:'Uma loja quer conectar você como entregador.',type:'delivery_connection_request',data:{storeId,connectionId}}); return res.status(201).json({ok:true,connectionId,status:'pending'});
+  }catch(e){return publicError(res,e,'Não foi possível enviar a solicitação.');}
+});
+
+app.post('/v1/delivery/connections/respond', requireUser, rateLimit('delivery-connection-respond', 20, 60 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,storeId=safe(req.body?.storeId),action=safe(req.body?.action).toLowerCase(),t=nowMs(); await v42AssertDeliveryActive(uid); const ref=db.ref(`delivery_connections/${storeId}/${uid}`); const snap=await ref.get(); const item=map(snap.val()); if(!snap.exists())return res.status(404).json({ok:false,code:'CONNECTION_NOT_FOUND'}); if(!['accept','reject'].includes(action))return res.status(422).json({ok:false,code:'INVALID_ACTION'}); const status=action==='accept'?'active':'rejected'; const connectionId=safe(item.connectionId)||stableHash(`${storeId}:${uid}`).slice(0,32); const next={...item,connectionId,status,updatedAtMs:t}; await db.ref().update({[`delivery_connections/${storeId}/${uid}`]:next,[`delivery_connections_by_user/${safe(item.sellerUid)}/${connectionId}`]:next,[`delivery_connections_by_user/${uid}/${connectionId}`]:next}); return res.json({ok:true,connectionId,status});
+  }catch(e){return publicError(res,e,'Não foi possível responder à conexão.');}
+});
+
+app.post('/v1/delivery/connections/update', requireUser, rateLimit('delivery-connection-update', 20, 60 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,storeId=safe(req.body?.storeId),deliveryUid=safe(req.body?.deliveryUid),action=safe(req.body?.action).toLowerCase(),t=nowMs(); await assertSellerCanPublish(uid); if(!(await v42SellerOwnsStore(uid,storeId)))return res.status(403).json({ok:false,code:'STORE_ACCESS_DENIED'}); const snap=await db.ref(`delivery_connections/${storeId}/${deliveryUid}`).get(); const item=map(snap.val()); if(!snap.exists())return res.status(404).json({ok:false,code:'CONNECTION_NOT_FOUND'}); if(!['remove','cancel'].includes(action))return res.status(422).json({ok:false,code:'INVALID_ACTION'}); const status=action==='remove'?'removed':'cancelled'; const connectionId=safe(item.connectionId)||stableHash(`${storeId}:${deliveryUid}`).slice(0,32); const next={...item,status,updatedAtMs:t}; await db.ref().update({[`delivery_connections/${storeId}/${deliveryUid}`]:next,[`delivery_connections_by_user/${uid}/${connectionId}`]:next,[`delivery_connections_by_user/${deliveryUid}/${connectionId}`]:next}); return res.json({ok:true,connectionId,status});
+  }catch(e){return publicError(res,e,'Não foi possível atualizar a conexão.');}
+});
+
+app.post('/v1/reviews', requireUser, rateLimit('review-create', 8, 60 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,orderId=safe(req.body?.orderId),rating=integer(req.body?.rating,0),comment=clip(req.body?.comment,1200),t=nowMs(); if(rating<1||rating>5)return res.status(422).json({ok:false,code:'INVALID_RATING'}); const order=await v42LoadOrder(orderId); if(safe(order.buyerUid)!==uid)return res.status(403).json({ok:false,code:'BUYER_REQUIRED'}); if(v42NormalizeStatus(order.status)!=='delivered')return res.status(409).json({ok:false,code:'ORDER_NOT_DELIVERED'}); if(safe(order.review?.reviewId)||order.review?.submitted===true)return res.status(409).json({ok:false,code:'REVIEW_ALREADY_SUBMITTED'}); const reviewId=db.ref('reviews').push().key,productId=safe(order.productId||order.productSnapshot?.productId),sellerUid=safe(order.sellerUid),review={reviewId,orderId,productId,sellerUid,buyerUid:uid,rating,comment,status:'published',createdAtMs:t}; await db.ref().update({[`reviews/${reviewId}`]:review,[`reviews_by_product/${productId}/${reviewId}`]:{reviewId,rating,createdAtMs:t},[`reviews_by_seller/${sellerUid}/${reviewId}`]:{reviewId,rating,createdAtMs:t},[`orders/${orderId}/review`]:{reviewId,submitted:true,rating,createdAtMs:t}}); const statsRef=db.ref(`product_stats/${productId}`); await statsRef.transaction((raw)=>{const s=map(raw);const count=integer(s.ratingCount,0);const sum=finiteNumber(s.ratingSum,0);return {...s,ratingCount:count+1,ratingSum:sum+rating,ratingAverage:(sum+rating)/(count+1),updatedAtMs:t};},{applyLocally:false}); return res.status(201).json({ok:true,reviewId});
+  }catch(e){return publicError(res,e,'Não foi possível enviar a avaliação.');}
+});
+
+app.post('/api/orders/:orderId/confirm-delivery', requireUser, rateLimit('confirm-delivery-legacy', 20, 10 * 60 * 1000), async(req,res)=>{
+  try{const uid=req.auth.uid,orderId=safe(req.params.orderId),order=await v42LoadOrder(orderId);await v42AssertDeliveryActive(uid);if(safe(order.deliveryUid)!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});const status=v42NormalizeStatus(order.status);if(!['arriving','on_route'].includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});await v42WriteOrderState(orderId,order,'delivered',uid,'delivery','confirm_delivery',{deliveryUid:uid});return res.json({ok:true,orderId,status:'delivered'});}catch(e){return publicError(res,e,'Não foi possível confirmar a entrega.');}
+});
+
+
 async function expireBoosts() {
   const t =
     nowMs();
@@ -8809,7 +9620,7 @@ app.get(
     res.send(
       htmlPage(
         "FireRank API",
-        `Backend V${FIRERANK_SCHEMA_VERSION} online: autenticação, catálogo, endereços, mídia protegida e serviços digitais.`
+        `Backend V${FIRERANK_SCHEMA_VERSION} online: autenticação, catálogo, endereços, mídia Cloudinary protegida e serviços digitais.`
       )
     );
   }
@@ -8846,7 +9657,7 @@ app.get(
 
     const ready =
       databaseOk &&
-      !!resolvedStorageBucket &&
+      CLOUDINARY_CONFIGURED &&
       !!sharp &&
       mediaSecretConfigured &&
       mercadoPagoWebhookReady;
@@ -8865,16 +9676,16 @@ app.get(
             : databaseError,
         firebaseConfigured:
           !!FIREBASE_DATABASE_URL,
-        storageConfigured:
-          !!resolvedStorageBucket,
+        cloudinaryConfigured:
+          CLOUDINARY_CONFIGURED,
+        cloudinaryCloudName: CLOUDINARY_CLOUD_NAME,
+        firebaseStorageUsed: false,
         mediaProcessorConfigured:
           !!sharp,
         mediaTokenSecretConfigured:
           !!MEDIA_TOKEN_SECRET,
         publicBaseUrlConfigured,
         publicBaseUrl: APP_BASE_URL,
-        railwayDomainDetected:
-          !!RAILWAY_PUBLIC_DOMAIN,
         mercadoPagoConfigured:
           !!MP_ACCESS_TOKEN,
         mercadoPagoWebhookSecretConfigured:
@@ -9049,12 +9860,7 @@ async function start() {
       console.log(
         `FireRank API ${FIRERANK_SCHEMA_VERSION} online na porta ${PORT}`
       );
-      console.log(
-        `Railway public domain: ${
-          RAILWAY_PUBLIC_DOMAIN ||
-          "not_detected"
-        }`
-      );
+      console.log(`Public base URL: ${APP_BASE_URL}`);
       console.log(
         `App Check enforced: ${REQUIRE_APP_CHECK}`
       );
