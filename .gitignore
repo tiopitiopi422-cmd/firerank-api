@@ -36,3 +36,9 @@ backup*/
 coverage/
 .nyc_output/
 .cache/
+
+# FireRank private/local secrets - FIX11
+.env.local
+.env.*.local
+firebase-adminsdk*.json
+*.p12
