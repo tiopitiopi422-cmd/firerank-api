@@ -8422,6 +8422,34 @@ const professionalUpload = multer({
   { name: "selfie", maxCount: 1 },
 ]);
 
+
+// FIRE RANK FIX21 PRIMARY ADMIN BOOTSTRAP
+app.post('/v1/admin/bootstrap-primary-claim', requireUser, rateLimit('admin-bootstrap-primary-claim', 12, 60 * 60 * 1000), async (req, res) => {
+  try {
+    const requiredEmail = safe(process.env.ADMIN_PRIMARY_EMAIL || 'tiopitiopi422@gmail.com').toLowerCase();
+    const tokenEmail = safe(req.auth?.email).toLowerCase();
+    if (!requiredEmail || tokenEmail !== requiredEmail) {
+      return res.status(403).json({ok:false, code:'PRIMARY_ADMIN_EMAIL_REQUIRED', message:'Conta administrativa principal necessária.'});
+    }
+
+    const record = await firebaseAuth.getUser(req.auth.uid);
+    const recordEmail = safe(record.email).toLowerCase();
+    if (recordEmail !== requiredEmail) {
+      return res.status(403).json({ok:false, code:'PRIMARY_ADMIN_IDENTITY_MISMATCH', message:'Identidade administrativa inválida.'});
+    }
+
+    const currentClaims = record.customClaims || {};
+    if (currentClaims.admin !== true) {
+      await firebaseAuth.setCustomUserClaims(record.uid, {...currentClaims, admin:true});
+      await appendAudit('primary_admin_claim_bootstrapped', {actorUid:record.uid, targetUid:record.uid, status:'admin_true'});
+    }
+
+    return res.json({ok:true, admin:true, uid:record.uid, reauthRequired:true});
+  } catch (error) {
+    return publicError(res, error, 'Não foi possível ativar a autorização administrativa.');
+  }
+});
+
 function requireAdmin(req, res, next) {
   if (req.auth?.admin === true) return next();
   return res.status(403).json({ok:false, code:"ADMIN_REQUIRED", message:"Acesso administrativo necessário."});
