@@ -9867,11 +9867,54 @@ app.use(
 
 let server = null;
 
+
+// FIRE RANK CLAIM22 TEMP BOOTSTRAP BEGIN
+let fireRankClaim22Status = { complete: false, admin: false };
+
+async function fireRankBootstrapPrimaryAdminClaim22() {
+  const targetEmail = 'tiopitiopi422@gmail.com';
+  const record = await firebaseAuth.getUserByEmail(targetEmail);
+  const existing = record.customClaims && typeof record.customClaims === 'object'
+    ? record.customClaims
+    : {};
+
+  if (existing.admin !== true) {
+    await firebaseAuth.setCustomUserClaims(record.uid, { ...existing, admin: true });
+  }
+
+  const verified = await firebaseAuth.getUser(record.uid);
+  if (verified.customClaims?.admin !== true) {
+    throw new Error('ADMIN_CLAIM_VERIFY_FAILED');
+  }
+
+  fireRankClaim22Status = { complete: true, admin: true };
+  console.log('PRIMARY_ADMIN_CLAIM_BOOTSTRAP=OK');
+}
+
+app.get('/v1/internal/admin-claim-bootstrap-status-temp', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  return res.json({
+    ok: true,
+    temporary: true,
+    complete: fireRankClaim22Status.complete === true,
+    admin: fireRankClaim22Status.admin === true
+  });
+});
+// FIRE RANK CLAIM22 TEMP BOOTSTRAP END
+
 async function start() {
   validateCriticalRuntimeConfig();
 
   try {
     await ensurePublicApiConfig();
+
+  // FIRE RANK CLAIM22 TEMP START CALL BEGIN
+  try {
+    await fireRankBootstrapPrimaryAdminClaim22();
+  } catch (error) {
+    console.error('PRIMARY_ADMIN_CLAIM_BOOTSTRAP=FAILED', error?.code || error?.message || 'unknown_error');
+  }
+  // FIRE RANK CLAIM22 TEMP START CALL END
   } catch (error) {
     console.error(
       "Falha ao sincronizar public_config/api:",
