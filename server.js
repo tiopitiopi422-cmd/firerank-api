@@ -272,6 +272,10 @@ const configuredAllowedOrigins = String(
 
 const allowedOrigins = new Set(configuredAllowedOrigins);
 
+// FireRank Admin - Hosting oficial
+allowedOrigins.add("https://firerank-admin.web.app");
+allowedOrigins.add("https://firerank-admin.firebaseapp.com");
+
 if (isHttpsUrl(APP_BASE_URL)) {
   try {
     allowedOrigins.add(new URL(APP_BASE_URL).origin);
