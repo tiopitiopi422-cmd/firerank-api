@@ -188,7 +188,7 @@ function validateCriticalRuntimeConfig() {
     !isHttpsUrl(APP_BASE_URL)
   ) {
     console.warn(
-      "APP_BASE_URL ainda não é HTTPS. Defina APP_BASE_URL para o domínio público do Render antes de conectar o app."
+      "APP_BASE_URL ainda nÃ£o Ã© HTTPS. Defina APP_BASE_URL para o domÃ­nio pÃºblico do Render antes de conectar o app."
     );
   }
 
@@ -232,7 +232,7 @@ function parseServiceAccount() {
     raw = FIREBASE_SERVICE_ACCOUNT_JSON.trim();
   } else {
     throw new Error(
-      "Firebase não configurado. Defina FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 ou FIREBASE_SERVICE_ACCOUNT_JSON"
+      "Firebase nÃ£o configurado. Defina FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 ou FIREBASE_SERVICE_ACCOUNT_JSON"
     );
   }
 
@@ -247,7 +247,7 @@ function parseServiceAccount() {
 }
 
 if (!FIREBASE_DATABASE_URL) {
-  throw new Error("FIREBASE_DATABASE_URL não configurado");
+  throw new Error("FIREBASE_DATABASE_URL nÃ£o configurado");
 }
 
 const serviceAccount = parseServiceAccount();
@@ -272,6 +272,9 @@ const configuredAllowedOrigins = String(
 
 const allowedOrigins = new Set(configuredAllowedOrigins);
 
+// FireRank Admin - Hosting oficial
+allowedOrigins.add("https://firerank-admin.web.app");
+allowedOrigins.add("https://firerank-admin.firebaseapp.com");
 if (isHttpsUrl(APP_BASE_URL)) {
   try {
     allowedOrigins.add(new URL(APP_BASE_URL).origin);
@@ -281,7 +284,7 @@ if (isHttpsUrl(APP_BASE_URL)) {
 app.use(
   cors({
     origin(origin, callback) {
-      // Apps nativos, curl e chamadas servidor-servidor normalmente não enviam Origin.
+      // Apps nativos, curl e chamadas servidor-servidor normalmente nÃ£o enviam Origin.
       if (!origin) {
         return callback(null, true);
       }
@@ -290,7 +293,7 @@ app.use(
         return callback(null, true);
       }
 
-      // Em desenvolvimento, manter conveniência local. Em produção, fail closed.
+      // Em desenvolvimento, manter conveniÃªncia local. Em produÃ§Ã£o, fail closed.
       if (
         NODE_ENV !== "production" &&
         configuredAllowedOrigins.length === 0
@@ -486,7 +489,7 @@ async function requireUser(
           code:
             "AUTH_REQUIRED",
           message:
-            "Autenticação necessária.",
+            "AutenticaÃ§Ã£o necessÃ¡ria.",
         });
     }
 
@@ -514,7 +517,7 @@ async function requireUser(
           code:
             "FULL_ACCOUNT_REQUIRED",
           message:
-            "Use uma conta completa para esta ação.",
+            "Use uma conta completa para esta aÃ§Ã£o.",
         });
     }
 
@@ -540,7 +543,7 @@ async function requireUser(
         code:
           "INVALID_SESSION",
         message:
-          "Sessão inválida ou expirada.",
+          "SessÃ£o invÃ¡lida ou expirada.",
       });
   }
 }
@@ -560,7 +563,7 @@ function requireInternalSecret(
         code:
           "MAINTENANCE_SECRET_NOT_CONFIGURED",
         message:
-          "Manutenção interna não configurada.",
+          "ManutenÃ§Ã£o interna nÃ£o configurada.",
       });
   }
 
@@ -585,7 +588,7 @@ function requireInternalSecret(
         code:
           "INTERNAL_AUTH_REQUIRED",
         message:
-          "Não autorizado.",
+          "NÃ£o autorizado.",
       });
   }
 
@@ -692,7 +695,7 @@ async function pushNotification(
 async function ensurePublicApiConfig() {
   if (!isHttpsUrl(APP_BASE_URL) && NODE_ENV === "production") {
     console.warn(
-      "public_config/api não foi alterado: APP_BASE_URL público HTTPS ainda não está configurado."
+      "public_config/api nÃ£o foi alterado: APP_BASE_URL pÃºblico HTTPS ainda nÃ£o estÃ¡ configurado."
     );
     return false;
   }
@@ -830,7 +833,7 @@ async function assertSellerCanPublish(
       403;
 
     error.publicMessage =
-      "Sua conta ainda não está liberada para publicar produtos.";
+      "Sua conta ainda nÃ£o estÃ¡ liberada para publicar produtos.";
 
     throw error;
   }
@@ -876,7 +879,7 @@ async function resolveStoreForUser(
         403;
 
       error.publicMessage =
-        "Você não possui acesso a esta loja.";
+        "VocÃª nÃ£o possui acesso a esta loja.";
 
       throw error;
     }
@@ -927,7 +930,7 @@ async function resolveStoreForUser(
     422;
 
   error.publicMessage =
-    "Nenhuma loja válida foi encontrada para esta conta.";
+    "Nenhuma loja vÃ¡lida foi encontrada para esta conta.";
 
   throw error;
 }
@@ -1457,7 +1460,7 @@ async function processProductImage(
       503;
 
     error.publicMessage =
-      'O processador de imagens do servidor ainda não está instalado. Adicione o pacote "sharp".';
+      'O processador de imagens do servidor ainda nÃ£o estÃ¡ instalado. Adicione o pacote "sharp".';
 
     throw error;
   }
@@ -1491,7 +1494,7 @@ async function processProductImage(
       422;
 
     error.publicMessage =
-      "A imagem precisa ter resolução maior.";
+      "A imagem precisa ter resoluÃ§Ã£o maior.";
 
     throw error;
   }
@@ -1560,7 +1563,7 @@ function cloudinaryUploadBuffer(bytes, options = {}) {
   if (!CLOUDINARY_CONFIGURED) {
     const error = new Error("CLOUDINARY_NOT_CONFIGURED");
     error.statusCode = 503;
-    error.publicMessage = "O serviço de mídia ainda não está configurado.";
+    error.publicMessage = "O serviÃ§o de mÃ­dia ainda nÃ£o estÃ¡ configurado.";
     throw error;
   }
   return new Promise((resolve, reject) => {
@@ -2010,7 +2013,7 @@ function validateProductTitle(
       422;
 
     error.publicMessage =
-      "O título deve ter entre 3 e 120 caracteres.";
+      "O tÃ­tulo deve ter entre 3 e 120 caracteres.";
 
     throw error;
   }
@@ -2037,7 +2040,7 @@ function validateProductDescription(
       422;
 
     error.publicMessage =
-      "A descrição deve ter entre 10 e 5000 caracteres.";
+      "A descriÃ§Ã£o deve ter entre 10 e 5000 caracteres.";
 
     throw error;
   }
@@ -2068,7 +2071,7 @@ function validatePriceCents(
       422;
 
     error.publicMessage =
-      "Preço inválido.";
+      "PreÃ§o invÃ¡lido.";
 
     throw error;
   }
@@ -2098,7 +2101,7 @@ async function validateCategory(
       422;
 
     error.publicMessage =
-      "Selecione uma categoria válida.";
+      "Selecione uma categoria vÃ¡lida.";
 
     throw error;
   }
@@ -2128,7 +2131,7 @@ async function validateCategory(
       422;
 
     error.publicMessage =
-      "Esta categoria não está disponível.";
+      "Esta categoria nÃ£o estÃ¡ disponÃ­vel.";
 
     throw error;
   }
@@ -2155,7 +2158,7 @@ async function validateCategory(
       422;
 
     error.publicMessage =
-      "Esta categoria não aceita produtos locais.";
+      "Esta categoria nÃ£o aceita produtos locais.";
 
     throw error;
   }
@@ -2178,7 +2181,7 @@ async function validateCategory(
       422;
 
     error.publicMessage =
-      "Esta categoria não aceita produtos afiliados.";
+      "Esta categoria nÃ£o aceita produtos afiliados.";
 
     throw error;
   }
@@ -2228,7 +2231,7 @@ async function getStoreContext(
       404;
 
     error.publicMessage =
-      "Loja não encontrada.";
+      "Loja nÃ£o encontrada.";
 
     throw error;
   }
@@ -2265,7 +2268,7 @@ function validateStoreFeature(
       409;
 
     error.publicMessage =
-      "Produtos afiliados estão desativados nesta loja.";
+      "Produtos afiliados estÃ£o desativados nesta loja.";
 
     throw error;
   }
@@ -2286,7 +2289,7 @@ function validateStoreFeature(
       409;
 
     error.publicMessage =
-      "Produtos locais estão desativados nesta loja.";
+      "Produtos locais estÃ£o desativados nesta loja.";
 
     throw error;
   }
@@ -2361,7 +2364,7 @@ function validateAffiliateUrl(
       422;
 
     error.publicMessage =
-      "Informe um link afiliado HTTPS válido.";
+      "Informe um link afiliado HTTPS vÃ¡lido.";
 
     throw error;
   }
@@ -2405,7 +2408,7 @@ function validateAffiliateUrl(
       422;
 
     error.publicMessage =
-      "Links encurtados não são aceitos.";
+      "Links encurtados nÃ£o sÃ£o aceitos.";
 
     throw error;
   }
@@ -2432,7 +2435,7 @@ function validateAffiliateUrl(
       422;
 
     error.publicMessage =
-      "Este domínio afiliado ainda não está autorizado.";
+      "Este domÃ­nio afiliado ainda nÃ£o estÃ¡ autorizado.";
 
     throw error;
   }
@@ -2583,7 +2586,7 @@ async function resolveLocalAddress(
       422;
 
     error.publicMessage =
-      "Endereço inválido.";
+      "EndereÃ§o invÃ¡lido.";
 
     throw error;
   }
@@ -2616,7 +2619,7 @@ async function resolveLocalAddress(
       422;
 
     error.publicMessage =
-      "Salve e valide um endereço antes de publicar um produto local.";
+      "Salve e valide um endereÃ§o antes de publicar um produto local.";
 
     throw error;
   }
@@ -2641,7 +2644,7 @@ async function resolveLocalAddress(
       422;
 
     error.publicMessage =
-      "Complete cidade, estado e bairro do endereço.";
+      "Complete cidade, estado e bairro do endereÃ§o.";
 
     throw error;
   }
@@ -2691,7 +2694,7 @@ function validateLocalConfig(
       422;
 
     error.publicMessage =
-      "Tipo de produto local inválido.";
+      "Tipo de produto local invÃ¡lido.";
 
     throw error;
   }
@@ -2717,7 +2720,7 @@ function validateLocalConfig(
       422;
 
     error.publicMessage =
-      "Ative entrega, retirada ou as duas opções.";
+      "Ative entrega, retirada ou as duas opÃ§Ãµes.";
 
     throw error;
   }
@@ -2760,7 +2763,7 @@ function validateLocalConfig(
       422;
 
     error.publicMessage =
-      "Raio de entrega inválido.";
+      "Raio de entrega invÃ¡lido.";
 
     throw error;
   }
@@ -2779,7 +2782,7 @@ function validateLocalConfig(
       422;
 
     error.publicMessage =
-      "Taxa de entrega inválida.";
+      "Taxa de entrega invÃ¡lida.";
 
     throw error;
   }
@@ -2797,7 +2800,7 @@ function validateLocalConfig(
       422;
 
     error.publicMessage =
-      "Tempo de preparo inválido.";
+      "Tempo de preparo invÃ¡lido.";
 
     throw error;
   }
@@ -2849,7 +2852,7 @@ function validateLocalConfig(
         422;
 
       error.publicMessage =
-        "Estoque inicial inválido.";
+        "Estoque inicial invÃ¡lido.";
 
       throw error;
     }
@@ -2907,7 +2910,7 @@ function validateVariationDefinitions(
       422;
 
     error.publicMessage =
-      "Há variações demais neste produto.";
+      "HÃ¡ variaÃ§Ãµes demais neste produto.";
 
     throw error;
   }
@@ -2963,7 +2966,7 @@ function validateVariationDefinitions(
         422;
 
       error.publicMessage =
-        "Revise as variações do produto.";
+        "Revise as variaÃ§Ãµes do produto.";
 
       throw error;
     }
@@ -2983,7 +2986,7 @@ function validateVariationDefinitions(
         422;
 
       error.publicMessage =
-        "Há opções de variação demais.";
+        "HÃ¡ opÃ§Ãµes de variaÃ§Ã£o demais.";
 
       throw error;
     }
@@ -3042,7 +3045,7 @@ function cartesianVariantAttributes(
             422;
 
           error.publicMessage =
-            "As variações geram combinações demais. Reduza as opções.";
+            "As variaÃ§Ãµes geram combinaÃ§Ãµes demais. Reduza as opÃ§Ãµes.";
 
           throw error;
         }
@@ -3095,7 +3098,7 @@ function buildVariantsAndInventory({
         Object.values(
           attributes
         ).join(" / ") ||
-        "Padrão";
+        "PadrÃ£o";
 
       variants[variantId] = {
         variantId,
@@ -3527,7 +3530,7 @@ async function mediaForProductUpdate(
           403;
 
         error.publicMessage =
-          "Uma imagem existente não pertence a este produto.";
+          "Uma imagem existente nÃ£o pertence a este produto.";
 
         throw error;
       }
@@ -3616,7 +3619,7 @@ async function mediaForProductUpdate(
       422;
 
     error.publicMessage =
-      "Formato de imagem inválido.";
+      "Formato de imagem invÃ¡lido.";
 
     throw error;
   }
@@ -3631,7 +3634,7 @@ function publicError(
   res,
   error,
   fallback =
-    "Não foi possível concluir a operação."
+    "NÃ£o foi possÃ­vel concluir a operaÃ§Ã£o."
 ) {
   if (
     NODE_ENV !==
@@ -3707,7 +3710,7 @@ app.post(
         return res.status(503).json({
           ok: false,
           code: "CLOUDINARY_NOT_CONFIGURED",
-          message: "O serviço de mídia ainda não está configurado.",
+          message: "O serviÃ§o de mÃ­dia ainda nÃ£o estÃ¡ configurado.",
         });
       }
 
@@ -3724,7 +3727,7 @@ app.post(
         return res.status(422).json({
           ok: false,
           code: "INVALID_MEDIA_PURPOSE",
-          message: "Finalidade de mídia inválida.",
+          message: "Finalidade de mÃ­dia invÃ¡lida.",
         });
       }
 
@@ -3768,7 +3771,7 @@ app.post(
         expiresInSeconds: 300,
       });
     } catch (error) {
-      return publicError(res, error, "Não foi possível autorizar o upload.");
+      return publicError(res, error, "NÃ£o foi possÃ­vel autorizar o upload.");
     }
   }
 );
@@ -3780,7 +3783,7 @@ app.post(
   async (req, res) => {
     try {
       if (!CLOUDINARY_CONFIGURED || !CLOUDINARY_API_SECRET) {
-        return res.status(503).json({ok:false,code:"CLOUDINARY_NOT_CONFIGURED",message:"O serviço de mídia ainda não está configurado."});
+        return res.status(503).json({ok:false,code:"CLOUDINARY_NOT_CONFIGURED",message:"O serviÃ§o de mÃ­dia ainda nÃ£o estÃ¡ configurado."});
       }
       const uid=req.auth.uid;
       const purpose=safe(req.body?.purpose).toLowerCase();
@@ -3809,7 +3812,7 @@ app.post(
       }
       const secureUrl=purpose==="profile_image"?safe(resource.secure_url):"";
       return res.status(201).json({ok:true,mediaId:assetId,assetId,publicId:resource.public_id,type:expectedType,secureUrl});
-    }catch(error){return publicError(res,error,"Não foi possível confirmar a mídia.");}
+    }catch(error){return publicError(res,error,"NÃ£o foi possÃ­vel confirmar a mÃ­dia.");}
   }
 );
 
@@ -3875,7 +3878,7 @@ app.post(
             code:
               "UNSUPPORTED_MEDIA_TYPE",
             message:
-              "Formato de imagem não aceito.",
+              "Formato de imagem nÃ£o aceito.",
           });
       }
 
@@ -3944,7 +3947,7 @@ app.post(
       return publicError(
         res,
         error,
-        "Não foi possível processar a imagem."
+        "NÃ£o foi possÃ­vel processar a imagem."
       );
     }
   }
@@ -3997,7 +4000,7 @@ app.post(
           422;
 
         error.publicMessage =
-          "Tipo de produto inválido.";
+          "Tipo de produto invÃ¡lido.";
 
         throw error;
       }
@@ -4023,7 +4026,7 @@ app.post(
           409;
 
         error.publicMessage =
-          "Este tipo de produto está temporariamente desativado.";
+          "Este tipo de produto estÃ¡ temporariamente desativado.";
 
         throw error;
       }
@@ -4395,7 +4398,7 @@ app.post(
       return publicError(
         res,
         error,
-        "Não foi possível publicar o produto."
+        "NÃ£o foi possÃ­vel publicar o produto."
       );
     }
   }
@@ -4440,7 +4443,7 @@ app.post(
           400;
 
         error.publicMessage =
-          "Produto inválido.";
+          "Produto invÃ¡lido.";
 
         throw error;
       }
@@ -4464,7 +4467,7 @@ app.post(
           404;
 
         error.publicMessage =
-          "Produto não encontrado.";
+          "Produto nÃ£o encontrado.";
 
         throw error;
       }
@@ -4487,7 +4490,7 @@ app.post(
           403;
 
         error.publicMessage =
-          "Você não pode editar este produto.";
+          "VocÃª nÃ£o pode editar este produto.";
 
         throw error;
       }
@@ -4538,7 +4541,7 @@ app.post(
           409;
 
         error.publicMessage =
-          "Este produto usa um formato antigo ainda não suportado.";
+          "Este produto usa um formato antigo ainda nÃ£o suportado.";
 
         throw error;
       }
@@ -4883,7 +4886,7 @@ app.post(
       return publicError(
         res,
         error,
-        "Não foi possível atualizar o produto."
+        "NÃ£o foi possÃ­vel atualizar o produto."
       );
     }
   }
@@ -4973,7 +4976,7 @@ function validateAddressPayload(
     fullName.length < 3
   ) {
     throwAddress(
-      "Nome inválido."
+      "Nome invÃ¡lido."
     );
   }
 
@@ -4982,7 +4985,7 @@ function validateAddressPayload(
     phone.length > 15
   ) {
     throwAddress(
-      "Telefone inválido."
+      "Telefone invÃ¡lido."
     );
   }
 
@@ -4991,7 +4994,7 @@ function validateAddressPayload(
     cep.length !== 8
   ) {
     throwAddress(
-      "CEP inválido."
+      "CEP invÃ¡lido."
     );
   }
 
@@ -4999,13 +5002,13 @@ function validateAddressPayload(
     street.length < 2
   ) {
     throwAddress(
-      "Rua inválida."
+      "Rua invÃ¡lida."
     );
   }
 
   if (!number) {
     throwAddress(
-      "Número do endereço obrigatório."
+      "NÃºmero do endereÃ§o obrigatÃ³rio."
     );
   }
 
@@ -5013,7 +5016,7 @@ function validateAddressPayload(
     neighborhood.length < 2
   ) {
     throwAddress(
-      "Bairro inválido."
+      "Bairro invÃ¡lido."
     );
   }
 
@@ -5021,7 +5024,7 @@ function validateAddressPayload(
     city.length < 2
   ) {
     throwAddress(
-      "Cidade inválida."
+      "Cidade invÃ¡lida."
     );
   }
 
@@ -5062,7 +5065,7 @@ function validateAddressPayload(
     )
   ) {
     throwAddress(
-      "UF inválida."
+      "UF invÃ¡lida."
     );
   }
 
@@ -5195,7 +5198,7 @@ app.post(
           422;
 
         error.publicMessage =
-          "Esta tela gerencia o endereço principal.";
+          "Esta tela gerencia o endereÃ§o principal.";
 
         throw error;
       }
@@ -5293,7 +5296,7 @@ app.post(
       return publicError(
         res,
         error,
-        "Não foi possível salvar o endereço."
+        "NÃ£o foi possÃ­vel salvar o endereÃ§o."
       );
     }
   }
@@ -5599,7 +5602,7 @@ function show(
 if (!oobCode) {
   show(
     'err',
-    'Link inválido. Solicite uma nova recuperação no app.'
+    'Link invÃ¡lido. Solicite uma nova recuperaÃ§Ã£o no app.'
   );
 
   btn.disabled =
@@ -5641,7 +5644,7 @@ form.addEventListener(
     ) {
       return show(
         'err',
-        'As senhas não conferem.'
+        'As senhas nÃ£o conferem.'
       );
     }
 
@@ -5684,7 +5687,7 @@ form.addEventListener(
       ) {
         throw new Error(
           d.error ||
-          'Não foi possível redefinir a senha.'
+          'NÃ£o foi possÃ­vel redefinir a senha.'
         );
       }
 
@@ -5699,7 +5702,7 @@ form.addEventListener(
       show(
         'err',
         err.message ||
-        'Link expirado ou inválido.'
+        'Link expirado ou invÃ¡lido.'
       );
 
       btn.disabled =
@@ -5847,7 +5850,7 @@ function buildResetEmailHtml(
     </div>
 
     <div style="padding:24px;color:#111827">
-      <p>Recebemos uma solicitação para redefinir sua senha.</p>
+      <p>Recebemos uma solicitaÃ§Ã£o para redefinir sua senha.</p>
 
       <p>
         <a
@@ -5859,7 +5862,7 @@ function buildResetEmailHtml(
       </p>
 
       <p style="color:#5a6676;font-size:13px">
-        Se você não pediu essa alteração, ignore este e-mail.
+        Se vocÃª nÃ£o pediu essa alteraÃ§Ã£o, ignore este e-mail.
       </p>
     </div>
   </div>
@@ -5884,7 +5887,7 @@ async function sendPasswordResetEmail(
       "Redefina sua senha do FireRank",
 
     text:
-      `Redefina sua senha do FireRank: ${resetUrl}\n\nSe você não solicitou, ignore este e-mail.`,
+      `Redefina sua senha do FireRank: ${resetUrl}\n\nSe vocÃª nÃ£o solicitou, ignore este e-mail.`,
 
     html:
       buildResetEmailHtml(
@@ -5959,7 +5962,7 @@ app.post(
           .json({
             ok: false,
             error:
-              "Digite um e-mail válido.",
+              "Digite um e-mail vÃ¡lido.",
           });
       }
 
@@ -6010,7 +6013,7 @@ app.post(
           ok: true,
 
           message:
-            "Se existir uma conta com esse e-mail, enviaremos um link de recuperação.",
+            "Se existir uma conta com esse e-mail, enviaremos um link de recuperaÃ§Ã£o.",
         });
       }
 
@@ -6065,7 +6068,7 @@ app.post(
         ok: true,
 
         message:
-          "Se existir uma conta com esse e-mail, enviaremos um link de recuperação.",
+          "Se existir uma conta com esse e-mail, enviaremos um link de recuperaÃ§Ã£o.",
       });
     } catch (error) {
       console.error(
@@ -6079,7 +6082,7 @@ app.post(
           ok: false,
 
           error:
-            "Não foi possível enviar a recuperação agora. Tente novamente mais tarde.",
+            "NÃ£o foi possÃ­vel enviar a recuperaÃ§Ã£o agora. Tente novamente mais tarde.",
         });
     }
   }
@@ -6124,7 +6127,7 @@ app.post(
           .json({
             ok: false,
             error:
-              "Link inválido.",
+              "Link invÃ¡lido.",
           });
       }
 
@@ -6218,7 +6221,7 @@ app.post(
         );
 
       let friendly =
-        "Link expirado ou inválido. Solicite uma nova recuperação.";
+        "Link expirado ou invÃ¡lido. Solicite uma nova recuperaÃ§Ã£o.";
 
       if (
         apiError.includes(
@@ -6226,7 +6229,7 @@ app.post(
         )
       ) {
         friendly =
-          "A senha é muito fraca.";
+          "A senha Ã© muito fraca.";
       }
 
       if (
@@ -6244,7 +6247,7 @@ app.post(
         )
       ) {
         friendly =
-          "Esse link é inválido ou já foi usado.";
+          "Esse link Ã© invÃ¡lido ou jÃ¡ foi usado.";
       }
 
       return res
@@ -6265,7 +6268,7 @@ function ensureMP() {
     );
     error.statusCode = 503;
     error.publicMessage =
-      "Pagamento temporariamente indisponível.";
+      "Pagamento temporariamente indisponÃ­vel.";
     throw error;
   }
 
@@ -6278,7 +6281,7 @@ function ensureMP() {
     );
     error.statusCode = 503;
     error.publicMessage =
-      "Pagamento temporariamente indisponível.";
+      "Pagamento temporariamente indisponÃ­vel.";
     throw error;
   }
 
@@ -6291,7 +6294,7 @@ function ensureMP() {
     );
     error.statusCode = 503;
     error.publicMessage =
-      "Pagamento temporariamente indisponível.";
+      "Pagamento temporariamente indisponÃ­vel.";
     throw error;
   }
 }
@@ -6501,7 +6504,7 @@ async function readSubscriptionPlan(
     422;
 
   error.publicMessage =
-    "Plano de verificação inválido.";
+    "Plano de verificaÃ§Ã£o invÃ¡lido.";
 
   throw error;
 }
@@ -6524,7 +6527,7 @@ async function assertVerificationPurchaseEligible(
       409;
 
     error.publicMessage =
-      "Assinaturas verificadas ainda não estão liberadas.";
+      "Assinaturas verificadas ainda nÃ£o estÃ£o liberadas.";
 
     throw error;
   }
@@ -6576,7 +6579,7 @@ async function assertVerificationPurchaseEligible(
       403;
 
     error.publicMessage =
-      "Sua conta ainda não está elegível para assinar a verificação.";
+      "Sua conta ainda nÃ£o estÃ¡ elegÃ­vel para assinar a verificaÃ§Ã£o.";
 
     throw error;
   }
@@ -6660,7 +6663,7 @@ async function readBoostPlan(
       503;
 
     error.publicMessage =
-      "Os preços de Patrocinado ainda não foram configurados no servidor.";
+      "Os preÃ§os de Patrocinado ainda nÃ£o foram configurados no servidor.";
 
     throw error;
   }
@@ -6693,7 +6696,7 @@ async function readBoostPlan(
       422;
 
     error.publicMessage =
-      "Plano de Patrocinado indisponível.";
+      "Plano de Patrocinado indisponÃ­vel.";
 
     throw error;
   }
@@ -6814,7 +6817,7 @@ async function createPaymentPreference(
             "GOOGLE_PLAY_BILLING_REQUIRED",
 
           message:
-            "No Android, este serviço digital precisa usar o faturamento da Google Play.",
+            "No Android, este serviÃ§o digital precisa usar o faturamento da Google Play.",
         });
     }
 
@@ -6875,7 +6878,7 @@ async function createPaymentPreference(
           409;
 
         error.publicMessage =
-          "Este plano não está disponível.";
+          "Este plano nÃ£o estÃ¡ disponÃ­vel.";
 
         throw error;
       }
@@ -6948,7 +6951,7 @@ async function createPaymentPreference(
           409;
 
         error.publicMessage =
-          "Patrocinados estão temporariamente desativados.";
+          "Patrocinados estÃ£o temporariamente desativados.";
 
         throw error;
       }
@@ -6989,7 +6992,7 @@ async function createPaymentPreference(
           403;
 
         error.publicMessage =
-          "Você não pode patrocinar este produto.";
+          "VocÃª nÃ£o pode patrocinar este produto.";
 
         throw error;
       }
@@ -7008,7 +7011,7 @@ async function createPaymentPreference(
           409;
 
         error.publicMessage =
-          "Somente produtos públicos e ativos podem ser patrocinados.";
+          "Somente produtos pÃºblicos e ativos podem ser patrocinados.";
 
         throw error;
       }
@@ -7294,7 +7297,7 @@ async function createPaymentPreference(
     return publicError(
       res,
       error,
-      "Não foi possível iniciar o pagamento."
+      "NÃ£o foi possÃ­vel iniciar o pagamento."
     );
   }
 }
@@ -7450,7 +7453,7 @@ async function activateVerificationFromPayment(
         pushNotification(uid, {
           title: "Pagamento recebido",
           body:
-            "Seu pagamento foi recebido, mas a verificação precisa de revisão antes da ativação.",
+            "Seu pagamento foi recebido, mas a verificaÃ§Ã£o precisa de revisÃ£o antes da ativaÃ§Ã£o.",
           type: "verification_manual_review",
           data: { requestId },
         })
@@ -7535,9 +7538,9 @@ async function activateVerificationFromPayment(
     "verification-activated-notification",
     () =>
       pushNotification(uid, {
-        title: "Verificação ativada",
+        title: "VerificaÃ§Ã£o ativada",
         body:
-          "Seu pagamento foi validado e sua assinatura de verificação está ativa.",
+          "Seu pagamento foi validado e sua assinatura de verificaÃ§Ã£o estÃ¡ ativa.",
         type: "verification_activated",
         data: { requestId },
       })
@@ -7592,9 +7595,9 @@ async function activateBoostFromPayment(
       "boost-manual-review-notification",
       () =>
         pushNotification(uid, {
-          title: "Patrocinado aguardando revisão",
+          title: "Patrocinado aguardando revisÃ£o",
           body:
-            "O pagamento foi recebido, mas o produto não está público/ativo para iniciar o Patrocinado.",
+            "O pagamento foi recebido, mas o produto nÃ£o estÃ¡ pÃºblico/ativo para iniciar o Patrocinado.",
           type: "boost_manual_review",
           data: { requestId, productId },
         })
@@ -7687,7 +7690,7 @@ async function activateBoostFromPayment(
       pushNotification(uid, {
         title: "Patrocinado ativado",
         body:
-          "Seu pagamento foi validado e o produto já está na área de Patrocinados.",
+          "Seu pagamento foi validado e o produto jÃ¡ estÃ¡ na Ã¡rea de Patrocinados.",
         type: "boost_activated",
         data: { requestId, productId, boostId },
       })
@@ -7925,7 +7928,7 @@ async function revokeFulfillmentForPayment(
         "Pagamento revertido",
 
       body:
-        "Um pagamento foi revertido e o benefício digital relacionado foi desativado ou enviado para revisão.",
+        "Um pagamento foi revertido e o benefÃ­cio digital relacionado foi desativado ou enviado para revisÃ£o.",
 
       type:
         "payment_reversed",
@@ -8391,7 +8394,7 @@ async function handleMercadoPagoWebhook(
   }
 }
 
-// Mantido para compatibilidade. Em produção, também exige assinatura válida.
+// Mantido para compatibilidade. Em produÃ§Ã£o, tambÃ©m exige assinatura vÃ¡lida.
 app.get(
   "/api/mercadopago/webhook",
   (req, res) =>
@@ -8442,7 +8445,7 @@ function ageFromBirthDate(value) {
 }
 
 async function uploadIdentityFile(uid, role, applicationId, label, file) {
-  if (!file?.buffer?.length) throw Object.assign(new Error("DOCUMENT_REQUIRED"), {statusCode:422, publicMessage:"Envie todos os documentos obrigatórios."});
+  if (!file?.buffer?.length) throw Object.assign(new Error("DOCUMENT_REQUIRED"), {statusCode:422, publicMessage:"Envie todos os documentos obrigatÃ³rios."});
   const folder=`firerank/private/identity/${uid}/${role}/${applicationId}`;
   const result=await cloudinaryUploadBuffer(file.buffer,{folder, publicId:label, type:"authenticated"});
   return {provider:"cloudinary", publicId:result.public_id, version:result.version, resourceType:"image", type:"authenticated", bytes:result.bytes||file.size||0, format:result.format||""};
@@ -8453,7 +8456,7 @@ async function loadIdentityMediaAsset(uid, role, assetId, label) {
   if (!cleanId) {
     const error = new Error("DOCUMENT_REQUIRED");
     error.statusCode = 422;
-    error.publicMessage = "Envie todos os documentos obrigatórios.";
+    error.publicMessage = "Envie todos os documentos obrigatÃ³rios.";
     throw error;
   }
   const purpose = role === "seller" ? "seller_identity" : "delivery_identity";
@@ -8462,7 +8465,7 @@ async function loadIdentityMediaAsset(uid, role, assetId, label) {
   if (!snap.exists() || safe(asset.ownerUid) !== uid || safe(asset.purpose) !== purpose || safe(asset.status) !== "ready" || safe(asset.type) !== "authenticated") {
     const error = new Error("IDENTITY_MEDIA_INVALID");
     error.statusCode = 403;
-    error.publicMessage = "Um dos documentos enviados não pôde ser validado.";
+    error.publicMessage = "Um dos documentos enviados nÃ£o pÃ´de ser validado.";
     throw error;
   }
   return {
@@ -8476,8 +8479,8 @@ async function handleProfessionalApplication(role, req, res) {
   try {
     const uid=req.auth.uid; const body=req.body||{}; const t=nowMs();
     const age=ageFromBirthDate(body.birthDate);
-    if (age < 18) return res.status(422).json({ok:false,code:"AGE_NOT_ELIGIBLE",message:"É necessário ter 18 anos ou mais."});
-    if (!safe(body.fullName) || !safe(body.cpf) || !safe(body.phone) || !safe(body.city) || !safe(body.state)) return res.status(422).json({ok:false,code:"REQUIRED_FIELDS",message:"Preencha todos os dados obrigatórios."});
+    if (age < 18) return res.status(422).json({ok:false,code:"AGE_NOT_ELIGIBLE",message:"Ã‰ necessÃ¡rio ter 18 anos ou mais."});
+    if (!safe(body.fullName) || !safe(body.cpf) || !safe(body.phone) || !safe(body.city) || !safe(body.state)) return res.status(422).json({ok:false,code:"REQUIRED_FIELDS",message:"Preencha todos os dados obrigatÃ³rios."});
     if (!bool(body.termsAccepted) || !bool(body.dataProcessingAccepted)) return res.status(422).json({ok:false,code:"CONSENT_REQUIRED",message:"Aceite os termos e o tratamento de dados."});
     const appRef=db.ref(`application_history/${uid}/${role}`).push(); const applicationId=appRef.key;
     const files=req.files||{};
@@ -8506,7 +8509,7 @@ async function handleProfessionalApplication(role, req, res) {
     else { updates[`admin_delivery_requests/${uid}`]={...common,...roleData}; updates[`delivery_private_profiles/${uid}`]={...roleData,phone:common.phone,city:common.city,state:common.state,status:"pending",updatedAtMs:t}; }
     await db.ref().update(updates); await appendAudit(`${role}_application_submitted`,{actorUid:uid,targetUid:uid,referenceId:applicationId,status:"pending"});
     return res.status(201).json({ok:true,applicationId,status:"pending"});
-  } catch(e){ return publicError(res,e,"Não foi possível enviar o cadastro."); }
+  } catch(e){ return publicError(res,e,"NÃ£o foi possÃ­vel enviar o cadastro."); }
 }
 
 app.post("/v1/applications/seller", requireUser, rateLimit("seller-application",3,60*60*1000), professionalUpload, (req,res)=>handleProfessionalApplication("seller",req,res));
@@ -8525,7 +8528,7 @@ async function ensureDeliveryPublicCode(uid) {
   }
   const error = new Error("DELIVERY_CODE_GENERATION_FAILED");
   error.statusCode = 503;
-  error.publicMessage = "Não foi possível gerar o código público do entregador.";
+  error.publicMessage = "NÃ£o foi possÃ­vel gerar o cÃ³digo pÃºblico do entregador.";
   throw error;
 }
 
@@ -8537,7 +8540,7 @@ app.post("/v1/admin/applications/:role/:uid/decision", requireUser, requireAdmin
     const decisionMap={approve:"approved",approved:"approved",reject:"rejected",rejected:"rejected",suspend:"suspended",suspended:"suspended",reactivate:"reactivated",reactivated:"reactivated",reopen:"reopened",reopened:"reopened",under_review:"reopened",pending:"reopened"};
     const decision=decisionMap[rawDecision]||"";
     const t=nowMs();
-    if(!["seller","delivery"].includes(role)||!decision) return res.status(422).json({ok:false,code:"INVALID_DECISION",message:"Decisão administrativa inválida."});
+    if(!["seller","delivery"].includes(role)||!decision) return res.status(422).json({ok:false,code:"INVALID_DECISION",message:"DecisÃ£o administrativa invÃ¡lida."});
 
     const currentSnap=await db.ref(`current_applications/${role}/${uid}`).get();
     const cur=map(currentSnap.val());
@@ -8614,15 +8617,15 @@ app.post("/v1/admin/applications/:role/:uid/decision", requireUser, requireAdmin
     updates[`application_decisions/${uid}/${role}/${decisionRef.key}`]={decision,status,actorUid:req.auth.uid,applicationId:safe(cur.applicationId),reason:clip(req.body?.reason,500),createdAtMs:t};
     await db.ref().update(updates);
     await appendAudit(`${role}_${decision}`,{actorUid:req.auth.uid,targetUid:uid,referenceId:cur.applicationId||"",status});
-    await pushNotification(uid,{title:activating?"Cadastro aprovado":suspended?"Acesso suspenso":reopened?"Cadastro reaberto":"Cadastro analisado",body:activating?`Seu acesso de ${role==="seller"?"vendedor":"entregador"} foi liberado.`:suspended?"Seu acesso foi suspenso pela equipe FireRank.":reopened?"Seu cadastro voltou para análise.":"Sua solicitação não foi aprovada.",type:`${role}_${decision}`});
+    await pushNotification(uid,{title:activating?"Cadastro aprovado":suspended?"Acesso suspenso":reopened?"Cadastro reaberto":"Cadastro analisado",body:activating?`Seu acesso de ${role==="seller"?"vendedor":"entregador"} foi liberado.`:suspended?"Seu acesso foi suspenso pela equipe FireRank.":reopened?"Seu cadastro voltou para anÃ¡lise.":"Sua solicitaÃ§Ã£o nÃ£o foi aprovada.",type:`${role}_${decision}`});
     return res.json({ok:true,role,uid,status,decision});
-  }catch(e){return publicError(res,e,"Não foi possível concluir a análise.");}
+  }catch(e){return publicError(res,e,"NÃ£o foi possÃ­vel concluir a anÃ¡lise.");}
 });
 
 app.post("/v1/account/privacy", requireUser, rateLimit("account-privacy",12,60*60*1000), async(req,res)=>{
   try{
     const uid=req.auth.uid, visibility=safe(req.body?.visibility).toLowerCase(), t=nowMs();
-    if(!["public","private"].includes(visibility)) return res.status(422).json({ok:false,code:"INVALID_VISIBILITY",message:"Privacidade inválida."});
+    if(!["public","private"].includes(visibility)) return res.status(422).json({ok:false,code:"INVALID_VISIBILITY",message:"Privacidade invÃ¡lida."});
 
     const updates={
       [`account_visibility/${uid}`]:visibility,
@@ -8671,14 +8674,14 @@ app.post("/v1/account/privacy", requireUser, rateLimit("account-privacy",12,60*6
     await db.ref().update(updates);
     await appendAudit("account_privacy_changed",{actorUid:uid,targetUid:uid,status:visibility});
     return res.json({ok:true,visibility});
-  }catch(e){return publicError(res,e,"Não foi possível alterar a privacidade.");}
+  }catch(e){return publicError(res,e,"NÃ£o foi possÃ­vel alterar a privacidade.");}
 });
 
 app.post("/v1/support/chat", requireUser, rateLimit("support-chat",15,60*60*1000), async(req,res)=>{
   try{
     const uid=req.auth.uid,t=nowMs(); const ent=map((await db.ref(`entitlements/${uid}`).get()).val());
     const active=ent.subscriptionActive===true && (!finiteNumber(ent.expiresAtMs,0)||finiteNumber(ent.expiresAtMs,0)>t); const plan=safe(ent.verifiedPlan).replace(/^verified_/,"").toLowerCase();
-    if(!active || !["plus","pro"].includes(plan)) return res.status(403).json({ok:false,code:"SUPPORT_ENTITLEMENT_REQUIRED",message:"O chat humano é exclusivo dos planos Plus e Pro."});
+    if(!active || !["plus","pro"].includes(plan)) return res.status(403).json({ok:false,code:"SUPPORT_ENTITLEMENT_REQUIRED",message:"O chat humano Ã© exclusivo dos planos Plus e Pro."});
     const existing=safe((await db.ref(`support_active_by_user/${uid}`).get()).val()); const chatId=existing||`support_${uid}`; const otherUid="firerank_support";
     const priority=plan==="pro"?"highest":"priority";
     await db.ref().update({
@@ -8689,41 +8692,41 @@ app.post("/v1/support/chat", requireUser, rateLimit("support-chat",15,60*60*1000
       [`support_active_by_user/${uid}`]:chatId,
     });
     return res.json({ok:true,chatId,otherUid,priority});
-  }catch(e){return publicError(res,e,"Não foi possível abrir o atendimento.");}
+  }catch(e){return publicError(res,e,"NÃ£o foi possÃ­vel abrir o atendimento.");}
 });
 
 app.post("/v1/ai/v2/chat", requireUser, rateLimit("gemini-chat",30,60*60*1000), async(req,res)=>{
   try{
-    if(!GEMINI_API_KEY || !GEMINI_MODEL) return res.status(503).json({ok:false,code:"AI_NOT_CONFIGURED",message:"A IA ainda não está configurada."});
+    if(!GEMINI_API_KEY || !GEMINI_MODEL) return res.status(503).json({ok:false,code:"AI_NOT_CONFIGURED",message:"A IA ainda nÃ£o estÃ¡ configurada."});
     const uid=req.auth.uid,t=nowMs(); const message=clip(req.body?.message||req.body?.text,6000); if(!message) return res.status(422).json({ok:false,code:"MESSAGE_REQUIRED"});
     const ent=map((await db.ref(`entitlements/${uid}`).get()).val()); let quota=20; const plan=safe(ent.verifiedPlan).replace(/^verified_/,"").toLowerCase(); if(ent.subscriptionActive===true){if(plan==="plus")quota=100;if(plan==="pro")quota=300;}
-    const day=new Date().toISOString().slice(0,10); const usageRef=db.ref(`ai_usage/${uid}/${day}`); const usage=map((await usageRef.get()).val()); const used=integer(usage.messages,0); if(used>=quota) return res.status(429).json({ok:false,code:"AI_DAILY_QUOTA",message:"Sua cota diária de IA foi atingida.",quota,used});
+    const day=new Date().toISOString().slice(0,10); const usageRef=db.ref(`ai_usage/${uid}/${day}`); const usage=map((await usageRef.get()).val()); const used=integer(usage.messages,0); if(used>=quota) return res.status(429).json({ok:false,code:"AI_DAILY_QUOTA",message:"Sua cota diÃ¡ria de IA foi atingida.",quota,used});
     const history=Array.isArray(req.body?.history)?req.body.history.slice(-6):[];
     const contents=[...history.map(x=>({role:safe(x.role)==="assistant"?"model":"user",parts:[{text:clip(x.text,3000)}]})),{role:"user",parts:[{text:message}]}];
     const url=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-    const gr=await axios.post(url,{contents,systemInstruction:{parts:[{text:"Você é o FireRank AI. Ajude usuários do aplicativo FireRank com respostas úteis e seguras. Nunca afirme ter alterado pagamentos, permissões, cadastros ou banco de dados. Não peça nem exponha segredos."}]},generationConfig:{temperature:0.5,maxOutputTokens:900}},{timeout:30000});
-    const answer=safe(gr.data?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n"))||"Não consegui gerar uma resposta agora.";
+    const gr=await axios.post(url,{contents,systemInstruction:{parts:[{text:"VocÃª Ã© o FireRank AI. Ajude usuÃ¡rios do aplicativo FireRank com respostas Ãºteis e seguras. Nunca afirme ter alterado pagamentos, permissÃµes, cadastros ou banco de dados. NÃ£o peÃ§a nem exponha segredos."}]},generationConfig:{temperature:0.5,maxOutputTokens:900}},{timeout:30000});
+    const answer=safe(gr.data?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n"))||"NÃ£o consegui gerar uma resposta agora.";
     await usageRef.set({messages:used+1,quota,plan:plan||"normal",updatedAtMs:t});
     return res.json({ok:true,text:answer,answer,usage:{used:used+1,quota}});
-  }catch(e){return publicError(res,e,"A IA não conseguiu responder agora.");}
+  }catch(e){return publicError(res,e,"A IA nÃ£o conseguiu responder agora.");}
 });
 
 app.post("/v1/analytics/banner", rateLimit("banner-analytics",120,60*60*1000), async(req,res)=>{
-  try{const bannerId=clip(req.body?.bannerId,160),event=clip(req.body?.event||req.body?.type,40);if(!bannerId||!["impression","click"].includes(event))return res.status(422).json({ok:false});const ref=db.ref("home_banner_events").push();await ref.set({eventId:ref.key,bannerId,event,createdAtMs:nowMs(),clientPlatform:clip(req.body?.clientPlatform,40)});return res.status(202).json({ok:true});}catch(e){return publicError(res,e,"Evento não registrado.");}
+  try{const bannerId=clip(req.body?.bannerId,160),event=clip(req.body?.event||req.body?.type,40);if(!bannerId||!["impression","click"].includes(event))return res.status(422).json({ok:false});const ref=db.ref("home_banner_events").push();await ref.set({eventId:ref.key,bannerId,event,createdAtMs:nowMs(),clientPlatform:clip(req.body?.clientPlatform,40)});return res.status(202).json({ok:true});}catch(e){return publicError(res,e,"Evento nÃ£o registrado.");}
 });
 
 
 
 
-// Conta oficial e benefícios por contrato são conceitos separados.
-// O badge oficial sai em public_badges; Pro por contrato é opcional e auditável.
+// Conta oficial e benefÃ­cios por contrato sÃ£o conceitos separados.
+// O badge oficial sai em public_badges; Pro por contrato Ã© opcional e auditÃ¡vel.
 app.post('/v1/admin/official-accounts/grant', requireUser, requireAdmin, rateLimit('admin-official-grant', 30, 60 * 60 * 1000), async(req,res)=>{
   try{
     const adminUid=req.auth.uid,body=map(req.body),uid=safe(body.uid),t=nowMs();
     if(!uid)return res.status(422).json({ok:false,code:'UID_REQUIRED'});
     const [pubSnap,userSnap,entSnap]=await Promise.all([db.ref(`public_users/${uid}`).get(),db.ref(`users/${uid}`).get(),db.ref(`entitlements/${uid}`).get()]);
     const user={...map(userSnap.val()),...map(pubSnap.val())};
-    if(!pubSnap.exists()&&!userSnap.exists())return res.status(404).json({ok:false,code:'USER_NOT_FOUND',message:'Conta não encontrada.'});
+    if(!pubSnap.exists()&&!userSnap.exists())return res.status(404).json({ok:false,code:'USER_NOT_FOUND',message:'Conta nÃ£o encontrada.'});
     const grantRef=db.ref(`partner_contracts/${uid}`).push(); const grantId=grantRef.key;
     const grantPro=bool(body.grantPro); const plan=grantPro?'pro':'normal'; const previousEntitlement=map(entSnap.val());
     const partnerName=clip(body.partnerName||user.displayName||user.username,120);
@@ -8738,7 +8741,7 @@ app.post('/v1/admin/official-accounts/grant', requireUser, requireAdmin, rateLim
     }
     await db.ref().update(updates); await appendAudit('official_account_granted',{actorUid:adminUid,targetUid:uid,referenceId:grantId,status:'active'});
     return res.status(201).json({ok:true,uid,grantId,official:true,proGranted:grantPro});
-  }catch(e){return publicError(res,e,'Não foi possível conceder a conta oficial.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel conceder a conta oficial.');}
 });
 
 app.post('/v1/admin/official-accounts/revoke', requireUser, requireAdmin, rateLimit('admin-official-revoke', 30, 60 * 60 * 1000), async(req,res)=>{
@@ -8755,11 +8758,11 @@ app.post('/v1/admin/official-accounts/revoke', requireUser, requireAdmin, rateLi
     if(safe(current.source)==='admin_contract_grant'&&safe(current.sourceGrantId)===grantId){updates[`entitlements/${uid}`]=Object.keys(previous).length?previous:{verifiedBadge:false,verifiedPlan:'normal',subscriptionActive:false,expiresAtMs:t,permanent:false,contractGrantActive:false,source:'admin_contract_revoked',updatedAtMs:t};}
     await db.ref().update(updates); await appendAudit('official_account_revoked',{actorUid:adminUid,targetUid:uid,referenceId:grantId,status:'revoked'});
     return res.json({ok:true,uid,grantId});
-  }catch(e){return publicError(res,e,'Não foi possível revogar a conta oficial.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel revogar a conta oficial.');}
 });
 
 // ============================================================================
-// FireRank production closure V4.2 — rotas esperadas pelo Flutter atual.
+// FireRank production closure V4.2 â€” rotas esperadas pelo Flutter atual.
 // Mantem Render como backend oficial e Firebase RTDB como persistencia.
 // ============================================================================
 
@@ -8812,7 +8815,7 @@ async function v42AssertDeliveryActive(uid) {
   if (roleSnap.val() !== true || state.active !== true || state.accessEnabled !== true || eligibility.canDeliver !== true || eligibility.needsAgeReview === true) {
     const error = new Error('DELIVERY_NOT_ELIGIBLE');
     error.statusCode = 403;
-    error.publicMessage = 'Seu acesso de entregador não está ativo.';
+    error.publicMessage = 'Seu acesso de entregador nÃ£o estÃ¡ ativo.';
     throw error;
   }
 }
@@ -8832,7 +8835,7 @@ async function v42LoadOrder(orderId) {
   if (!snap.exists()) {
     const error = new Error('ORDER_NOT_FOUND');
     error.statusCode = 404;
-    error.publicMessage = 'Pedido não encontrado.';
+    error.publicMessage = 'Pedido nÃ£o encontrado.';
     throw error;
   }
   return map(snap.val());
@@ -8907,7 +8910,7 @@ app.post('/v1/account/guest-merge', requireUser, rateLimit('guest-merge', 10, 10
     if (Object.keys(updates).length) await db.ref().update(updates);
     await appendAudit('guest_state_merged', { actorUid: uid, targetUid: uid, status: 'ok' });
     return res.json({ ok: true, cartMerged, favoritesMerged });
-  } catch (e) { return publicError(res, e, 'Não foi possível sincronizar o modo visitante.'); }
+  } catch (e) { return publicError(res, e, 'NÃ£o foi possÃ­vel sincronizar o modo visitante.'); }
 });
 
 app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 * 60 * 1000), async (req, res) => {
@@ -8919,14 +8922,14 @@ app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 
     const bio = clip(body.bio, 500);
     const profileLink = safe(body.profileLink);
     const removePhoto = bool(body.removePhoto);
-    if (!/^[a-z][a-z0-9._]{2,19}$/.test(username)) return res.status(422).json({ ok:false, code:'INVALID_USERNAME', message:'Username inválido.' });
-    if (!displayName) return res.status(422).json({ ok:false, code:'DISPLAY_NAME_REQUIRED', message:'Nome obrigatório.' });
-    if (profileLink && !isHttpsUrl(profileLink)) return res.status(422).json({ ok:false, code:'INVALID_PROFILE_LINK', message:'Use um link HTTPS válido.' });
+    if (!/^[a-z][a-z0-9._]{2,19}$/.test(username)) return res.status(422).json({ ok:false, code:'INVALID_USERNAME', message:'Username invÃ¡lido.' });
+    if (!displayName) return res.status(422).json({ ok:false, code:'DISPLAY_NAME_REQUIRED', message:'Nome obrigatÃ³rio.' });
+    if (profileLink && !isHttpsUrl(profileLink)) return res.status(422).json({ ok:false, code:'INVALID_PROFILE_LINK', message:'Use um link HTTPS vÃ¡lido.' });
     const current = map((await db.ref(`user_profiles/${uid}`).get()).val());
     const oldUsername = safe(current.username).toLowerCase();
     const indexRef = db.ref(`username_index/${firebaseSafeKey(username)}`);
     const tx = await indexRef.transaction((value) => (!value || value === uid ? uid : value), { applyLocally:false });
-    if (!tx.committed || tx.snapshot.val() !== uid) return res.status(409).json({ ok:false, code:'USERNAME_TAKEN', message:'Esse username já está em uso.' });
+    if (!tx.committed || tx.snapshot.val() !== uid) return res.status(409).json({ ok:false, code:'USERNAME_TAKEN', message:'Esse username jÃ¡ estÃ¡ em uso.' });
     const t = nowMs();
     let photoUrl = safe(current.photoUrl);
     if (removePhoto) photoUrl = '';
@@ -8934,7 +8937,7 @@ app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 
     if (profileMediaId) {
       let media = map((await db.ref(`media_assets/${uid}/${profileMediaId}`).get()).val());
       if (!safe(media.assetId)) media = map((await db.ref(`media_assets/${profileMediaId}`).get()).val());
-      if (safe(media.ownerUid) !== uid || safe(media.purpose) !== 'profile_image') return res.status(403).json({ok:false,code:'PROFILE_MEDIA_INVALID',message:'Foto inválida.'});
+      if (safe(media.ownerUid) !== uid || safe(media.purpose) !== 'profile_image') return res.status(403).json({ok:false,code:'PROFILE_MEDIA_INVALID',message:'Foto invÃ¡lida.'});
       if (safe(media.type) === 'upload') {
         photoUrl = cloudinary.url(safe(media.publicId), {resource_type:'image',type:'upload',secure:true,transformation:[{width:400,height:400,crop:'fill',gravity:'face',quality:'auto',fetch_format:'auto'}]});
       } else {
@@ -8952,13 +8955,13 @@ app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 
     await firebaseAuth.updateUser(uid, { displayName, photoURL: photoUrl || null });
     await appendAudit('profile_updated', { actorUid: uid, targetUid: uid, status:'ok' });
     return res.json({ ok:true, profile });
-  } catch (e) { return publicError(res, e, 'Não foi possível salvar o perfil.'); }
+  } catch (e) { return publicError(res, e, 'NÃ£o foi possÃ­vel salvar o perfil.'); }
 });
 
 app.post('/v1/account/delete-request', requireUser, rateLimit('account-delete-request', 3, 24 * 60 * 60 * 1000), async (req, res) => {
   try {
     const uid = req.auth.uid;
-    if (req.body?.confirmation !== true) return res.status(422).json({ok:false,code:'CONFIRMATION_REQUIRED',message:'Confirme a exclusão.'});
+    if (req.body?.confirmation !== true) return res.status(422).json({ok:false,code:'CONFIRMATION_REQUIRED',message:'Confirme a exclusÃ£o.'});
     const t = nowMs();
     const ref = db.ref(`account_deletion_requests/${uid}`).push();
     const requestId = ref.key;
@@ -8966,7 +8969,7 @@ app.post('/v1/account/delete-request', requireUser, rateLimit('account-delete-re
     await db.ref(`account_state/${uid}`).update({ deletionRequested:true, deletionRequestId:requestId, updatedAtMs:t });
     await appendAudit('account_deletion_requested', { actorUid:uid, targetUid:uid, referenceId:requestId, status:'requested' });
     return res.status(202).json({ok:true,requestId,status:'requested'});
-  } catch (e) { return publicError(res, e, 'Não foi possível registrar a exclusão.'); }
+  } catch (e) { return publicError(res, e, 'NÃ£o foi possÃ­vel registrar a exclusÃ£o.'); }
 });
 
 app.post('/v1/account/export', requireUser, rateLimit('account-export', 3, 60 * 60 * 1000), async (req, res) => {
@@ -8980,7 +8983,7 @@ app.post('/v1/account/export', requireUser, rateLimit('account-export', 3, 60 * 
     const t = nowMs();
     await ref.set({ requestId, uid, status:'completed_inline', createdAtMs:t, completedAtMs:t, immutable:true });
     return res.json({ok:true,requestId,generatedAtMs:t,data});
-  } catch (e) { return publicError(res, e, 'Não foi possível gerar a exportação.'); }
+  } catch (e) { return publicError(res, e, 'NÃ£o foi possÃ­vel gerar a exportaÃ§Ã£o.'); }
 });
 
 app.get('/v1/boost/catalog', requireUser, rateLimit('boost-catalog', 60, 10 * 60 * 1000), async (_req, res) => {
@@ -8990,7 +8993,7 @@ app.get('/v1/boost/catalog', requireUser, rateLimit('boost-catalog', 60, 10 * 60
     if (!Object.keys(map(raw)).length) raw = map((await db.ref('public_config/boostCatalog').get()).val());
     const plans = Object.entries(map(raw)).map(([id, value]) => ({ id, ...map(value) })).filter((x) => integer(x.days,0) > 0 && integer(x.priceCents,0) > 0).slice(0,20);
     return res.json({ok:true,plans});
-  } catch (e) { return publicError(res,e,'Não foi possível carregar os Patrocinados.'); }
+  } catch (e) { return publicError(res,e,'NÃ£o foi possÃ­vel carregar os Patrocinados.'); }
 });
 
 app.post('/v1/chats/start', requireUser, rateLimit('chat-start', 30, 10 * 60 * 1000), async (req,res) => {
@@ -9006,7 +9009,7 @@ app.post('/v1/chats/start', requireUser, rateLimit('chat-start', 30, 10 * 60 * 1
       [`chats_by_user/${otherUid}/${chatId}`]:{chatId,type,productId,otherUid:uid,updatedAtMs:t,lastMessageAtMs:t},
     });
     return res.json({ok:true,chatId,otherUid});
-  }catch(e){return publicError(res,e,'Não foi possível iniciar a conversa.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel iniciar a conversa.');}
 });
 
 app.post('/v1/reports', requireUser, rateLimit('report-create', 10, 60 * 60 * 1000), async(req,res)=>{
@@ -9017,7 +9020,7 @@ app.post('/v1/reports', requireUser, rateLimit('report-create', 10, 60 * 60 * 10
     await ref.set({reportId,reporterUid:uid,targetType,targetId,reason,description,status:'open',createdAtMs:t,updatedAtMs:t});
     await appendAudit('report_created',{actorUid:uid,referenceId:reportId,status:'open'});
     return res.status(201).json({ok:true,reportId});
-  }catch(e){return publicError(res,e,'Não foi possível enviar a denúncia.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel enviar a denÃºncia.');}
 });
 
 app.post('/v1/products/event', rateLimit('product-event', 180, 60 * 60 * 1000), async(req,res)=>{
@@ -9029,7 +9032,7 @@ app.post('/v1/products/event', rateLimit('product-event', 180, 60 * 60 * 1000), 
     const statKey=event==='view'?'views':event==='affiliate_click'?'affiliateClicks':event==='share'?'shares':'favorites';
     await db.ref(`product_stats/${productId}/${statKey}`).transaction((v)=>integer(v,0)+1,{applyLocally:false});
     return res.status(202).json({ok:true});
-  }catch(e){return publicError(res,e,'Evento não registrado.');}
+  }catch(e){return publicError(res,e,'Evento nÃ£o registrado.');}
 });
 
 app.post('/v1/products/action', requireUser, rateLimit('product-action', 30, 10 * 60 * 1000), async(req,res)=>{
@@ -9054,7 +9057,7 @@ app.post('/v1/products/action', requireUser, rateLimit('product-action', 30, 10 
     }
     await db.ref().update(updates); await appendAudit(`product_${action}`,{actorUid:uid,targetUid:uid,referenceId:productId,status:nextStatus});
     return res.json({ok:true,productId,status:nextStatus});
-  }catch(e){return publicError(res,e,'Não foi possível atualizar o produto.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel atualizar o produto.');}
 });
 
 app.post('/v1/orders', requireUser, rateLimit('order-create', 12, 10 * 60 * 1000), async(req,res)=>{
@@ -9072,7 +9075,7 @@ app.post('/v1/orders', requireUser, rateLimit('order-create', 12, 10 * 60 * 1000
     const addressKey=safe(body.addressKey||'primary'); let address={};
     if(fulfillmentType==='delivery'){
       const addressSnap=await db.ref(`user_addresses/${uid}/${addressKey}`).get(); address=map(addressSnap.val());
-      if(!addressSnap.exists()||!safe(address.city)||!safe(address.state))return res.status(422).json({ok:false,code:'ADDRESS_REQUIRED',message:'Cadastre um endereço válido.'});
+      if(!addressSnap.exists()||!safe(address.city)||!safe(address.state))return res.status(422).json({ok:false,code:'ADDRESS_REQUIRED',message:'Cadastre um endereÃ§o vÃ¡lido.'});
     }
     const deliveryFeeCents=fulfillmentType==='delivery'?Math.max(0,integer(local.deliveryFeeCents,0)):0; const productAmountCents=unitPriceCents*quantity; const totalCents=productAmountCents+deliveryFeeCents;
     const orderId=db.ref('orders').push().key; const code=String(crypto.randomInt(100000,999999)); const codeHash=stableHash(`${orderId}:${code}`);
@@ -9085,9 +9088,9 @@ app.post('/v1/orders', requireUser, rateLimit('order-create', 12, 10 * 60 * 1000
       [`buyer_orders/${uid}/${orderId}`]:{orderId,status:'sent',updatedAtMs:t},
     };
     await db.ref().update(updates); await appendAudit('order_created',{actorUid:uid,targetUid:sellerUid,referenceId:orderId,status:'sent'});
-    await pushNotification(sellerUid,{title:'Novo pedido',body:`Você recebeu um novo pedido de ${clip(product.title,80)}.`,type:'order_created',data:{orderId,productId}});
+    await pushNotification(sellerUid,{title:'Novo pedido',body:`VocÃª recebeu um novo pedido de ${clip(product.title,80)}.`,type:'order_created',data:{orderId,productId}});
     return res.status(201).json({ok:true,orderId,status:'sent'});
-  }catch(e){return publicError(res,e,'Não foi possível criar o pedido.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel criar o pedido.');}
 });
 
 app.post('/v1/orders/action', requireUser, rateLimit('order-action', 40, 10 * 60 * 1000), async(req,res)=>{
@@ -9108,26 +9111,26 @@ app.post('/v1/orders/action', requireUser, rateLimit('order-action', 40, 10 * 60
       if(typeof codeSnap.val()==='string')deliveryUid=safe(codeSnap.val());else deliveryUid=safe(map(codeSnap.val()).uid||map(codeSnap.val()).deliveryUid);
       if(!deliveryUid)return res.status(404).json({ok:false,code:'DELIVERY_NOT_FOUND'});
       const connection=map((await db.ref(`delivery_connections/${storeId}/${deliveryUid}`).get()).val()); if(!['active','accepted'].includes(safe(connection.status).toLowerCase()))return res.status(403).json({ok:false,code:'DELIVERY_NOT_CONNECTED'});
-      await v42WriteOrderState(orderId,order,'assigned',uid,'seller',action,{deliveryUid}); await pushNotification(deliveryUid,{title:'Nova entrega',body:'Uma loja conectada enviou um pedido para você.',type:'delivery_assigned',data:{orderId}}); return res.json({ok:true,orderId,status:'assigned',deliveryUid});
+      await v42WriteOrderState(orderId,order,'assigned',uid,'seller',action,{deliveryUid}); await pushNotification(deliveryUid,{title:'Nova entrega',body:'Uma loja conectada enviou um pedido para vocÃª.',type:'delivery_assigned',data:{orderId}}); return res.json({ok:true,orderId,status:'assigned',deliveryUid});
     }
     if(action==='verify_delivery_code'){
       if(actorRole!=='delivery'||!['arriving','on_route'].includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});
       const typed=safe(req.body?.code||req.body?.deliveryCode).replace(/[^0-9A-Za-z]/g,''); const priv=map((await db.ref(`order_private/${orderId}`).get()).val()); const codeData=map(priv.deliveryCode||priv.deliveryConfirmation); const expected=safe(codeData.codeHash||priv.deliveryCodeHash||priv.confirmationCodeHash);
-      if(!typed||!expected||stableHash(`${orderId}:${typed}`)!==expected)return res.status(422).json({ok:false,code:'DELIVERY_CODE_INVALID',message:'Código de entrega inválido.'});
-      await db.ref().update({[`orders/${orderId}/deliveryCodeVerified`]:true,[`order_private/${orderId}/deliveryCode/verified`]:true,[`order_private/${orderId}/deliveryCode/verifiedAtMs`]:nowMs()}); await v42WriteOrderState(orderId,order,'delivered',uid,'delivery',action,{deliveryCodeVerified:true}); await pushNotification(buyerUid,{title:'Entrega concluída',body:'Seu pedido foi marcado como entregue.',type:'order_delivered',data:{orderId}}); return res.json({ok:true,orderId,status:'delivered'});
+      if(!typed||!expected||stableHash(`${orderId}:${typed}`)!==expected)return res.status(422).json({ok:false,code:'DELIVERY_CODE_INVALID',message:'CÃ³digo de entrega invÃ¡lido.'});
+      await db.ref().update({[`orders/${orderId}/deliveryCodeVerified`]:true,[`order_private/${orderId}/deliveryCode/verified`]:true,[`order_private/${orderId}/deliveryCode/verifiedAtMs`]:nowMs()}); await v42WriteOrderState(orderId,order,'delivered',uid,'delivery',action,{deliveryCodeVerified:true}); await pushNotification(buyerUid,{title:'Entrega concluÃ­da',body:'Seu pedido foi marcado como entregue.',type:'order_delivered',data:{orderId}}); return res.json({ok:true,orderId,status:'delivered'});
     }
     const tr=transitions[actorRole]?.[action]; if(!tr)return res.status(422).json({ok:false,code:'INVALID_ACTION'}); if(!tr.from.includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION',status});
     if(actorRole==='delivery'&&!safe(order.deliveryUid))return res.status(409).json({ok:false,code:'DELIVERY_NOT_ASSIGNED'});
     await v42WriteOrderState(orderId,order,tr.to,uid,actorRole,action,actorRole==='delivery'?{deliveryUid:uid}:{});
-    if(tr.to==='delivered')await pushNotification(buyerUid,{title:'Pedido entregue',body:'Seu pedido foi concluído.',type:'order_delivered',data:{orderId}});
+    if(tr.to==='delivered')await pushNotification(buyerUid,{title:'Pedido entregue',body:'Seu pedido foi concluÃ­do.',type:'order_delivered',data:{orderId}});
     else if(actorRole==='seller')await pushNotification(buyerUid,{title:'Pedido atualizado',body:`Novo status: ${tr.to}.`,type:'order_status',data:{orderId,status:tr.to}});
     return res.json({ok:true,orderId,status:tr.to});
-  }catch(e){return publicError(res,e,'Não foi possível atualizar o pedido.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel atualizar o pedido.');}
 });
 
 app.post('/v1/delivery/orders/action', requireUser, rateLimit('delivery-order-action', 40, 10 * 60 * 1000), async(req,res)=>{
   req.body={...map(req.body),actorRole:'delivery'};
-  // Reutiliza a mesma lógica por chamada interna HTTP-less: replica apenas o formato esperado.
+  // Reutiliza a mesma lÃ³gica por chamada interna HTTP-less: replica apenas o formato esperado.
   const orderId=safe(req.body.orderId); const action=safe(req.body.action).toLowerCase();
   try{
     const uid=req.auth.uid; await v42AssertDeliveryActive(uid); const order=await v42LoadOrder(orderId); const assigned=safe(order.deliveryUid); if(assigned&&assigned!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});
@@ -9139,40 +9142,40 @@ app.post('/v1/delivery/orders/action', requireUser, rateLimit('delivery-order-ac
     // Implementacao direta das demais transicoes.
     const status=v42NormalizeStatus(order.status); const transitions={accept_delivery:{from:['assigned'],to:'delivery_accepted'},mark_picked_up:{from:['delivery_accepted'],to:'picked_up'},start_route:{from:['picked_up'],to:'on_route'},mark_arriving:{from:['on_route'],to:'arriving'},confirm_delivery:{from:['arriving','on_route'],to:'delivered'},archive:{from:['delivered','cancelled','rejected'],to:'archived'}};
     if(normalized==='verify_delivery_code'){
-      const typed=safe(req.body.code||req.body.deliveryCode).replace(/[^0-9A-Za-z]/g,''); const priv=map((await db.ref(`order_private/${orderId}`).get()).val()); const codeData=map(priv.deliveryCode||priv.deliveryConfirmation); const expected=safe(codeData.codeHash||priv.deliveryCodeHash||priv.confirmationCodeHash); if(!typed||!expected||stableHash(`${orderId}:${typed}`)!==expected)return res.status(422).json({ok:false,code:'DELIVERY_CODE_INVALID',message:'Código de entrega inválido.'}); await db.ref().update({[`orders/${orderId}/deliveryCodeVerified`]:true,[`order_private/${orderId}/deliveryCode/verified`]:true,[`order_private/${orderId}/deliveryCode/verifiedAtMs`]:nowMs()}); await v42WriteOrderState(orderId,order,'delivered',uid,'delivery','verify_delivery_code',{deliveryUid:uid,deliveryCodeVerified:true}); return res.json({ok:true,orderId,status:'delivered'});
+      const typed=safe(req.body.code||req.body.deliveryCode).replace(/[^0-9A-Za-z]/g,''); const priv=map((await db.ref(`order_private/${orderId}`).get()).val()); const codeData=map(priv.deliveryCode||priv.deliveryConfirmation); const expected=safe(codeData.codeHash||priv.deliveryCodeHash||priv.confirmationCodeHash); if(!typed||!expected||stableHash(`${orderId}:${typed}`)!==expected)return res.status(422).json({ok:false,code:'DELIVERY_CODE_INVALID',message:'CÃ³digo de entrega invÃ¡lido.'}); await db.ref().update({[`orders/${orderId}/deliveryCodeVerified`]:true,[`order_private/${orderId}/deliveryCode/verified`]:true,[`order_private/${orderId}/deliveryCode/verifiedAtMs`]:nowMs()}); await v42WriteOrderState(orderId,order,'delivered',uid,'delivery','verify_delivery_code',{deliveryUid:uid,deliveryCodeVerified:true}); return res.json({ok:true,orderId,status:'delivered'});
     }
     const tr=transitions[normalized]; if(!tr)return res.status(422).json({ok:false,code:'INVALID_ACTION'}); if(!tr.from.includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION',status}); await v42WriteOrderState(orderId,order,tr.to,uid,'delivery',normalized,{deliveryUid:uid}); return res.json({ok:true,orderId,status:tr.to});
-  }catch(e){return publicError(res,e,'Não foi possível atualizar a entrega.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel atualizar a entrega.');}
 });
 
 app.post('/v1/delivery/connections/request', requireUser, rateLimit('delivery-connection-request', 20, 60 * 60 * 1000), async(req,res)=>{
   try{
     const uid=req.auth.uid,storeId=safe(req.body?.storeId),code=safe(req.body?.publicCode).toUpperCase(),t=nowMs(); await assertSellerCanPublish(uid); if(!(await v42SellerOwnsStore(uid,storeId)))return res.status(403).json({ok:false,code:'STORE_ACCESS_DENIED'});
     const codeSnap=await db.ref(`delivery_public_codes/${firebaseSafeKey(code)}`).get(); let deliveryUid=typeof codeSnap.val()==='string'?safe(codeSnap.val()):safe(map(codeSnap.val()).uid||map(codeSnap.val()).deliveryUid); if(!deliveryUid)return res.status(404).json({ok:false,code:'DELIVERY_NOT_FOUND'}); await v42AssertDeliveryActive(deliveryUid);
-    const connectionId=stableHash(`${storeId}:${deliveryUid}`).slice(0,32); const item={connectionId,storeId,deliveryUid,sellerUid:uid,status:'pending',requestedAtMs:t,updatedAtMs:t}; await db.ref().update({[`delivery_connections/${storeId}/${deliveryUid}`]:item,[`delivery_connections_by_user/${uid}/${connectionId}`]:item,[`delivery_connections_by_user/${deliveryUid}/${connectionId}`]:item}); await pushNotification(deliveryUid,{title:'Nova conexão de loja',body:'Uma loja quer conectar você como entregador.',type:'delivery_connection_request',data:{storeId,connectionId}}); return res.status(201).json({ok:true,connectionId,status:'pending'});
-  }catch(e){return publicError(res,e,'Não foi possível enviar a solicitação.');}
+    const connectionId=stableHash(`${storeId}:${deliveryUid}`).slice(0,32); const item={connectionId,storeId,deliveryUid,sellerUid:uid,status:'pending',requestedAtMs:t,updatedAtMs:t}; await db.ref().update({[`delivery_connections/${storeId}/${deliveryUid}`]:item,[`delivery_connections_by_user/${uid}/${connectionId}`]:item,[`delivery_connections_by_user/${deliveryUid}/${connectionId}`]:item}); await pushNotification(deliveryUid,{title:'Nova conexÃ£o de loja',body:'Uma loja quer conectar vocÃª como entregador.',type:'delivery_connection_request',data:{storeId,connectionId}}); return res.status(201).json({ok:true,connectionId,status:'pending'});
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel enviar a solicitaÃ§Ã£o.');}
 });
 
 app.post('/v1/delivery/connections/respond', requireUser, rateLimit('delivery-connection-respond', 20, 60 * 60 * 1000), async(req,res)=>{
   try{
     const uid=req.auth.uid,storeId=safe(req.body?.storeId),action=safe(req.body?.action).toLowerCase(),t=nowMs(); await v42AssertDeliveryActive(uid); const ref=db.ref(`delivery_connections/${storeId}/${uid}`); const snap=await ref.get(); const item=map(snap.val()); if(!snap.exists())return res.status(404).json({ok:false,code:'CONNECTION_NOT_FOUND'}); if(!['accept','reject'].includes(action))return res.status(422).json({ok:false,code:'INVALID_ACTION'}); const status=action==='accept'?'active':'rejected'; const connectionId=safe(item.connectionId)||stableHash(`${storeId}:${uid}`).slice(0,32); const next={...item,connectionId,status,updatedAtMs:t}; await db.ref().update({[`delivery_connections/${storeId}/${uid}`]:next,[`delivery_connections_by_user/${safe(item.sellerUid)}/${connectionId}`]:next,[`delivery_connections_by_user/${uid}/${connectionId}`]:next}); return res.json({ok:true,connectionId,status});
-  }catch(e){return publicError(res,e,'Não foi possível responder à conexão.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel responder Ã  conexÃ£o.');}
 });
 
 app.post('/v1/delivery/connections/update', requireUser, rateLimit('delivery-connection-update', 20, 60 * 60 * 1000), async(req,res)=>{
   try{
     const uid=req.auth.uid,storeId=safe(req.body?.storeId),deliveryUid=safe(req.body?.deliveryUid),action=safe(req.body?.action).toLowerCase(),t=nowMs(); await assertSellerCanPublish(uid); if(!(await v42SellerOwnsStore(uid,storeId)))return res.status(403).json({ok:false,code:'STORE_ACCESS_DENIED'}); const snap=await db.ref(`delivery_connections/${storeId}/${deliveryUid}`).get(); const item=map(snap.val()); if(!snap.exists())return res.status(404).json({ok:false,code:'CONNECTION_NOT_FOUND'}); if(!['remove','cancel'].includes(action))return res.status(422).json({ok:false,code:'INVALID_ACTION'}); const status=action==='remove'?'removed':'cancelled'; const connectionId=safe(item.connectionId)||stableHash(`${storeId}:${deliveryUid}`).slice(0,32); const next={...item,status,updatedAtMs:t}; await db.ref().update({[`delivery_connections/${storeId}/${deliveryUid}`]:next,[`delivery_connections_by_user/${uid}/${connectionId}`]:next,[`delivery_connections_by_user/${deliveryUid}/${connectionId}`]:next}); return res.json({ok:true,connectionId,status});
-  }catch(e){return publicError(res,e,'Não foi possível atualizar a conexão.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel atualizar a conexÃ£o.');}
 });
 
 app.post('/v1/reviews', requireUser, rateLimit('review-create', 8, 60 * 60 * 1000), async(req,res)=>{
   try{
     const uid=req.auth.uid,orderId=safe(req.body?.orderId),rating=integer(req.body?.rating,0),comment=clip(req.body?.comment,1200),t=nowMs(); if(rating<1||rating>5)return res.status(422).json({ok:false,code:'INVALID_RATING'}); const order=await v42LoadOrder(orderId); if(safe(order.buyerUid)!==uid)return res.status(403).json({ok:false,code:'BUYER_REQUIRED'}); if(v42NormalizeStatus(order.status)!=='delivered')return res.status(409).json({ok:false,code:'ORDER_NOT_DELIVERED'}); if(safe(order.review?.reviewId)||order.review?.submitted===true)return res.status(409).json({ok:false,code:'REVIEW_ALREADY_SUBMITTED'}); const reviewId=db.ref('reviews').push().key,productId=safe(order.productId||order.productSnapshot?.productId),sellerUid=safe(order.sellerUid),review={reviewId,orderId,productId,sellerUid,buyerUid:uid,rating,comment,status:'published',createdAtMs:t}; await db.ref().update({[`reviews/${reviewId}`]:review,[`reviews_by_product/${productId}/${reviewId}`]:{reviewId,rating,createdAtMs:t},[`reviews_by_seller/${sellerUid}/${reviewId}`]:{reviewId,rating,createdAtMs:t},[`orders/${orderId}/review`]:{reviewId,submitted:true,rating,createdAtMs:t}}); const statsRef=db.ref(`product_stats/${productId}`); await statsRef.transaction((raw)=>{const s=map(raw);const count=integer(s.ratingCount,0);const sum=finiteNumber(s.ratingSum,0);return {...s,ratingCount:count+1,ratingSum:sum+rating,ratingAverage:(sum+rating)/(count+1),updatedAtMs:t};},{applyLocally:false}); return res.status(201).json({ok:true,reviewId});
-  }catch(e){return publicError(res,e,'Não foi possível enviar a avaliação.');}
+  }catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel enviar a avaliaÃ§Ã£o.');}
 });
 
 app.post('/api/orders/:orderId/confirm-delivery', requireUser, rateLimit('confirm-delivery-legacy', 20, 10 * 60 * 1000), async(req,res)=>{
-  try{const uid=req.auth.uid,orderId=safe(req.params.orderId),order=await v42LoadOrder(orderId);await v42AssertDeliveryActive(uid);if(safe(order.deliveryUid)!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});const status=v42NormalizeStatus(order.status);if(!['arriving','on_route'].includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});await v42WriteOrderState(orderId,order,'delivered',uid,'delivery','confirm_delivery',{deliveryUid:uid});return res.json({ok:true,orderId,status:'delivered'});}catch(e){return publicError(res,e,'Não foi possível confirmar a entrega.');}
+  try{const uid=req.auth.uid,orderId=safe(req.params.orderId),order=await v42LoadOrder(orderId);await v42AssertDeliveryActive(uid);if(safe(order.deliveryUid)!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});const status=v42NormalizeStatus(order.status);if(!['arriving','on_route'].includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});await v42WriteOrderState(orderId,order,'delivered',uid,'delivery','confirm_delivery',{deliveryUid:uid});return res.json({ok:true,orderId,status:'delivered'});}catch(e){return publicError(res,e,'NÃ£o foi possÃ­vel confirmar a entrega.');}
 });
 
 
@@ -9330,7 +9333,7 @@ async function expireBoosts() {
             "Patrocinado encerrado",
 
           body:
-            "O período do seu Patrocinado terminou.",
+            "O perÃ­odo do seu Patrocinado terminou.",
 
           type:
             "boost_expired",
@@ -9476,10 +9479,10 @@ async function expireSubscriptions() {
       item.uid,
       {
         title:
-          "Verificação expirada",
+          "VerificaÃ§Ã£o expirada",
 
         body:
-          "Sua assinatura de verificação terminou.",
+          "Sua assinatura de verificaÃ§Ã£o terminou.",
 
         type:
           "verification_expired",
@@ -9540,7 +9543,7 @@ app.post(
       return publicError(
         res,
         error,
-        "Erro ao expirar verificações."
+        "Erro ao expirar verificaÃ§Ãµes."
       );
     }
   }
@@ -9609,7 +9612,7 @@ app.post(
       return publicError(
         res,
         error,
-        "Erro ao rodar manutenção."
+        "Erro ao rodar manutenÃ§Ã£o."
       );
     }
   }
@@ -9624,7 +9627,7 @@ app.get(
     res.send(
       htmlPage(
         "FireRank API",
-        `Backend V${FIRERANK_SCHEMA_VERSION} online: autenticação, catálogo, endereços, mídia Cloudinary protegida e serviços digitais.`
+        `Backend V${FIRERANK_SCHEMA_VERSION} online: autenticaÃ§Ã£o, catÃ¡logo, endereÃ§os, mÃ­dia Cloudinary protegida e serviÃ§os digitais.`
       )
     );
   }
@@ -9721,7 +9724,7 @@ app.get(
     res.send(
       htmlPage(
         "Pagamento aprovado",
-        "Pagamento concluído. Você já pode voltar ao app."
+        "Pagamento concluÃ­do. VocÃª jÃ¡ pode voltar ao app."
       )
     );
   }
@@ -9736,7 +9739,7 @@ app.get(
     res.send(
       htmlPage(
         "Pagamento pendente",
-        "Seu pagamento está pendente. Volte ao app para acompanhar o status."
+        "Seu pagamento estÃ¡ pendente. Volte ao app para acompanhar o status."
       )
     );
   }
@@ -9750,8 +9753,8 @@ app.get(
   ) => {
     res.send(
       htmlPage(
-        "Pagamento não concluído",
-        "O pagamento não foi concluído. Você pode tentar novamente no app."
+        "Pagamento nÃ£o concluÃ­do",
+        "O pagamento nÃ£o foi concluÃ­do. VocÃª pode tentar novamente no app."
       )
     );
   }
@@ -9798,7 +9801,7 @@ app.use(
             "REQUEST_TOO_LARGE",
 
           message:
-            "O arquivo ou conteúdo enviado é grande demais.",
+            "O arquivo ou conteÃºdo enviado Ã© grande demais.",
         });
     }
 
@@ -9816,7 +9819,7 @@ app.use(
             "CORS_ORIGIN_NOT_ALLOWED",
 
           message:
-            "Origem não autorizada.",
+            "Origem nÃ£o autorizada.",
         });
     }
 
