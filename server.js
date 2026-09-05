@@ -8696,6 +8696,123 @@ app.post("/v1/support/chat", requireUser, rateLimit("support-chat",15,60*60*1000
   }catch(e){return publicError(res,e,"Não foi possível abrir o atendimento.");}
 });
 
+
+app.post(
+  "/v1/admin/ai/chat",
+  requireUser,
+  requireAdmin,
+  rateLimit("admin-ai-chat", 60, 60 * 60 * 1000),
+  async (req, res) => {
+    try {
+      if (!GEMINI_API_KEY || !GEMINI_MODEL) {
+        return res.status(503).json({
+          ok: false,
+          code: "AI_NOT_CONFIGURED",
+          message: "FireRank Admin AI is not configured."
+        });
+      }
+
+      const uid = req.auth.uid;
+
+      const message = clip(
+        req.body?.message || req.body?.text,
+        6000
+      );
+
+      if (!message) {
+        return res.status(422).json({
+          ok: false,
+          code: "MESSAGE_REQUIRED"
+        });
+      }
+
+      const history = Array.isArray(req.body?.history)
+        ? req.body.history.slice(-8)
+        : [];
+
+      const contents = [
+        ...history.map((item) => ({
+          role:
+            safe(item.role) === "assistant"
+              ? "model"
+              : "user",
+          parts: [
+            {
+              text: clip(item.text, 3000)
+            }
+          ]
+        })),
+        {
+          role: "user",
+          parts: [
+            {
+              text: message
+            }
+          ]
+        }
+      ];
+
+      const url =
+        "https://generativelanguage.googleapis.com/v1beta/models/" +
+        encodeURIComponent(GEMINI_MODEL) +
+        ":generateContent?key=" +
+        encodeURIComponent(GEMINI_API_KEY);
+
+      const geminiResponse = await axios.post(
+        url,
+        {
+          contents,
+          systemInstruction: {
+            parts: [
+              {
+                text:
+                  "You are FireRank AI Admin, the private administrative assistant for FireRank. " +
+                  "Help the administrator understand users, sellers, deliveries, products, orders, reports, application behavior, database contracts and operational problems. " +
+                  "You may diagnose and recommend actions. " +
+                  "Never claim to have changed FireRank data unless an authorized backend operation actually performed the change. " +
+                  "Never expose credentials, tokens, API keys, Firebase private keys or other secrets. " +
+                  "Never autonomously modify payments, financial ledgers, Firebase admin claims, Firebase security rules, environment variables, deployments or credentials."
+              }
+            ]
+          },
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 1400
+          }
+        },
+        {
+          timeout: 30000
+        }
+      );
+
+      const answer =
+        safe(
+          geminiResponse.data?.candidates?.[0]?.content?.parts
+            ?.map((part) => part.text || "")
+            .join("\n")
+        ) || "No response was generated.";
+
+      await appendAudit("admin_ai_chat", {
+        actorUid: uid,
+        targetUid: uid,
+        status: "ok"
+      });
+
+      return res.json({
+        ok: true,
+        text: answer,
+        answer
+      });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "FireRank Admin AI could not respond."
+      );
+    }
+  }
+);
+
 app.post("/v1/ai/v2/chat", requireUser, rateLimit("gemini-chat",30,60*60*1000), async(req,res)=>{
   try{
     if(!GEMINI_API_KEY || !GEMINI_MODEL) return res.status(503).json({ok:false,code:"AI_NOT_CONFIGURED",message:"A IA ainda não está configurada."});
