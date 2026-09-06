@@ -8697,6 +8697,587 @@ app.post("/v1/support/chat", requireUser, rateLimit("support-chat",15,60*60*1000
 });
 
 
+
+// ============================================================================
+// FIRE RANK ADMIN - HOME CAROUSEL
+// Backend-authoritative banner media + banner mutations.
+// ============================================================================
+
+app.post(
+  "/v1/admin/media/banner/sign",
+  requireUser,
+  requireAdmin,
+  rateLimit("admin-banner-media-sign", 20, 10 * 60 * 1000),
+  async (req, res) => {
+    try {
+      if (!CLOUDINARY_CONFIGURED || !CLOUDINARY_API_SECRET) {
+        return res.status(503).json({
+          ok: false,
+          code: "CLOUDINARY_NOT_CONFIGURED",
+          message: "Servico de midia indisponivel."
+        });
+      }
+
+      const adminUid = req.auth.uid;
+      const timestamp = Math.floor(Date.now() / 1000);
+      const nonce = crypto.randomBytes(10).toString("hex");
+
+      const folder =
+        "firerank/home_banners/" + adminUid;
+
+      const publicId =
+        "home_banner_" + timestamp + "_" + nonce;
+
+      const type = "upload";
+
+      const paramsToSign = {
+        timestamp,
+        folder,
+        public_id: publicId,
+        type
+      };
+
+      const signature =
+        cloudinary.utils.api_sign_request(
+          paramsToSign,
+          CLOUDINARY_API_SECRET
+        );
+
+      return res.json({
+        ok: true,
+        provider: "cloudinary",
+        cloudName: CLOUDINARY_CLOUD_NAME,
+        apiKey: CLOUDINARY_API_KEY,
+        timestamp,
+        signature,
+        folder,
+        publicId,
+        type,
+        resourceType: "image",
+        uploadUrl:
+          "https://api.cloudinary.com/v1_1/" +
+          CLOUDINARY_CLOUD_NAME +
+          "/image/upload",
+        expiresInSeconds: 300
+      });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Nao foi possivel autorizar o banner."
+      );
+    }
+  }
+);
+
+app.post(
+  "/v1/admin/media/banner/complete",
+  requireUser,
+  requireAdmin,
+  rateLimit("admin-banner-media-complete", 30, 10 * 60 * 1000),
+  async (req, res) => {
+    try {
+      if (!CLOUDINARY_CONFIGURED || !CLOUDINARY_API_SECRET) {
+        return res.status(503).json({
+          ok: false,
+          code: "CLOUDINARY_NOT_CONFIGURED",
+          message: "Servico de midia indisponivel."
+        });
+      }
+
+      const adminUid = req.auth.uid;
+      const publicId = safe(req.body?.publicId);
+      const requestedType =
+        safe(req.body?.type).toLowerCase();
+
+      if (!publicId) {
+        return res.status(422).json({
+          ok: false,
+          code: "PUBLIC_ID_REQUIRED"
+        });
+      }
+
+      const expectedPrefix =
+        "firerank/home_banners/" +
+        adminUid +
+        "/";
+
+      if (!publicId.startsWith(expectedPrefix)) {
+        return res.status(403).json({
+          ok: false,
+          code: "BANNER_MEDIA_OWNER_MISMATCH"
+        });
+      }
+
+      const expectedType = "upload";
+
+      if (
+        requestedType &&
+        requestedType !== expectedType
+      ) {
+        return res.status(422).json({
+          ok: false,
+          code: "BANNER_MEDIA_TYPE_MISMATCH"
+        });
+      }
+
+      const resource =
+        await cloudinary.api.resource(
+          publicId,
+          {
+            resource_type: "image",
+            type: expectedType
+          }
+        );
+
+      const bytes = integer(resource?.bytes, 0);
+      const width = integer(resource?.width, 0);
+      const height = integer(resource?.height, 0);
+
+      const maxBytes = 5 * 1024 * 1024;
+
+      if (
+        !resource?.public_id ||
+        bytes <= 0 ||
+        bytes > maxBytes ||
+        width < 400 ||
+        height < 400 ||
+        width > 1600 ||
+        height > 1600 ||
+        Math.abs(width - height) > 2
+      ) {
+        return res.status(422).json({
+          ok: false,
+          code: "BANNER_MEDIA_INVALID",
+          message:
+            "O banner deve ser quadrado, ter dimensoes seguras e no maximo 5 MB."
+        });
+      }
+
+      const t = nowMs();
+
+      const mediaRef =
+        db.ref(
+          "media_assets/" + adminUid
+        ).push();
+
+      const assetId = mediaRef.key;
+
+      const asset = {
+        assetId,
+        ownerUid: adminUid,
+        purpose: "home_banner",
+        provider: "cloudinary",
+        publicId: resource.public_id,
+        resourceType: "image",
+        type: expectedType,
+        version: resource.version || 0,
+        bytes,
+        format: safe(resource.format),
+        width,
+        height,
+        secureUrl: safe(resource.secure_url),
+        createdAtMs: t,
+        status: "ready"
+      };
+
+      await mediaRef.set(asset);
+
+      await appendAudit(
+        "home_banner_media_uploaded",
+        {
+          actorUid: adminUid,
+          targetUid: adminUid,
+          referenceId: assetId,
+          status: "ready"
+        }
+      );
+
+      return res.status(201).json({
+        ok: true,
+        mediaId: assetId,
+        assetId,
+        publicId: resource.public_id,
+        type: expectedType,
+        secureUrl: safe(resource.secure_url),
+        width,
+        height,
+        bytes
+      });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Nao foi possivel confirmar o banner."
+      );
+    }
+  }
+);
+
+app.post(
+  "/v1/admin/banners/upsert",
+  requireUser,
+  requireAdmin,
+  rateLimit("admin-banner-upsert", 60, 60 * 60 * 1000),
+  async (req, res) => {
+    try {
+      const adminUid = req.auth.uid;
+      const body = map(req.body);
+      const t = nowMs();
+
+      let bannerId = safe(body.bannerId);
+
+      if (!bannerId) {
+        bannerId =
+          db.ref("public_home_banners").push().key;
+      }
+
+      if (
+        !bannerId ||
+        /[.#$\[\]\/]/.test(bannerId)
+      ) {
+        return res.status(422).json({
+          ok: false,
+          code: "INVALID_BANNER_ID"
+        });
+      }
+
+      const title = clip(body.title, 120);
+      const imageUrl = safe(body.imageUrl);
+
+      if (
+        !imageUrl ||
+        imageUrl.length > 2048 ||
+        !isHttpsUrl(imageUrl)
+      ) {
+        return res.status(422).json({
+          ok: false,
+          code: "INVALID_BANNER_IMAGE",
+          message: "Use uma imagem HTTPS valida."
+        });
+      }
+
+      let actionType =
+        safe(body.actionType).toLowerCase();
+
+      let actionValue =
+        safe(body.actionValue);
+
+      const targetUrl = safe(body.targetUrl);
+
+      if (!actionType && targetUrl) {
+        if (isHttpsUrl(targetUrl)) {
+          actionType = "external_url";
+          actionValue = targetUrl;
+        } else {
+          const match =
+            targetUrl.match(
+              /^(product|store|profile):(.+)$/i
+            );
+
+          if (match) {
+            actionType =
+              match[1].toLowerCase();
+
+            actionValue =
+              safe(match[2]);
+          }
+        }
+      }
+
+      const allowedActions =
+        new Set([
+          "external_url",
+          "store",
+          "product",
+          "profile"
+        ]);
+
+      if (
+        !allowedActions.has(actionType) ||
+        !actionValue ||
+        actionValue.length > 2048
+      ) {
+        return res.status(422).json({
+          ok: false,
+          code: "INVALID_BANNER_ACTION",
+          message:
+            "Escolha um destino valido para o banner."
+        });
+      }
+
+      if (
+        actionType === "external_url" &&
+        !isHttpsUrl(actionValue)
+      ) {
+        return res.status(422).json({
+          ok: false,
+          code: "INVALID_EXTERNAL_URL",
+          message:
+            "Links externos devem usar HTTPS."
+        });
+      }
+
+      const enabled =
+        typeof body.enabled === "boolean"
+          ? body.enabled
+          : body.active === true;
+
+      const sponsored =
+        body.sponsored === true;
+
+      const label =
+        clip(body.label, 80);
+
+      const startsAtMs =
+        Math.max(
+          0,
+          integer(body.startsAtMs, 0)
+        );
+
+      const endsAtMs =
+        Math.max(
+          0,
+          integer(body.endsAtMs, 0)
+        );
+
+      if (
+        startsAtMs > 0 &&
+        endsAtMs > 0 &&
+        endsAtMs <= startsAtMs
+      ) {
+        return res.status(422).json({
+          ok: false,
+          code: "INVALID_BANNER_PERIOD",
+          message:
+            "A data final deve ser posterior a data inicial."
+        });
+      }
+
+      const currentSnap =
+        await db.ref(
+          "public_home_banners/" +
+          bannerId
+        ).get();
+
+      const current =
+        map(currentSnap.val());
+
+      let sortOrder =
+        integer(body.sortOrder, 0);
+
+      if (sortOrder <= 0) {
+        const allSnap =
+          await db
+            .ref("public_home_banners")
+            .limitToLast(20)
+            .get();
+
+        let highest = 0;
+
+        if (allSnap.exists()) {
+          for (
+            const value of Object.values(
+              map(allSnap.val())
+            )
+          ) {
+            highest = Math.max(
+              highest,
+              integer(
+                map(value).sortOrder,
+                0
+              )
+            );
+          }
+        }
+
+        sortOrder =
+          integer(
+            current.sortOrder,
+            highest + 1
+          );
+
+        if (sortOrder <= 0) {
+          sortOrder = highest + 1;
+        }
+      }
+
+      const createdAtMs =
+        integer(
+          current.createdAtMs,
+          t
+        );
+
+      const publicBanner = {
+        id: bannerId,
+        bannerId,
+        title,
+        imageUrl,
+        actionType,
+        actionValue,
+        enabled,
+        sponsored,
+        label,
+        sortOrder,
+        startsAtMs,
+        endsAtMs,
+        createdAtMs,
+        updatedAtMs: t
+      };
+
+      const adminBanner = {
+        ...publicBanner,
+        targetUrl: actionValue,
+        position:
+          safe(body.position) || "home",
+        active: enabled
+      };
+
+      await db.ref().update({
+        ["public_home_banners/" + bannerId]:
+          publicBanner,
+        ["home_banners/" + bannerId]:
+          adminBanner
+      });
+
+      await appendAudit(
+        currentSnap.exists()
+          ? "carousel_banner_updated"
+          : "carousel_banner_created",
+        {
+          actorUid: adminUid,
+          targetUid: adminUid,
+          referenceId: bannerId,
+          status:
+            enabled
+              ? "active"
+              : "disabled"
+        }
+      );
+
+      return res
+        .status(
+          currentSnap.exists()
+            ? 200
+            : 201
+        )
+        .json({
+          ok: true,
+          bannerId,
+          banner: adminBanner
+        });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Nao foi possivel salvar o banner."
+      );
+    }
+  }
+);
+
+app.post(
+  "/v1/admin/banners/:bannerId/archive",
+  requireUser,
+  requireAdmin,
+  rateLimit("admin-banner-archive", 30, 60 * 60 * 1000),
+  async (req, res) => {
+    try {
+      const adminUid = req.auth.uid;
+      const bannerId =
+        safe(req.params.bannerId);
+
+      if (
+        !bannerId ||
+        /[.#$\[\]\/]/.test(bannerId)
+      ) {
+        return res.status(422).json({
+          ok: false,
+          code: "INVALID_BANNER_ID"
+        });
+      }
+
+      if (req.body?.confirm !== true) {
+        return res.status(422).json({
+          ok: false,
+          code: "CONFIRM_REQUIRED"
+        });
+      }
+
+      const snap =
+        await db.ref(
+          "public_home_banners/" +
+          bannerId
+        ).get();
+
+      if (!snap.exists()) {
+        return res.status(404).json({
+          ok: false,
+          code: "BANNER_NOT_FOUND",
+          message: "Banner nao encontrado."
+        });
+      }
+
+      const t = nowMs();
+
+      await db.ref().update({
+        [
+          "public_home_banners/" +
+          bannerId +
+          "/enabled"
+        ]: false,
+
+        [
+          "public_home_banners/" +
+          bannerId +
+          "/updatedAtMs"
+        ]: t,
+
+        [
+          "home_banners/" +
+          bannerId +
+          "/enabled"
+        ]: false,
+
+        [
+          "home_banners/" +
+          bannerId +
+          "/active"
+        ]: false,
+
+        [
+          "home_banners/" +
+          bannerId +
+          "/updatedAtMs"
+        ]: t
+      });
+
+      await appendAudit(
+        "carousel_banner_archived",
+        {
+          actorUid: adminUid,
+          targetUid: adminUid,
+          referenceId: bannerId,
+          status: "disabled"
+        }
+      );
+
+      return res.json({
+        ok: true,
+        bannerId,
+        active: false
+      });
+    } catch (error) {
+      return publicError(
+        res,
+        error,
+        "Nao foi possivel arquivar o banner."
+      );
+    }
+  }
+);
+
+
 app.post(
   "/v1/admin/ai/chat",
   requireUser,
