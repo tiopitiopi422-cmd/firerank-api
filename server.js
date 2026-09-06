@@ -9278,7 +9278,7 @@ app.post(
 );
 
 
-// FIRERANK_ADMIN_AI_BRAIN_V1
+// FIRERANK_ADMIN_AI_BRAIN_V1_1
 // Grounded private AI for FireRank Admin.
 // Static FireRank/DB15 knowledge + controlled live RTDB context.
 // Database content is untrusted DATA, never instructions.
@@ -9302,6 +9302,20 @@ const FIRERANK_ADMIN_AI_KNOWLEDGE = Object.freeze({
     media: "Cloudinary; private identity media uses authenticated delivery",
     ai: "Gemini is called only from the backend. Secrets never go to the browser.",
     guestMode: "Local guest browsing; Firebase anonymous auth is not part of the intended current architecture"
+  },
+  sellerAuthorization: {
+    gate: [
+      "user_roles/{uid}/seller == true",
+      "role_state/{uid}/seller/active == true",
+      "role_state/{uid}/seller/accessEnabled == true",
+      "eligibility/{uid}/canSell == true",
+      "eligibility/{uid}/needsAgeReview != true"
+    ],
+    currentApplicationPath: "current_applications/seller/{uid}",
+    adminClaimRule:
+      "Firebase Auth custom claim admin=true controls administrative access only. It must never be used to decide whether a user is a seller.",
+    officialAccountRule:
+      "official_accounts/public_badges are independent from seller authorization. Being an official account does not automatically make the account a seller."
   },
   principles: [
     "Never invent database values.",
@@ -9533,6 +9547,23 @@ async function adminAiResolveUser(message) {
     return { uid: explicitUid, resolvedBy: "explicit_uid" };
   }
 
+  const bareCandidates =
+    safe(message).match(/\b[A-Za-z0-9_-]{24,40}\b/g) || [];
+
+  for (const candidate of [...new Set(bareCandidates)].slice(0, 4)) {
+    const [userSnap, publicSnap] = await Promise.all([
+      db.ref(`users/${candidate}`).get(),
+      db.ref(`public_users/${candidate}`).get()
+    ]);
+
+    if (userSnap.exists() || publicSnap.exists()) {
+      return {
+        uid: candidate,
+        resolvedBy: "verified_bare_uid"
+      };
+    }
+  }
+
   const username = adminAiExtractUsername(message);
   if (username) {
     const usernameSnap = await db
@@ -9684,9 +9715,20 @@ async function adminAiBuildLiveContext(message) {
       `entitlements/${uid}`,
       `public_badges/${uid}`,
       `official_accounts/${uid}`,
-      `stores_by_user/${uid}`
+      `stores_by_user/${uid}`,
+      `current_applications/seller/${uid}`,
+      `current_applications/delivery/${uid}`,
+      `stores/${uid}`
     ]) {
       results.push(await adminAiReadPath(path));
+    }
+
+    const storeIndexSnap = await db.ref(`stores_by_user/${uid}`).get();
+    const storeIndex = map(storeIndexSnap.val());
+
+    for (const storeId of Object.keys(storeIndex).slice(0, 12)) {
+      results.push(await adminAiReadPath(`stores/${storeId}`));
+      results.push(await adminAiReadPath(`store_members/${storeId}/${uid}`));
     }
   }
 
@@ -9742,21 +9784,41 @@ async function adminAiBuildLiveContext(message) {
   }
 
   const roots = adminAiSelectRoots(message);
+  const hasExactTarget = Object.keys(targets).length > 0;
+  const globalQuestion = adminAiHasAny(message, [
+    "auditoria completa",
+    "firerank inteiro",
+    "visão geral",
+    "visao geral",
+    "todos os",
+    "quantos",
+    "listar",
+    "sistema inteiro"
+  ]);
+  const shouldSampleRoots = !hasExactTarget || globalQuestion;
 
-  for (const root of roots) {
-    if (results.length >= 22) break;
-    results.push(await adminAiSampleRoot(root));
+  if (shouldSampleRoots) {
+    for (const root of roots) {
+      if (results.length >= 28) break;
+      results.push(await adminAiSampleRoot(root));
+    }
   }
 
   const payload = {
     generatedAtMs: nowMs(),
-    contextMode: "read_only_grounded",
+    contextMode: hasExactTarget
+      ? "exact_target_read_only_grounded"
+      : "read_only_grounded",
     targets,
-    rootsSelected: roots,
-    boundedSampling: true,
-    sampleLimitPerRoot: FIRERANK_ADMIN_AI_SAMPLE_LIMIT,
-    warning:
-      "Sampled roots are bounded. Do not claim a complete count or exhaustive audit unless the evidence is exact.",
+    rootsSelected: shouldSampleRoots ? roots : [],
+    exactTargetResolved: hasExactTarget,
+    boundedSampling: shouldSampleRoots,
+    sampleLimitPerRoot: shouldSampleRoots
+      ? FIRERANK_ADMIN_AI_SAMPLE_LIMIT
+      : 0,
+    warning: shouldSampleRoots
+      ? "Sampled roots are bounded. Do not claim a complete count or exhaustive audit unless the evidence is exact."
+      : "An exact target was resolved. Prefer the exact paths in data and do not describe them as a generic sample.",
     data: results.filter(Boolean)
   };
 
@@ -9785,6 +9847,9 @@ function adminAiSystemInstruction(mode, liveContext) {
     "Never reveal secrets, credentials, access tokens, API keys, private keys, session material or protected identity media.",
     "Do not expose unnecessary sensitive personal data.",
     "Never claim to have changed data. This chat route is read-only.",
+    "Seller authorization is NOT a Firebase Auth custom claim. admin=true is only for administrative access. Seller access is determined by user_roles/{uid}/seller, role_state/{uid}/seller/active, role_state/{uid}/seller/accessEnabled, eligibility/{uid}/canSell, and eligibility/{uid}/needsAgeReview.",
+    "An official account/badge is independent from seller authorization. official_accounts or public_badges alone must never be treated as proof that seller access is enabled.",
+    "For a resolved UID, use exact user paths including current_applications/seller/{uid} and stores_by_user/{uid}; do not call those exact reads a generic sample.",
     "Never autonomously change payments, ledger, admin claims, Firebase Rules, environment variables, deployments, credentials, permanent bans or account deletion.",
     "Be concrete: mention relevant RTDB paths when useful.",
     "If evidence is insufficient, say exactly what is missing rather than guessing.",
@@ -9871,6 +9936,7 @@ async function adminAiCollectDiagnostic(scope = "all", targetId = "") {
   };
 
   const wantedUser = safe(targetId);
+  let targetSummary = null;
 
   if (wantedUser) {
     const [
@@ -9879,14 +9945,24 @@ async function adminAiCollectDiagnostic(scope = "all", targetId = "") {
       profileSnap,
       stateSnap,
       rolesSnap,
-      eligibilitySnap
+      eligibilitySnap,
+      sellerStateSnap,
+      sellerApplicationSnap,
+      officialSnap,
+      storesByUserSnap,
+      directStoreSnap
     ] = await Promise.all([
       db.ref(`users/${wantedUser}`).get(),
       db.ref(`public_users/${wantedUser}`).get(),
       db.ref(`user_profiles/${wantedUser}`).get(),
       db.ref(`account_state/${wantedUser}`).get(),
       db.ref(`user_roles/${wantedUser}`).get(),
-      db.ref(`eligibility/${wantedUser}`).get()
+      db.ref(`eligibility/${wantedUser}`).get(),
+      db.ref(`role_state/${wantedUser}/seller`).get(),
+      db.ref(`current_applications/seller/${wantedUser}`).get(),
+      db.ref(`official_accounts/${wantedUser}`).get(),
+      db.ref(`stores_by_user/${wantedUser}`).get(),
+      db.ref(`stores/${wantedUser}`).get()
     ]);
 
     if (!userSnap.exists() && !publicSnap.exists()) {
@@ -9920,6 +9996,67 @@ async function adminAiCollectDiagnostic(scope = "all", targetId = "") {
 
       const roles = map(rolesSnap.val());
       const eligibility = map(eligibilitySnap.val());
+      const sellerState = map(sellerStateSnap.val());
+      const sellerApplication = map(sellerApplicationSnap.val());
+      const official = map(officialSnap.val());
+      const storesByUser = map(storesByUserSnap.val());
+      const directStore = map(directStoreSnap.val());
+
+      const sellerGate = {
+        roleSeller: roles.seller === true,
+        active: sellerState.active === true,
+        accessEnabled: sellerState.accessEnabled === true,
+        canSell: eligibility.canSell === true,
+        needsAgeReview: eligibility.needsAgeReview === true
+      };
+
+      sellerGate.allowed =
+        sellerGate.roleSeller &&
+        sellerGate.active &&
+        sellerGate.accessEnabled &&
+        sellerGate.canSell &&
+        !sellerGate.needsAgeReview;
+
+      const storeIds = Object.keys(storesByUser).slice(0, 20);
+      const indexedStores = [];
+
+      for (const storeId of storeIds) {
+        const storeSnap = await db.ref(`stores/${storeId}`).get();
+        if (storeSnap.exists()) {
+          indexedStores.push({
+            storeId,
+            value: adminAiRedact(storeSnap.val())
+          });
+        }
+      }
+
+      const hasApprovedStore =
+        adminAiLower(directStore.status) === "approved" ||
+        indexedStores.some(
+          (item) => adminAiLower(map(item.value).status) === "approved"
+        );
+
+      targetSummary = {
+        uid: wantedUser,
+        official: official.official === true && official.active !== false,
+        sellerGate,
+        currentSellerApplication: adminAiRedact(sellerApplication),
+        storesByUser: adminAiRedact(storesByUser),
+        directStore: directStoreSnap.exists()
+          ? adminAiRedact(directStore)
+          : null,
+        indexedStores
+      };
+
+      if (hasApprovedStore && !sellerGate.allowed) {
+        addIssue(
+          "APPROVED_STORE_SELLER_GATE_CLOSED",
+          "warning",
+          "seller",
+          wantedUser,
+          "Existe loja com status approved, mas o gate de vendedor não está completamente aberto."
+        );
+      }
 
       if (roles.seller === true && eligibility.canSell !== true) {
         addIssue(
@@ -10015,6 +10152,7 @@ async function adminAiCollectDiagnostic(scope = "all", targetId = "") {
     targetId: wantedUser,
     sampled: !wantedUser,
     sampleLimit: wantedUser ? 1 : 120,
+    targetSummary,
     issues
   };
 }
@@ -10028,7 +10166,7 @@ app.get(
     try {
       return res.json({
         ok: true,
-        brainVersion: "FIRERANK_ADMIN_AI_BRAIN_V1",
+        brainVersion: "FIRERANK_ADMIN_AI_BRAIN_V1_1",
         mode: "read_only_grounded",
         schemaVersion: "4.2.0",
         databaseRevision: "DB15",
@@ -10139,7 +10277,7 @@ app.post(
         text: answer,
         answer,
         grounded: true,
-        brainVersion: "FIRERANK_ADMIN_AI_BRAIN_V1",
+        brainVersion: "FIRERANK_ADMIN_AI_BRAIN_V1_1",
         knowledge: {
           schemaVersion: "4.2.0",
           databaseRevision: "DB15",
