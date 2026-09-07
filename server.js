@@ -8836,21 +8836,25 @@ app.post(
 
       const maxBytes = 5 * 1024 * 1024;
 
+      const expectedAspectRatio = 16 / 7;
+      const actualAspectRatio =
+        height > 0 ? width / height : 0;
+
       if (
         !resource?.public_id ||
         bytes <= 0 ||
         bytes > maxBytes ||
-        width < 400 ||
-        height < 400 ||
-        width > 1600 ||
-        height > 1600 ||
-        Math.abs(width - height) > 2
+        width < 800 ||
+        height < 350 ||
+        width > 2000 ||
+        height > 1000 ||
+        Math.abs(actualAspectRatio - expectedAspectRatio) > 0.04
       ) {
         return res.status(422).json({
           ok: false,
           code: "BANNER_MEDIA_INVALID",
           message:
-            "O banner deve ser quadrado, ter dimensoes seguras e no maximo 5 MB."
+            "O banner deve usar o formato 16:7, ter dimensoes seguras e no maximo 5 MB."
         });
       }
 
@@ -10311,7 +10315,22 @@ app.post("/v1/ai/v2/chat", requireUser, rateLimit("gemini-chat",30,60*60*1000), 
 });
 
 app.post("/v1/analytics/banner", rateLimit("banner-analytics",120,60*60*1000), async(req,res)=>{
-  try{const bannerId=clip(req.body?.bannerId,160),event=clip(req.body?.event||req.body?.type,40);if(!bannerId||!["impression","click"].includes(event))return res.status(422).json({ok:false});const ref=db.ref("home_banner_events").push();await ref.set({eventId:ref.key,bannerId,event,createdAtMs:nowMs(),clientPlatform:clip(req.body?.clientPlatform,40)});return res.status(202).json({ok:true});}catch(e){return publicError(res,e,"Evento não registrado.");}
+  try{
+    const bannerId=clip(req.body?.bannerId,160);
+    let event=clip(req.body?.event||req.body?.type,40).toLowerCase();
+    if(event==="view") event="impression";
+    if(!bannerId||!["impression","click"].includes(event)) return res.status(422).json({ok:false});
+    const ref=db.ref("home_banner_events").push();
+    await ref.set({
+      eventId:ref.key,
+      bannerId,
+      event,
+      placement:clip(req.body?.placement,80),
+      createdAtMs:nowMs(),
+      clientPlatform:clip(req.body?.clientPlatform||req.body?.platform,40)
+    });
+    return res.status(202).json({ok:true});
+  }catch(e){return publicError(res,e,"Evento não registrado.");}
 });
 
 
