@@ -276,6 +276,10 @@ const allowedOrigins = new Set(configuredAllowedOrigins);
 allowedOrigins.add("https://firerank-admin.web.app");
 allowedOrigins.add("https://firerank-admin.firebaseapp.com");
 
+// FireRank Web Lite - Hosting publico oficial
+allowedOrigins.add("https://firerank-web-757ac.web.app");
+allowedOrigins.add("https://firerank-web-757ac.firebaseapp.com");
+
 if (isHttpsUrl(APP_BASE_URL)) {
   try {
     allowedOrigins.add(new URL(APP_BASE_URL).origin);
