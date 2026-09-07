@@ -8,6 +8,7 @@ const { initializeApp, getApps, cert } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
 const { getDatabase } = require("firebase-admin/database");
 const { getAppCheck } = require("firebase-admin/app-check");
+const { getMessaging } = require("firebase-admin/messaging");
 const nodemailer = require("nodemailer");
 const sharp = require("sharp");
 const multer = require("multer");
@@ -262,6 +263,7 @@ const firebaseApp =
 const db = getDatabase(firebaseApp);
 const firebaseAuth = getAuth(firebaseApp);
 const firebaseAppCheck = getAppCheck(firebaseApp);
+const firebaseMessaging = getMessaging(firebaseApp);
 
 const configuredAllowedOrigins = String(
   process.env.CORS_ALLOWED_ORIGINS || ""
@@ -654,48 +656,98 @@ async function appendAudit(
   return eventId;
 }
 
-async function pushNotification(
-  uid,
-  notification
-) {
-  if (!uid) {
-    return;
+// FIRERANK_PRODUCTION_FLOW_V1_PUSH_BEGIN
+function notificationDataStrings(raw) {
+  const out = {};
+  for (const [key, value] of Object.entries(map(raw))) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === "object") out[String(key)] = JSON.stringify(value).slice(0, 3000);
+    else out[String(key)] = String(value).slice(0, 3000);
   }
+  return out;
+}
 
-  const ref =
-    db
-      .ref(
-        `notifications/${uid}`
-      )
-      .push();
+async function pushNotification(uid, notification) {
+  if (!uid) return null;
+
+  const t = nowMs();
+  const title = clip(notification.title || "FireRank", 120);
+  const body = clip(notification.body || "Você tem uma nova notificação.", 500);
+  const type = clip(notification.type || "system", 80);
+  const data = map(notification.data);
+  const urgent = new Set(["order_created", "order_reminder", "delivery_assigned"]).has(type);
+  const channelId = urgent ? "firerank_orders_channel" : "firerank_general_channel";
+  const ref = db.ref(`notifications/${uid}`).push();
 
   await ref.set({
-    title:
-      clip(
-        notification.title,
-        120
-      ),
-    body:
-      clip(
-        notification.body,
-        500
-      ),
-    type:
-      clip(
-        notification.type ||
-          "system",
-        80
-      ),
-    read:
-      false,
-    createdAtMs:
-      nowMs(),
-    data:
-      map(
-        notification.data
-      ),
+    title,
+    body,
+    type,
+    read: false,
+    createdAtMs: t,
+    data,
   });
+
+  try {
+    const devicesSnap = await db.ref(`user_devices/${uid}`).get();
+    const devices = map(devicesSnap.val());
+    const rows = Object.entries(devices)
+      .map(([deviceId, raw]) => ({ deviceId, ...map(raw) }))
+      .filter((row) => row.active === true && safe(row.token));
+
+    for (let offset = 0; offset < rows.length; offset += 500) {
+      const chunk = rows.slice(offset, offset + 500);
+      const tokens = chunk.map((row) => safe(row.token));
+      if (!tokens.length) continue;
+
+      const response = await firebaseMessaging.sendEachForMulticast({
+        tokens,
+        notification: { title, body },
+        data: {
+          ...notificationDataStrings(data),
+          title,
+          body,
+          type,
+          notificationId: safe(ref.key),
+        },
+        android: {
+          priority: urgent ? "high" : "normal",
+          notification: {
+            channelId,
+            sound: "default",
+          },
+        },
+        apns: {
+          headers: { "apns-priority": urgent ? "10" : "5" },
+          payload: { aps: { sound: "default" } },
+        },
+      });
+
+      const invalidUpdates = {};
+      response.responses.forEach((item, index) => {
+        if (item.success) return;
+        const code = safe(item.error?.code);
+        if (
+          code === "messaging/registration-token-not-registered" ||
+          code === "messaging/invalid-registration-token"
+        ) {
+          const deviceId = safe(chunk[index]?.deviceId);
+          if (deviceId) {
+            invalidUpdates[`user_devices/${uid}/${deviceId}/active`] = false;
+            invalidUpdates[`user_devices/${uid}/${deviceId}/updatedAtMs`] = t;
+          }
+        }
+      });
+      if (Object.keys(invalidUpdates).length) await db.ref().update(invalidUpdates);
+    }
+  } catch (error) {
+    // A notificação no RTDB continua válida mesmo se o FCM estiver temporariamente indisponível.
+    console.error("[pushNotification:fcm]", error?.code || error?.message || "unknown");
+  }
+
+  return ref.key;
 }
+// FIRERANK_PRODUCTION_FLOW_V1_PUSH_END
 
 async function ensurePublicApiConfig() {
   if (!isHttpsUrl(APP_BASE_URL) && NODE_ENV === "production") {
@@ -6613,6 +6665,67 @@ function parseBoostCatalogFromEnv() {
   }
 }
 
+// FIRERANK_PRODUCTION_FLOW_V1_COMMERCIAL_BEGIN
+const DEFAULT_BOOST_CATALOG = Object.freeze({
+  one_day: { planId: "one_day", displayName: "Patrocinado 1 dia", days: 1, priceCents: 490, currency: "BRL", placement: "discover_sponsored", active: true },
+  three_days: { planId: "three_days", displayName: "Patrocinado 3 dias", days: 3, priceCents: 990, currency: "BRL", placement: "discover_sponsored", active: true },
+  seven_days: { planId: "seven_days", displayName: "Patrocinado 7 dias", days: 7, priceCents: 1990, currency: "BRL", placement: "discover_sponsored", active: true },
+  fifteen_days: { planId: "fifteen_days", displayName: "Patrocinado 15 dias", days: 15, priceCents: 3490, currency: "BRL", placement: "discover_sponsored", active: true },
+  thirty_days: { planId: "thirty_days", displayName: "Patrocinado 30 dias", days: 30, priceCents: 5990, currency: "BRL", placement: "discover_sponsored", active: true },
+});
+
+async function ensureDefaultBoostCatalog() {
+  const snap = await db.ref("public_config/boostCatalog").get();
+  const fromDb = map(snap.val());
+  const fromEnv = parseBoostCatalogFromEnv();
+  if (Object.keys(fromDb).length || Object.keys(fromEnv).length) return false;
+  await db.ref("public_config/boostCatalog").set(DEFAULT_BOOST_CATALOG);
+  console.log("FireRank boost catalog: preços iniciais aplicados porque não havia catálogo configurado.");
+  return true;
+}
+
+async function ensureDefaultNotificationConfig() {
+  const ref = db.ref("public_config/notifications/daily");
+  const snap = await ref.get();
+  if (snap.exists()) return false;
+  await ref.set({
+    active: true,
+    title: "Novidades no FireRank",
+    body: "Confira {produto} e outras novidades disponíveis hoje no FireRank.",
+    updatedAtMs: nowMs(),
+    source: "production_flow_v1_default",
+  });
+  return true;
+}
+
+async function activeCommercialOffer(kind, targetId, t = nowMs()) {
+  const snap = await db.ref(`commercial_offers/${firebaseSafeKey(kind)}/${firebaseSafeKey(targetId)}`).get();
+  const offer = map(snap.val());
+  if (!snap.exists() || offer.active !== true) return null;
+  const startsAtMs = finiteNumber(offer.startsAtMs, 0);
+  const endsAtMs = finiteNumber(offer.endsAtMs, 0);
+  if (startsAtMs > 0 && startsAtMs > t) return null;
+  if (endsAtMs > 0 && endsAtMs <= t) return null;
+  const promoPriceCents = integer(offer.promoPriceCents, -1);
+  if (promoPriceCents <= 0) return null;
+  return { ...offer, promoPriceCents };
+}
+
+async function effectiveCommercialPrice(kind, targetId, basePriceCents) {
+  const base = integer(basePriceCents, -1);
+  const offer = await activeCommercialOffer(kind, targetId);
+  if (!offer || offer.promoPriceCents >= base) {
+    return { priceCents: base, basePriceCents: base, offerId: "", offer: null };
+  }
+  return {
+    priceCents: offer.promoPriceCents,
+    basePriceCents: base,
+    offerId: safe(offer.offerId || targetId),
+    offer,
+  };
+}
+// FIRERANK_PRODUCTION_FLOW_V1_COMMERCIAL_END
+
 async function getBoostCatalog() {
   const snap =
     await db
@@ -6673,7 +6786,7 @@ async function readBoostPlan(
     throw error;
   }
 
-  const priceCents =
+  const basePriceCents =
     integer(
       plan.priceCents,
       -1
@@ -6688,7 +6801,7 @@ async function readBoostPlan(
   if (
     plan.active ===
       false ||
-    priceCents <= 0 ||
+    basePriceCents <= 0 ||
     days <= 0 ||
     days > 365
   ) {
@@ -6706,6 +6819,12 @@ async function readBoostPlan(
     throw error;
   }
 
+  const boostPricing = await effectiveCommercialPrice(
+    "boost",
+    planId,
+    basePriceCents
+  );
+
   return {
     planId,
 
@@ -6716,7 +6835,10 @@ async function readBoostPlan(
         100
       ),
 
-    priceCents,
+    priceCents: boostPricing.priceCents,
+    basePriceCents: boostPricing.basePriceCents,
+    offerId: boostPricing.offerId,
+    offer: boostPricing.offer,
 
     days,
 
@@ -6888,11 +7010,13 @@ async function createPaymentPreference(
         throw error;
       }
 
-      amountCents =
-        integer(
-          plan.priceCents,
-          -1
-        );
+      const verificationPricing = await effectiveCommercialPrice(
+        "verification",
+        safe(plan.planId || plan.key),
+        integer(plan.priceCents, -1)
+      );
+
+      amountCents = verificationPricing.priceCents;
 
       if (
         amountCents <= 0
@@ -6927,6 +7051,8 @@ async function createPaymentPreference(
           ),
 
         amountCents,
+        basePriceCents: verificationPricing.basePriceCents,
+        offerId: verificationPricing.offerId,
 
         currency:
           "BRL",
@@ -7057,6 +7183,10 @@ async function createPaymentPreference(
           plan.days,
 
         amountCents,
+        basePriceCents:
+          plan.basePriceCents || amountCents,
+        offerId:
+          plan.offerId || "",
 
         currency:
           "BRL",
@@ -7413,6 +7543,156 @@ async function appendFinancialLedgerEvent({
       "approved",
   });
 }
+// FIRERANK_VERIFIED_BADGES_V2_BEGIN
+async function syncVerifiedBadgeProjection(uid, t = nowMs()) {
+  const id = safe(uid);
+  if (!id) return { active: false, type: "" };
+
+  const [officialSnap, entitlementSnap, currentBadgeSnap, publicUserSnap] = await Promise.all([
+    db.ref(`official_accounts/${id}`).get(),
+    db.ref(`entitlements/${id}`).get(),
+    db.ref(`public_badges/${id}`).get(),
+    db.ref(`public_users/${id}`).get(),
+  ]);
+
+  const official = map(officialSnap.val());
+  const entitlement = map(entitlementSnap.val());
+  const currentBadge = map(currentBadgeSnap.val());
+
+  const officialActive = official.active === true && official.official === true;
+  const expiresAtMs = finiteNumber(entitlement.expiresAtMs, 0);
+  const paidActive = entitlement.verifiedBadge === true &&
+    entitlement.subscriptionActive === true &&
+    (expiresAtMs <= 0 || expiresAtMs > t);
+
+  let active = false;
+  let badgeType = "";
+  let label = "";
+  let officialFlag = false;
+  let projectedExpiry = 0;
+  let source = "verification_projection_v2";
+
+  if (officialActive) {
+    active = true;
+    badgeType = "official";
+    label = "Oficial";
+    officialFlag = true;
+    source = "official_account";
+  } else if (paidActive) {
+    active = true;
+    badgeType = "verified";
+    label = "Verificado";
+    projectedExpiry = expiresAtMs;
+    source = "verified_entitlement";
+  }
+
+  const currentType = safe(currentBadge.badgeType || currentBadge.type).toLowerCase();
+  const currentKnownProjection = currentBadge.official === true ||
+    ["official", "verified", "verification"].includes(currentType) ||
+    ["official_account", "verified_entitlement", "verification_projection_v2"].includes(safe(currentBadge.source));
+
+  const updates = {};
+
+  if (active) {
+    updates[`public_badges/${id}`] = {
+      uid: id,
+      active: true,
+      official: officialFlag,
+      verified: true,
+      badgeType,
+      label,
+      expiresAtMs: projectedExpiry,
+      entityType: officialFlag ? clip(official.entityType || currentBadge.entityType || "account", 40) : "account",
+      source,
+      updatedAtMs: t,
+    };
+  } else if (currentKnownProjection) {
+    updates[`public_badges/${id}`] = {
+      ...currentBadge,
+      uid: id,
+      active: false,
+      official: false,
+      verified: false,
+      badgeType: currentType,
+      expiresAtMs: finiteNumber(currentBadge.expiresAtMs, 0),
+      source: safe(currentBadge.source || "verification_projection_v2"),
+      updatedAtMs: t,
+    };
+  }
+
+  if (publicUserSnap.exists()) {
+    updates[`public_users/${id}/verifiedBadge`] = active;
+    updates[`public_users/${id}/publicVerified`] = active;
+    updates[`public_users/${id}/badgeActive`] = active;
+    updates[`public_users/${id}/verifiedBadgeType`] = active ? badgeType : "";
+    updates[`public_users/${id}/verifiedUntilMs`] = active ? projectedExpiry : 0;
+    updates[`public_users/${id}/verifiedBadgeUpdatedAtMs`] = t;
+  }
+
+  if (Object.keys(updates).length) await db.ref().update(updates);
+  return { active, type: badgeType, official: officialFlag, expiresAtMs: projectedExpiry };
+}
+
+async function migrateVerifiedBadgeProjectionV2() {
+  const t = nowMs();
+  const markerRef = db.ref("system_migrations/verified_badge_projection_v2");
+  const lock = await markerRef.transaction((raw) => {
+    const current = map(raw);
+    if (current.status === "completed") return;
+    const startedAtMs = finiteNumber(current.startedAtMs, 0);
+    if (current.status === "running" && startedAtMs > t - 30 * 60 * 1000) return;
+    return { status: "running", startedAtMs: t, updatedAtMs: t };
+  }, { applyLocally: false });
+
+  if (!lock.committed) return { skipped: true };
+
+  try {
+    const [entitlementsSnap, officialSnap, badgesSnap] = await Promise.all([
+      db.ref("entitlements").get(),
+      db.ref("official_accounts").get(),
+      db.ref("public_badges").get(),
+    ]);
+
+    const uids = new Set();
+    for (const uid of Object.keys(map(entitlementsSnap.val()))) uids.add(uid);
+    for (const uid of Object.keys(map(officialSnap.val()))) uids.add(uid);
+    for (const [uid, raw] of Object.entries(map(badgesSnap.val()))) {
+      const badge = map(raw);
+      const type = safe(badge.badgeType || badge.type).toLowerCase();
+      if (badge.official === true || ["official", "verified", "verification"].includes(type)) uids.add(uid);
+    }
+
+    const list = Array.from(uids).slice(0, 10000);
+    let synced = 0;
+    for (let offset = 0; offset < list.length; offset += 25) {
+      const chunk = list.slice(offset, offset + 25);
+      await Promise.all(chunk.map(async (uid) => {
+        try {
+          await syncVerifiedBadgeProjection(uid, nowMs());
+          synced += 1;
+        } catch (error) {
+          console.error("[verified-badge-migration]", safe(uid), error?.code || error?.message || "error");
+        }
+      }));
+    }
+
+    await markerRef.set({
+      status: "completed",
+      startedAtMs: finiteNumber(lock.snapshot.val()?.startedAtMs, t),
+      completedAtMs: nowMs(),
+      synced,
+      totalCandidates: uids.size,
+      truncated: uids.size > list.length,
+      updatedAtMs: nowMs(),
+    });
+    return { synced, totalCandidates: uids.size };
+  } catch (error) {
+    await markerRef.update({ status: "failed", failedAtMs: nowMs(), updatedAtMs: nowMs() });
+    throw error;
+  }
+}
+// FIRERANK_VERIFIED_BADGES_V2_END
+
 async function activateVerificationFromPayment(
   payment,
   paymentDetail,
@@ -7538,6 +7818,8 @@ async function activateVerificationFromPayment(
     [`payment_requests/${uid}/${requestId}/updatedAtMs`]:
       t,
   });
+
+  await syncVerifiedBadgeProjection(uid, t); // verification activation
 
   await bestEffort(
     "verification-activated-notification",
@@ -7794,6 +8076,7 @@ async function revokeFulfillmentForPayment(
                 true,
             },
         });
+      await syncVerifiedBadgeProjection(uid, t); // payment reversal
     } else {
       await appendAudit(
         "subscription_reversal_manual_review",
@@ -10306,14 +10589,14 @@ app.post("/v1/ai/v2/chat", requireUser, rateLimit("gemini-chat",30,60*60*1000), 
   try{
     if(!GEMINI_API_KEY || !GEMINI_MODEL) return res.status(503).json({ok:false,code:"AI_NOT_CONFIGURED",message:"A IA ainda não está configurada."});
     const uid=req.auth.uid,t=nowMs(); const message=clip(req.body?.message||req.body?.text,6000); if(!message) return res.status(422).json({ok:false,code:"MESSAGE_REQUIRED"});
-    const ent=map((await db.ref(`entitlements/${uid}`).get()).val()); let quota=20; const plan=safe(ent.verifiedPlan).replace(/^verified_/,"").toLowerCase(); if(ent.subscriptionActive===true){if(plan==="plus")quota=100;if(plan==="pro")quota=300;}
+    const quota=20; const plan="normal";
     const day=new Date().toISOString().slice(0,10); const usageRef=db.ref(`ai_usage/${uid}/${day}`); const usage=map((await usageRef.get()).val()); const used=integer(usage.messages,0); if(used>=quota) return res.status(429).json({ok:false,code:"AI_DAILY_QUOTA",message:"Sua cota diária de IA foi atingida.",quota,used});
     const history=Array.isArray(req.body?.history)?req.body.history.slice(-6):[];
     const contents=[...history.map(x=>({role:safe(x.role)==="assistant"?"model":"user",parts:[{text:clip(x.text,3000)}]})),{role:"user",parts:[{text:message}]}];
     const url=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
     const gr=await axios.post(url,{contents,systemInstruction:{parts:[{text:"Você é o FireRank AI. Ajude usuários do aplicativo FireRank com respostas úteis e seguras. Nunca afirme ter alterado pagamentos, permissões, cadastros ou banco de dados. Não peça nem exponha segredos."}]},generationConfig:{temperature:0.5,maxOutputTokens:900}},{timeout:30000});
     const answer=safe(gr.data?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n"))||"Não consegui gerar uma resposta agora.";
-    await usageRef.set({messages:used+1,quota,plan:plan||"normal",updatedAtMs:t});
+    await usageRef.set({messages:used+1,quota,plan:"normal",updatedAtMs:t});
     return res.json({ok:true,text:answer,answer,usage:{used:used+1,quota}});
   }catch(e){return publicError(res,e,"A IA não conseguiu responder agora.");}
 });
@@ -10361,7 +10644,7 @@ app.post('/v1/admin/official-accounts/grant', requireUser, requireAdmin, rateLim
     if(grantPro){
       updates[`entitlements/${uid}`]={...previousEntitlement,verifiedBadge:true,verifiedPlan:'pro',subscriptionActive:true,expiresAtMs:Date.UTC(2100,0,1),permanent:true,contractGrantActive:true,paymentRequired:false,source:'admin_contract_grant',sourceGrantId:grantId,grantedByAdminUid:adminUid,updatedAtMs:t};
     }
-    await db.ref().update(updates); await appendAudit('official_account_granted',{actorUid:adminUid,targetUid:uid,referenceId:grantId,status:'active'});
+    await db.ref().update(updates); await syncVerifiedBadgeProjection(uid,t); await appendAudit('official_account_granted',{actorUid:adminUid,targetUid:uid,referenceId:grantId,status:'active'});
     return res.status(201).json({ok:true,uid,grantId,official:true,proGranted:grantPro});
   }catch(e){return publicError(res,e,'Não foi possível conceder a conta oficial.');}
 });
@@ -10378,7 +10661,7 @@ app.post('/v1/admin/official-accounts/revoke', requireUser, requireAdmin, rateLi
       [`partner_contracts/${uid}/${grantId}/active`]:false,[`partner_contracts/${uid}/${grantId}/revokedAtMs`]:t,[`partner_contracts/${uid}/${grantId}/revokedByAdminUid`]:adminUid,[`partner_contracts/${uid}/${grantId}/updatedAtMs`]:t,
     };
     if(safe(current.source)==='admin_contract_grant'&&safe(current.sourceGrantId)===grantId){updates[`entitlements/${uid}`]=Object.keys(previous).length?previous:{verifiedBadge:false,verifiedPlan:'normal',subscriptionActive:false,expiresAtMs:t,permanent:false,contractGrantActive:false,source:'admin_contract_revoked',updatedAtMs:t};}
-    await db.ref().update(updates); await appendAudit('official_account_revoked',{actorUid:adminUid,targetUid:uid,referenceId:grantId,status:'revoked'});
+    await db.ref().update(updates); await syncVerifiedBadgeProjection(uid,t); await appendAudit('official_account_revoked',{actorUid:adminUid,targetUid:uid,referenceId:grantId,status:'revoked'});
     return res.json({ok:true,uid,grantId});
   }catch(e){return publicError(res,e,'Não foi possível revogar a conta oficial.');}
 });
@@ -10487,6 +10770,7 @@ async function v42WriteOrderState(orderId, order, nextStatus, actorUid, actorRol
     if (key === 'deliveryUid') continue;
     updates[`orders/${orderId}/${key}`] = value;
   }
+  if (nextStatus !== 'sent') updates[`pending_order_alerts/${orderId}`] = null;
   await db.ref().update(updates);
   return { t, updates };
 }
@@ -10503,6 +10787,228 @@ function v42PublicUserProjection(uid, source, t) {
     updatedAtMs: t,
   };
 }
+
+// FIRERANK_PRODUCTION_FLOW_V1_ROUTES_BEGIN
+app.get('/v1/me/seller-context', requireUser, rateLimit('seller-context', 90, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid;
+    const [rolesSnap,stateSnap,eligibilitySnap,applicationSnap,storesIndexSnap,addressesSnap,boostFlagSnap,verificationFlagSnap]=await Promise.all([
+      db.ref(`user_roles/${uid}`).get(),
+      db.ref(`role_state/${uid}/seller`).get(),
+      db.ref(`eligibility/${uid}`).get(),
+      db.ref(`current_applications/seller/${uid}`).get(),
+      db.ref(`stores_by_user/${uid}`).get(),
+      db.ref(`user_addresses/${uid}`).get(),
+      db.ref('feature_flags/boosts').get(),
+      db.ref('feature_flags/verificationSubscriptions').get(),
+    ]);
+    const roles=map(rolesSnap.val()),state=map(stateSnap.val()),eligibility=map(eligibilitySnap.val());
+    const allowed=roles.seller===true&&state.active===true&&state.accessEnabled===true&&eligibility.canSell===true&&eligibility.needsAgeReview!==true;
+    const uiState=safe(state.uiState).toLowerCase();
+    let status='normal';
+    if(allowed) status='allowed';
+    else if(applicationSnap.exists()||state.applicationOpen===true||['pending','under_review'].includes(uiState)) status='pending';
+    else if(eligibility.needsAgeReview===true||safe(state.accessGate)) status='review';
+
+    const storeIds=[];
+    const index=map(storesIndexSnap.val());
+    for(const [storeId,value] of Object.entries(index)) if(value!==false&&value!==null&&safe(storeId)) storeIds.push(storeId);
+    const stores=[];
+    for(const storeId of storeIds.slice(0,20)){
+      const [storeSnap,memberSnap,settingsSnap]=await Promise.all([
+        db.ref(`stores/${storeId}`).get(),
+        db.ref(`store_members/${storeId}/${uid}`).get(),
+        db.ref(`store_settings/${storeId}`).get(),
+      ]);
+      if(!storeSnap.exists()) continue;
+      const store=map(storeSnap.val()),member=map(memberSnap.val()),settings=map(settingsSnap.val());
+      const owner=safe(store.ownerUid)===uid;
+      const memberAllowed=member.active===true&&['owner','admin','manager'].includes(safe(member.role).toLowerCase());
+      if(!owner&&!memberAllowed) continue;
+      stores.push({storeId,name:clip(store.name||'Minha Loja',120),status:safe(store.status),visibility:safe(store.visibility),ordersOpen:settings.ordersOpen!==false});
+    }
+
+    const addresses=[];
+    for(const [addressId,raw] of Object.entries(map(addressesSnap.val())).slice(0,30)){
+      const a=map(raw);
+      if(!['primary','shipping'].includes(safe(addressId).toLowerCase())) continue;
+      addresses.push({addressId,label:clip(a.label||a.nickname||'Endereço',80),city:clip(a.city,100),state:clip(a.state,40),neighborhood:clip(a.neighborhood,100),usable:a.usableForOrder===true&&a.needsReview!==true});
+    }
+
+    return res.json({ok:true,gate:{allowed,status,sellerRole:roles.seller===true,active:state.active===true,accessEnabled:state.accessEnabled===true,canSell:eligibility.canSell===true,needsAgeReview:eligibility.needsAgeReview===true,accessGate:clip(state.accessGate,80),uiState:clip(state.uiState,80)},stores,addresses,features:{boosts:boostFlagSnap.exists()?bool(boostFlagSnap.val(),true):true,verificationSubscriptions:verificationFlagSnap.exists()?bool(verificationFlagSnap.val(),false):false}});
+  }catch(e){return publicError(res,e,'Não foi possível carregar a área do vendedor.');}
+});
+
+app.post('/v1/seller/store/availability', requireUser, rateLimit('seller-store-availability', 40, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,storeId=safe(req.body?.storeId),open=req.body?.open===true,t=nowMs();
+    await assertSellerCanPublish(uid);
+    if(!storeId||!(await v42SellerOwnsStore(uid,storeId))) return res.status(403).json({ok:false,code:'STORE_ACCESS_DENIED',message:'Você não administra esta loja.'});
+    await db.ref(`store_settings/${storeId}`).update({ordersOpen:open,ordersOpenUpdatedAtMs:t,ordersOpenUpdatedByUid:uid});
+    await appendAudit('store_availability_changed',{actorUid:uid,targetUid:uid,referenceId:storeId,status:open?'open':'closed'});
+    return res.json({ok:true,storeId,ordersOpen:open,updatedAtMs:t});
+  }catch(e){return publicError(res,e,'Não foi possível alterar o funcionamento da loja.');}
+});
+
+app.post('/v1/notifications/device', requireUser, rateLimit('notification-device', 60, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,deviceId=clip(req.body?.deviceId,120),token=clip(req.body?.token,4096),platform=clip(req.body?.platform,30),active=req.body?.active!==false,t=nowMs();
+    if(!/^[A-Za-z0-9_-]{6,120}$/.test(deviceId)) return res.status(422).json({ok:false,code:'DEVICE_ID_INVALID'});
+    if(active&&!token) return res.status(422).json({ok:false,code:'FCM_TOKEN_REQUIRED'});
+    const updates={};
+    if(active){
+      updates[`user_devices/${uid}/${deviceId}`]={token,updatedAtMs:t,active:true,platform:platform||'unknown',source:'firebase_messaging'};
+      updates[`notification_subscribers/${uid}`]={active:true,updatedAtMs:t};
+    }else{
+      updates[`user_devices/${uid}/${deviceId}/active`]=false;
+      updates[`user_devices/${uid}/${deviceId}/updatedAtMs`]=t;
+    }
+    await db.ref().update(updates);
+    return res.json({ok:true,deviceId,active});
+  }catch(e){return publicError(res,e,'Não foi possível registrar as notificações deste aparelho.');}
+});
+
+app.get('/v1/verification/catalog', requireUser, rateLimit('verification-catalog',60,10*60*1000), async(_req,res)=>{
+  try{
+    const all=map((await db.ref('subscription_plans').get()).val());
+    const plans=[];
+    for(const [key,raw] of Object.entries(all)){
+      const plan={key,...map(raw)};
+      if(plan.activeForLaunch!==true||integer(plan.priceCents,0)<=0) continue;
+      const planId=safe(plan.planId||key);
+      const pricing=await effectiveCommercialPrice('verification',planId,integer(plan.priceCents,-1));
+      plans.push({...plan,planId,priceCents:pricing.priceCents,basePriceCents:pricing.basePriceCents,offerId:pricing.offerId,offer:pricing.offer});
+    }
+    return res.json({ok:true,plans});
+  }catch(e){return publicError(res,e,'Não foi possível carregar os planos de verificação.');}
+});
+
+app.get('/v1/admin/commercial/config', requireUser, requireAdmin, rateLimit('admin-commercial-read',120,10*60*1000), async(_req,res)=>{
+  try{
+    const [boostSnap,subscriptionsSnap,offersSnap,downloadsSnap,dailySnap]=await Promise.all([
+      db.ref('public_config/boostCatalog').get(),db.ref('subscription_plans').get(),db.ref('commercial_offers').get(),db.ref('public_config/downloads').get(),db.ref('public_config/notifications/daily').get()
+    ]);
+    return res.json({ok:true,boostCatalog:map(boostSnap.val()),subscriptionPlans:map(subscriptionsSnap.val()),offers:map(offersSnap.val()),downloads:map(downloadsSnap.val()),dailyNotifications:map(dailySnap.val())});
+  }catch(e){return publicError(res,e,'Não foi possível carregar preços e ofertas.');}
+});
+
+app.post('/v1/admin/commercial/boost-plan', requireUser, requireAdmin, rateLimit('admin-commercial-boost',60,10*60*1000), async(req,res)=>{
+  try{
+    const adminUid=req.auth.uid,planId=safe(req.body?.planId).toLowerCase(),days=integer(req.body?.days,-1),priceCents=integer(req.body?.priceCents,-1),active=req.body?.active!==false,t=nowMs();
+    if(!/^[a-z0-9_]{2,40}$/.test(planId)||days<1||days>365||priceCents<100||priceCents>10000000) return res.status(422).json({ok:false,code:'INVALID_BOOST_PLAN'});
+    const plan={planId,displayName:clip(req.body?.displayName||`Patrocinado ${days} dia(s)`,100),days,priceCents,currency:'BRL',placement:clip(req.body?.placement||'discover_sponsored',80),active,updatedAtMs:t};
+    await db.ref(`public_config/boostCatalog/${planId}`).set(plan);
+    await appendAudit('commercial_boost_plan_updated',{actorUid:adminUid,referenceId:planId,status:active?'active':'inactive'});
+    return res.json({ok:true,plan});
+  }catch(e){return publicError(res,e,'Não foi possível salvar o preço do anúncio.');}
+});
+
+app.post('/v1/admin/commercial/offer', requireUser, requireAdmin, rateLimit('admin-commercial-offer',80,10*60*1000), async(req,res)=>{
+  try{
+    const adminUid=req.auth.uid,kind=safe(req.body?.kind).toLowerCase(),targetId=safe(req.body?.targetId).toLowerCase(),promoPriceCents=integer(req.body?.promoPriceCents,-1),startsAtMs=Math.max(0,finiteNumber(req.body?.startsAtMs,0)),endsAtMs=Math.max(0,finiteNumber(req.body?.endsAtMs,0)),active=req.body?.active!==false,t=nowMs();
+    if(!['boost','verification'].includes(kind)||!/^[a-z0-9_]{2,80}$/.test(targetId)) return res.status(422).json({ok:false,code:'INVALID_OFFER_TARGET'});
+    let basePriceCents=-1;
+    if(kind==='boost') basePriceCents=integer(map((await getBoostCatalog())[targetId]).priceCents,-1);
+    else basePriceCents=integer((await readSubscriptionPlan(targetId)).priceCents,-1);
+    if(basePriceCents<=0||promoPriceCents<=0||promoPriceCents>=basePriceCents) return res.status(422).json({ok:false,code:'INVALID_OFFER_PRICE',message:'O preço promocional deve ser menor que o preço normal.'});
+    if(endsAtMs>0&&startsAtMs>0&&endsAtMs<=startsAtMs) return res.status(422).json({ok:false,code:'INVALID_OFFER_PERIOD'});
+    const offerId=`global_${kind}_${targetId}`;
+    const offer={offerId,kind,targetId,label:clip(req.body?.label||'Oferta FireRank',100),basePriceCents,promoPriceCents,currency:'BRL',active,startsAtMs,endsAtMs,scope:'all_approved_sellers',updatedAtMs:t,updatedByAdminUid:adminUid};
+    await db.ref(`commercial_offers/${kind}/${targetId}`).set(offer);
+    await appendAudit('commercial_offer_updated',{actorUid:adminUid,referenceId:offerId,status:active?'active':'inactive'});
+    return res.json({ok:true,offer});
+  }catch(e){return publicError(res,e,'Não foi possível salvar a oferta.');}
+});
+
+app.post('/v1/admin/commercial/downloads', requireUser, requireAdmin, rateLimit('admin-download-links',40,10*60*1000), async(req,res)=>{
+  try{
+    const adminUid=req.auth.uid,t=nowMs(),androidUrl=safe(req.body?.androidUrl),iosUrl=safe(req.body?.iosUrl);
+    if(androidUrl&&!isHttpsUrl(androidUrl)) return res.status(422).json({ok:false,code:'ANDROID_URL_INVALID'});
+    if(iosUrl&&!isHttpsUrl(iosUrl)) return res.status(422).json({ok:false,code:'IOS_URL_INVALID'});
+    const downloads={androidUrl,iosUrl,androidEnabled:req.body?.androidEnabled===true&&!!androidUrl,iosEnabled:req.body?.iosEnabled===true&&!!iosUrl,androidVersion:clip(req.body?.androidVersion,60),iosVersion:clip(req.body?.iosVersion,60),updatedAtMs:t};
+    await db.ref('public_config/downloads').set(downloads);
+    await appendAudit('download_links_updated',{actorUid:adminUid,referenceId:'public_config/downloads',status:'ok'});
+    return res.json({ok:true,downloads});
+  }catch(e){return publicError(res,e,'Não foi possível salvar os links de instalação.');}
+});
+
+app.post('/v1/admin/notifications/daily-config', requireUser, requireAdmin, rateLimit('admin-daily-notifications',40,10*60*1000), async(req,res)=>{
+  try{
+    const adminUid=req.auth.uid,t=nowMs();
+    const config={active:req.body?.active!==false,title:clip(req.body?.title||'Novidades no FireRank',120),body:clip(req.body?.body||'Confira {produto} e outras novidades disponíveis hoje no FireRank.',300),updatedAtMs:t,updatedByAdminUid:adminUid};
+    await db.ref('public_config/notifications/daily').set(config);
+    await appendAudit('daily_notification_config_updated',{actorUid:adminUid,referenceId:'daily',status:config.active?'active':'inactive'});
+    return res.json({ok:true,config});
+  }catch(e){return publicError(res,e,'Não foi possível salvar a notificação diária.');}
+});
+// FIRERANK_PRODUCTION_FLOW_V1_EXTENDED_ROUTES_BEGIN
+app.get('/v1/me/profile', requireUser, rateLimit('me-profile', 120, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid;
+    const [pubSnap,badgeSnap,profileSnap,userSnap]=await Promise.all([
+      db.ref(`public_users/${uid}`).get(),
+      db.ref(`public_badges/${uid}`).get(),
+      db.ref(`user_profiles/${uid}`).get(),
+      db.ref(`users/${uid}`).get(),
+    ]);
+    const pub=map(pubSnap.val()),profile=map(profileSnap.val()),user=map(userSnap.val()),badge=map(badgeSnap.val());
+    const source={...user,...profile,...pub};
+    const visibility=safe(source.accountVisibility||'public').toLowerCase()==='private'?'private':'public';
+    const publicProfile={
+      uid,
+      displayName:clip(source.displayName||source.name,120),
+      username:clip(source.username,40),
+      bio:clip(source.bio,500),
+      photoUrl:safe(source.photoUrl||source.profilePhotoUrl||source.photoURL),
+      profileLink:clip(source.profileLink,500),
+      accountVisibility:visibility,
+      city:clip(source.city,100),
+      state:clip(source.state,40),
+      seller:source.isSeller===true||map(source.roles).seller===true,
+    };
+    return res.json({ok:true,profile:publicProfile,badge:badgeSnap.exists()?badge:null});
+  }catch(e){return publicError(res,e,'Não foi possível carregar seu perfil.');}
+});
+
+app.post('/v1/chats/:chatId/messages', requireUser, rateLimit('chat-message-send', 90, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,chatId=safe(req.params.chatId),body=clip(req.body?.body||req.body?.message,4000),t=nowMs();
+    if(!chatId||!body) return res.status(422).json({ok:false,code:'CHAT_MESSAGE_REQUIRED',message:'Digite uma mensagem.'});
+    const chatSnap=await db.ref(`chats/${chatId}`).get();
+    const chat=map(chatSnap.val());
+    if(!chatSnap.exists()||safe(chat.status||'open').toLowerCase()!=='open') return res.status(404).json({ok:false,code:'CHAT_NOT_AVAILABLE',message:'Conversa indisponível.'});
+    const participants=map(chat.participants);
+    if(participants[uid]!==true) return res.status(403).json({ok:false,code:'CHAT_PARTICIPANT_REQUIRED',message:'Você não participa desta conversa.'});
+    const others=Object.entries(participants).filter(([participantUid,active])=>participantUid!==uid&&active===true).map(([participantUid])=>participantUid).slice(0,10);
+    if(!others.length) return res.status(409).json({ok:false,code:'CHAT_RECIPIENT_REQUIRED'});
+
+    const messageRef=db.ref(`chat_messages/${chatId}`).push();
+    const messageId=messageRef.key;
+    const productId=safe(chat.productId);
+    const updates={
+      [`chat_messages/${chatId}/${messageId}`]:{senderUid:uid,type:'text',body,createdAtMs:t},
+      [`chats/${chatId}/lastMessage`]:body,
+      [`chats/${chatId}/lastMessageAtMs`]:t,
+      [`chats/${chatId}/lastSenderUid`]:uid,
+      [`chats/${chatId}/updatedAtMs`]:t,
+      [`chats_by_user/${uid}/${chatId}/lastMessage`]:body,
+      [`chats_by_user/${uid}/${chatId}/lastMessageAtMs`]:t,
+      [`chats_by_user/${uid}/${chatId}/updatedAtMs`]:t,
+    };
+    for(const otherUid of others){
+      updates[`chats_by_user/${otherUid}/${chatId}/lastMessage`]=body;
+      updates[`chats_by_user/${otherUid}/${chatId}/lastMessageAtMs`]=t;
+      updates[`chats_by_user/${otherUid}/${chatId}/updatedAtMs`]=t;
+    }
+    await db.ref().update(updates);
+    for(const otherUid of others){
+      await pushNotification(otherUid,{title:'Nova mensagem',body:clip(body,140),type:'chat_new_message',data:{chatId,productId,senderUid:uid}});
+    }
+    return res.status(201).json({ok:true,chatId,messageId,createdAtMs:t});
+  }catch(e){return publicError(res,e,'Não foi possível enviar a mensagem.');}
+});
+// FIRERANK_PRODUCTION_FLOW_V1_EXTENDED_ROUTES_END
+// FIRERANK_PRODUCTION_FLOW_V1_ROUTES_END
 
 app.post('/v1/account/guest-merge', requireUser, rateLimit('guest-merge', 10, 10 * 60 * 1000), async (req, res) => {
   try {
@@ -10610,10 +11116,15 @@ app.post('/v1/account/export', requireUser, rateLimit('account-export', 3, 60 * 
 
 app.get('/v1/boost/catalog', requireUser, rateLimit('boost-catalog', 60, 10 * 60 * 1000), async (_req, res) => {
   try {
-    let raw = {};
-    if (BOOST_CATALOG_JSON) { try { raw = JSON.parse(BOOST_CATALOG_JSON); } catch (_) {} }
-    if (!Object.keys(map(raw)).length) raw = map((await db.ref('public_config/boostCatalog').get()).val());
-    const plans = Object.entries(map(raw)).map(([id, value]) => ({ id, ...map(value) })).filter((x) => integer(x.days,0) > 0 && integer(x.priceCents,0) > 0).slice(0,20);
+    const raw = await getBoostCatalog();
+    const plans = [];
+    for (const [id, value] of Object.entries(map(raw)).slice(0,20)) {
+      const item = { id, planId: safe(value?.planId || id), ...map(value) };
+      if (integer(item.days,0) <= 0 || integer(item.priceCents,0) <= 0 || item.active === false) continue;
+      const pricing = await effectiveCommercialPrice('boost', item.planId, integer(item.priceCents,-1));
+      plans.push({...item,priceCents:pricing.priceCents,basePriceCents:pricing.basePriceCents,offerId:pricing.offerId,offer:pricing.offer});
+    }
+    plans.sort((a,b)=>integer(a.days,0)-integer(b.days,0));
     return res.json({ok:true,plans});
   } catch (e) { return publicError(res,e,'Não foi possível carregar os Patrocinados.'); }
 });
@@ -10694,6 +11205,8 @@ app.post('/v1/orders', requireUser, rateLimit('order-create', 12, 10 * 60 * 1000
     if(fulfillmentType==='pickup'&&local.pickupAvailable!==true)return res.status(422).json({ok:false,code:'PICKUP_UNAVAILABLE'});
     const unitPriceCents=integer(product.pricing?.priceCents,0); if(unitPriceCents<=0)return res.status(409).json({ok:false,code:'PRICE_CHANGED'});
     const storeId=safe(product.storeId), sellerUid=safe(product.ownerUid); const store=map((await db.ref(`stores/${storeId}`).get()).val());
+    const storeSettings=map((await db.ref(`store_settings/${storeId}`).get()).val());
+    if(storeSettings.ordersOpen===false)return res.status(409).json({ok:false,code:'STORE_CLOSED',message:'Esta loja está fechada para novos pedidos agora.'});
     const addressKey=safe(body.addressKey||'primary'); let address={};
     if(fulfillmentType==='delivery'){
       const addressSnap=await db.ref(`user_addresses/${uid}/${addressKey}`).get(); address=map(addressSnap.val());
@@ -10708,6 +11221,7 @@ app.post('/v1/orders', requireUser, rateLimit('order-create', 12, 10 * 60 * 1000
       [`orders_by_buyer/${uid}/${orderId}`]:v42OrderIndexValue(orderId,'sent',t),
       [`orders_by_store/${storeId}/${orderId}`]:v42OrderIndexValue(orderId,'sent',t),
       [`buyer_orders/${uid}/${orderId}`]:{orderId,status:'sent',updatedAtMs:t},
+      [`pending_order_alerts/${orderId}`]:{orderId,sellerUid,storeId,status:'active',repeatCount:0,nextAlertAtMs:t+2*60*1000,createdAtMs:t,updatedAtMs:t},
     };
     await db.ref().update(updates); await appendAudit('order_created',{actorUid:uid,targetUid:sellerUid,referenceId:orderId,status:'sent'});
     await pushNotification(sellerUid,{title:'Novo pedido',body:`Você recebeu um novo pedido de ${clip(product.title,80)}.`,type:'order_created',data:{orderId,productId}});
@@ -10800,6 +11314,84 @@ app.post('/api/orders/:orderId/confirm-delivery', requireUser, rateLimit('confir
   try{const uid=req.auth.uid,orderId=safe(req.params.orderId),order=await v42LoadOrder(orderId);await v42AssertDeliveryActive(uid);if(safe(order.deliveryUid)!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});const status=v42NormalizeStatus(order.status);if(!['arriving','on_route'].includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});await v42WriteOrderState(orderId,order,'delivered',uid,'delivery','confirm_delivery',{deliveryUid:uid});return res.json({ok:true,orderId,status:'delivered'});}catch(e){return publicError(res,e,'Não foi possível confirmar a entrega.');}
 });
 
+
+// FIRERANK_PRODUCTION_FLOW_V1_SCHEDULED_BEGIN
+// FIRERANK_PRODUCTION_FLOW_V1_AI_PLAN_CLEANUP_BEGIN
+async function removePaidPlanAiBenefits() {
+  const snap=await db.ref('subscription_plans').get();
+  const plans=map(snap.val());
+  const updates={};
+  for(const [planKey,raw] of Object.entries(plans)){
+    const plan=map(raw),features=map(plan.features);
+    if(Object.prototype.hasOwnProperty.call(features,'aiAccess')) updates[`subscription_plans/${planKey}/features/aiAccess`]=null;
+    if(Object.prototype.hasOwnProperty.call(features,'aiDailyQuota')) updates[`subscription_plans/${planKey}/features/aiDailyQuota`]=null;
+    if(Object.prototype.hasOwnProperty.call(plan,'aiAccess')) updates[`subscription_plans/${planKey}/aiAccess`]=null;
+    if(Object.prototype.hasOwnProperty.call(plan,'aiDailyQuota')) updates[`subscription_plans/${planKey}/aiDailyQuota`]=null;
+  }
+  if(Object.keys(updates).length) await db.ref().update(updates);
+  return Object.keys(updates).length;
+}
+// FIRERANK_PRODUCTION_FLOW_V1_AI_PLAN_CLEANUP_END
+async function runPendingOrderReminders() {
+  const t=nowMs();
+  const snap=await db.ref('pending_order_alerts').orderByChild('nextAlertAtMs').endAt(t).limitToFirst(100).get();
+  const rows=[]; snap.forEach((child)=>rows.push({orderId:child.key,...map(child.val())}));
+  let notified=0,cleared=0;
+  for(const alert of rows){
+    const orderId=safe(alert.orderId),sellerUid=safe(alert.sellerUid); if(!orderId||!sellerUid) continue;
+    const order=map((await db.ref(`orders/${orderId}`).get()).val());
+    if(v42NormalizeStatus(order.status)!=='sent') { await db.ref(`pending_order_alerts/${orderId}`).remove(); cleared++; continue; }
+    const repeatCount=integer(alert.repeatCount,0);
+    if(repeatCount>=15){await db.ref(`pending_order_alerts/${orderId}`).update({status:'paused_after_limit',updatedAtMs:t});continue;}
+    await pushNotification(sellerUid,{title:'Pedido aguardando resposta',body:'Você tem um novo pedido que ainda precisa ser aceito ou recusado.',type:'order_reminder',data:{orderId,status:'sent',repeat:String(repeatCount+1)}});
+    await db.ref(`pending_order_alerts/${orderId}`).update({repeatCount:repeatCount+1,nextAlertAtMs:t+2*60*1000,lastAlertAtMs:t,updatedAtMs:t});
+    notified++;
+  }
+  return {checked:rows.length,notified,cleared,checkedAtMs:t};
+}
+
+async function runDailyNotifications() {
+  const t=nowMs(),day=new Date(t).toISOString().slice(0,10);
+  const config=map((await db.ref('public_config/notifications/daily').get()).val());
+  let discoveryProduct=null;
+  try{
+    const productsSnap=await db.ref('product_cards').orderByChild('createdAtMs').limitToLast(20).get();
+    const candidates=[];
+    productsSnap.forEach((child)=>candidates.push({productId:child.key,...map(child.val())}));
+    candidates.sort((a,b)=>finiteNumber(b.createdAtMs,0)-finiteNumber(a.createdAtMs,0));
+    discoveryProduct=candidates.find((item)=>safe(item.title)&&item.active!==false&&safe(item.status||'active').toLowerCase()!=='archived')||null;
+  }catch(error){console.error('[daily-product]',error?.code||error?.message||'error');}
+  const productTitle=clip(discoveryProduct?.title||'produtos em destaque',120);
+  const dailyTitle=clip(config.title||'Novidades no FireRank',120).replaceAll('{produto}',productTitle);
+  const dailyBody=clip(config.body||'Confira {produto} e outras novidades disponíveis hoje no FireRank.',300).replaceAll('{produto}',productTitle);
+  if(config.active===false) return {active:false,notified:0,day};
+  const runRef=db.ref(`notification_daily_runs/${day}`);
+  const lock=await runRef.transaction((raw)=>{
+    const current=map(raw); const started=finiteNumber(current.startedAtMs,0);
+    if(current.status==='completed') return;
+    if(current.status==='running'&&started>t-HOUR_MS) return;
+    return {status:'running',startedAtMs:t,updatedAtMs:t};
+  },{applyLocally:false});
+  if(!lock.committed) return {active:true,alreadyRunningOrCompleted:true,notified:0,day};
+
+  const subscribersSnap=await db.ref('notification_subscribers').get();
+  const uids=Object.entries(map(subscribersSnap.val())).filter(([,v])=>map(v).active!==false).map(([uid])=>uid).slice(0,5000);
+  let notified=0,skipped=0;
+  for(let offset=0;offset<uids.length;offset+=20){
+    const batch=uids.slice(offset,offset+20);
+    await Promise.all(batch.map(async(uid)=>{
+      try{
+        const pref=map((await db.ref(`user_preferences/${uid}`).get()).val());
+        if(pref.notificationDailyMarketing===false){skipped++;return;}
+        await pushNotification(uid,{title:dailyTitle,body:dailyBody,type:'daily_discovery',data:{day,productId:safe(discoveryProduct?.productId)}});
+        notified++;
+      }catch(error){console.error('[daily-notification]',safe(uid),error?.code||error?.message||'error');}
+    }));
+  }
+  await runRef.set({status:'completed',startedAtMs:finiteNumber(lock.snapshot.val()?.startedAtMs,t),completedAtMs:nowMs(),notified,skipped,updatedAtMs:nowMs()});
+  return {active:true,notified,skipped,day};
+}
+// FIRERANK_PRODUCTION_FLOW_V1_SCHEDULED_END
 
 async function expireBoosts() {
   const t =
@@ -11097,6 +11689,8 @@ async function expireSubscriptions() {
           },
       });
 
+    await syncVerifiedBadgeProjection(item.uid, t); // subscription expiry
+
     await pushNotification(
       item.uid,
       {
@@ -11118,6 +11712,18 @@ async function expireSubscriptions() {
       t,
   };
 }
+
+// FIRERANK_PRODUCTION_FLOW_V1_INTERNAL_ROUTES_BEGIN
+app.post('/api/internal/order-reminders', requireInternalSecret, async(_req,res)=>{
+  try{return res.json({ok:true,...(await runPendingOrderReminders())});}
+  catch(e){return publicError(res,e,'Erro ao processar lembretes de pedidos.');}
+});
+
+app.post('/api/internal/daily-notifications', requireInternalSecret, async(_req,res)=>{
+  try{return res.json({ok:true,...(await runDailyNotifications())});}
+  catch(e){return publicError(res,e,'Erro ao processar notificações diárias.');}
+});
+// FIRERANK_PRODUCTION_FLOW_V1_INTERNAL_ROUTES_END
 
 app.post(
   "/api/internal/expire-boosts",
@@ -11476,6 +12082,11 @@ async function start() {
 
   try {
     await ensurePublicApiConfig();
+    await ensureDefaultBoostCatalog();
+    await ensureDefaultNotificationConfig();
+    await bestEffort("verified-badge-projection-migration", migrateVerifiedBadgeProjectionV2);
+    const removedAiPlanFields = await removePaidPlanAiBenefits();
+    if (removedAiPlanFields > 0) console.log(`FireRank plans: removed ${removedAiPlanFields} paid AI benefit fields.`);
 
   
   } catch (error) {
