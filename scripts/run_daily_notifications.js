@@ -1,7 +1,7 @@
 'use strict';
 
 const baseUrl = String(process.env.FIRERANK_API_BASE_URL || 'https://firerank-api-oxy1.onrender.com').replace(/\/$/, '');
-const secret = String(process.env.FIRERANK_INTERNAL_SECRET || '').trim();
+const secret = String(process.env.FIRERANK_CRON_SECRET || '').trim();
 
 if (!secret) {
   console.error('FIRERANK_CRON=INTERNAL_SECRET_MISSING');
@@ -12,7 +12,7 @@ if (!secret) {
     headers: {
       'Accept': 'application/json',
       'Content-Type': 'application/json',
-      'x-firerank-internal-secret': secret,
+      'x-firerank-cron-secret': secret,
     },
     body: '{}',
   })

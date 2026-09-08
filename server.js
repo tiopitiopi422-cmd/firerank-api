@@ -87,6 +87,9 @@ const ENFORCE_GOOGLE_PLAY_BILLING =
 const INTERNAL_MAINTENANCE_SECRET = String(
   process.env.INTERNAL_MAINTENANCE_SECRET || ""
 );
+const FIRERANK_CRON_SECRET = String(
+  process.env.FIRERANK_CRON_SECRET || ""
+).trim();
 const MEDIA_TOKEN_SECRET = String(process.env.MEDIA_TOKEN_SECRET || "");
 const BOOST_CATALOG_JSON = String(process.env.BOOST_CATALOG_JSON || "");
 
@@ -597,6 +600,27 @@ function requireInternalSecret(
         message:
           "Não autorizado.",
       });
+  }
+
+  return next();
+}
+
+function requireCronSecret(req, res, next) {
+  if (!FIRERANK_CRON_SECRET) {
+    return res.status(503).json({
+      ok: false,
+      code: "CRON_SECRET_NOT_CONFIGURED",
+      message: "Agendador interno não configurado.",
+    });
+  }
+
+  const supplied = safe(req.headers["x-firerank-cron-secret"]);
+  if (!supplied || !timingSafeEqualText(supplied, FIRERANK_CRON_SECRET)) {
+    return res.status(401).json({
+      ok: false,
+      code: "CRON_AUTH_REQUIRED",
+      message: "Não autorizado.",
+    });
   }
 
   return next();
@@ -11714,12 +11738,12 @@ async function expireSubscriptions() {
 }
 
 // FIRERANK_PRODUCTION_FLOW_V1_INTERNAL_ROUTES_BEGIN
-app.post('/api/internal/order-reminders', requireInternalSecret, async(_req,res)=>{
+app.post('/api/internal/order-reminders', requireCronSecret, async(_req,res)=>{
   try{return res.json({ok:true,...(await runPendingOrderReminders())});}
   catch(e){return publicError(res,e,'Erro ao processar lembretes de pedidos.');}
 });
 
-app.post('/api/internal/daily-notifications', requireInternalSecret, async(_req,res)=>{
+app.post('/api/internal/daily-notifications', requireCronSecret, async(_req,res)=>{
   try{return res.json({ok:true,...(await runDailyNotifications())});}
   catch(e){return publicError(res,e,'Erro ao processar notificações diárias.');}
 });
@@ -11937,6 +11961,8 @@ app.get(
           ENFORCE_GOOGLE_PLAY_BILLING,
         maintenanceSecretConfigured:
           !!INTERNAL_MAINTENANCE_SECRET,
+        cronSecretConfigured:
+          !!FIRERANK_CRON_SECRET,
         boostCatalogEnvConfigured:
           !!BOOST_CATALOG_JSON,
       });
