@@ -8794,6 +8794,50 @@ async function handleProfessionalApplication(role, req, res) {
     if (age < 18) return res.status(422).json({ok:false,code:"AGE_NOT_ELIGIBLE",message:"É necessário ter 18 anos ou mais."});
     if (!safe(body.fullName) || !safe(body.cpf) || !safe(body.phone) || !safe(body.city) || !safe(body.state)) return res.status(422).json({ok:false,code:"REQUIRED_FIELDS",message:"Preencha todos os dados obrigatórios."});
     if (!bool(body.termsAccepted) || !bool(body.dataProcessingAccepted)) return res.status(422).json({ok:false,code:"CONSENT_REQUIRED",message:"Aceite os termos e o tratamento de dados."});
+    const applicationSource=clip(body.source,40);
+    const legalAcceptanceSnap=await db.ref(`legal_acceptances/${uid}/web`).get();
+    const legalAcceptance=map(legalAcceptanceSnap.val());
+    const legalAcceptedAtMs=integer(legalAcceptance.acceptedAtMs,0);
+
+    const hasLegalConsent=
+      legalAcceptanceSnap.exists() &&
+      legalAcceptance.termsAccepted===true &&
+      legalAcceptance.privacyAcknowledged===true &&
+      legalAcceptedAtMs>0;
+
+    const hasCurrentLegalAcceptance=
+      hasLegalConsent &&
+      safe(legalAcceptance.termsVersion)===FIRERANK_TERMS_VERSION &&
+      safe(legalAcceptance.privacyVersion)===FIRERANK_PRIVACY_VERSION;
+
+    // Compatibilidade temporária com o cliente Flutter legado.
+    // Esses clientes possuem consentimento específico da candidatura,
+    // mas ainda não possuem o fluxo global legal_acceptances.
+    // NUNCA gravar versão jurídica 2026.09 para eles sem aceite canônico real.
+    const legacyProfessionalClient=
+      applicationSource==="flutter_app" ||
+      applicationSource==="flutter_web";
+
+    if (!legacyProfessionalClient && !hasCurrentLegalAcceptance) {
+
+      if (hasLegalConsent) {
+        return res.status(409).json({
+          ok:false,
+          code:"LEGAL_VERSION_OUTDATED",
+          message:"Os documentos jurídicos foram atualizados. Aceite a versão atual antes de continuar.",
+          termsVersion:FIRERANK_TERMS_VERSION,
+          privacyVersion:FIRERANK_PRIVACY_VERSION
+        });
+      }
+
+      return res.status(422).json({
+        ok:false,
+        code:"LEGAL_ACCEPTANCE_REQUIRED",
+        message:"Aceite os Termos de Uso e declare ciência da Política de Privacidade antes de enviar o cadastro.",
+        termsVersion:FIRERANK_TERMS_VERSION,
+        privacyVersion:FIRERANK_PRIVACY_VERSION
+      });
+    }
     const appRef=db.ref(`application_history/${uid}/${role}`).push(); const applicationId=appRef.key;
     const files=req.files||{};
     const directMedia = safe(body.documentFrontMediaId) && safe(body.documentBackMediaId) && safe(body.selfieMediaId);
@@ -8808,7 +8852,13 @@ async function handleProfessionalApplication(role, req, res) {
           uploadIdentityFile(uid,role,applicationId,"document_back",files.documentBack?.[0]),
           uploadIdentityFile(uid,role,applicationId,"selfie",files.selfie?.[0]),
         ]);
-    const common={applicationId,uid,role,status:"pending",fullName:clip(body.fullName,120),birthDate:safe(body.birthDate),phone:clip(body.phone,32),city:clip(body.city,100),state:clip(body.state,8),createdAtMs:t,updatedAtMs:t,source:clip(body.source,40)};
+    const common={applicationId,uid,role,status:"pending",fullName:clip(body.fullName,120),birthDate:safe(body.birthDate),phone:clip(body.phone,32),city:clip(body.city,100),state:clip(body.state,8),createdAtMs:t,updatedAtMs:t,source:applicationSource};
+
+    if (hasCurrentLegalAcceptance) {
+      common.legalTermsVersion=FIRERANK_TERMS_VERSION;
+      common.legalPrivacyVersion=FIRERANK_PRIVACY_VERSION;
+      common.legalAcceptedAtMs=legalAcceptedAtMs;
+    }
     const roleData=role==="seller"?{storeName:clip(body.storeName,120),sellerBio:clip(body.sellerBio,500)}:{vehicleType:clip(body.vehicleType,60),vehiclePlate:clip(body.vehiclePlate,16)};
     const privateData={cpf:clip(body.cpf,20),documents:{documentFront:front,documentBack:back,selfie}};
     const updates={
@@ -8823,6 +8873,41 @@ async function handleProfessionalApplication(role, req, res) {
     return res.status(201).json({ok:true,applicationId,status:"pending"});
   } catch(e){ return publicError(res,e,"Não foi possível enviar o cadastro."); }
 }
+
+// FIRERANK_LEGAL_ACCEPTANCE_V2026_09
+const FIRERANK_TERMS_VERSION = "2026.09";
+const FIRERANK_PRIVACY_VERSION = "2026.09";
+
+app.get("/v1/me/legal/acceptance", requireUser, async (req,res)=>{
+  try{
+    const uid=req.auth.uid;
+    const snap=await db.ref(`legal_acceptances/${uid}/web`).get();
+    const value=map(snap.val());
+    const currentAccepted=
+      value.termsAccepted===true &&
+      value.privacyAcknowledged===true &&
+      safe(value.termsVersion)===FIRERANK_TERMS_VERSION &&
+      safe(value.privacyVersion)===FIRERANK_PRIVACY_VERSION;
+    return res.json({ok:true,currentAccepted,termsVersion:FIRERANK_TERMS_VERSION,privacyVersion:FIRERANK_PRIVACY_VERSION,acceptedAtMs:currentAccepted?integer(value.acceptedAtMs,0):0});
+  }catch(e){return publicError(res,e,"Não foi possível verificar o aceite jurídico.")}
+});
+
+app.post("/v1/me/legal/acceptance", requireUser, rateLimit("legal-acceptance",20,60*60*1000), async (req,res)=>{
+  try{
+    const uid=req.auth.uid; const body=req.body||{};
+    if(!bool(body.termsAccepted)||!bool(body.privacyAcknowledged)){
+      return res.status(422).json({ok:false,code:"LEGAL_ACCEPTANCE_REQUIRED",message:"É necessário aceitar os Termos de Uso e declarar ciência da Política de Privacidade."});
+    }
+    if(safe(body.termsVersion)!==FIRERANK_TERMS_VERSION||safe(body.privacyVersion)!==FIRERANK_PRIVACY_VERSION){
+      return res.status(409).json({ok:false,code:"LEGAL_VERSION_OUTDATED",message:"Os documentos jurídicos foram atualizados. Recarregue a página para continuar.",termsVersion:FIRERANK_TERMS_VERSION,privacyVersion:FIRERANK_PRIVACY_VERSION});
+    }
+    const t=nowMs();
+    const value={uid,termsAccepted:true,privacyAcknowledged:true,termsVersion:FIRERANK_TERMS_VERSION,privacyVersion:FIRERANK_PRIVACY_VERSION,acceptedAtMs:t,updatedAtMs:t,source:clip(body.source||"web",40)};
+    await db.ref(`legal_acceptances/${uid}/web`).set(value);
+    await appendAudit("legal_terms_accepted",{actorUid:uid,targetUid:uid,status:"accepted",referenceId:FIRERANK_TERMS_VERSION});
+    return res.json({ok:true,currentAccepted:true,termsVersion:FIRERANK_TERMS_VERSION,privacyVersion:FIRERANK_PRIVACY_VERSION,acceptedAtMs:t});
+  }catch(e){return publicError(res,e,"Não foi possível registrar o aceite jurídico.")}
+});
 
 app.post("/v1/applications/seller", requireUser, rateLimit("seller-application",3,60*60*1000), professionalUpload, (req,res)=>handleProfessionalApplication("seller",req,res));
 app.post("/v1/applications/delivery", requireUser, rateLimit("delivery-application",3,60*60*1000), professionalUpload, (req,res)=>handleProfessionalApplication("delivery",req,res));
