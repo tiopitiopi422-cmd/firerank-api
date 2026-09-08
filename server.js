@@ -9019,61 +9019,123 @@ app.post("/v1/admin/applications/:role/:uid/decision", requireUser, requireAdmin
   }catch(e){return publicError(res,e,"Não foi possível concluir a análise.");}
 });
 
+// FIRERANK_PUBLIC_SEARCH_V341_BEGIN
+function searchTermsForQuery(value) {
+  const terms = new Set();
+  const raw = clip(value, 120);
+  const full = normalizeSearchTerm(raw);
+  if (full) terms.add(full);
+  for (const part of raw.split(/\s+/).slice(0, 8)) {
+    const term = normalizeSearchTerm(part);
+    if (term.length >= 2) terms.add(term);
+    if (terms.size >= 8) break;
+  }
+  return [...terms];
+}
+function scorePublicSearchCard(card, terms) {
+  const text = normalizeSearchTerm([
+    card?.title,
+    card?.categoryId,
+    card?.city,
+    card?.state,
+  ].filter(Boolean).join(" "));
+  if (!text) return 0;
+  let score = finiteNumber(card?.rankScore, 0);
+  for (const term of terms) {
+    if (!term) continue;
+    if (text === term) score += 1200;
+    else if (text.startsWith(term)) score += 700;
+    else if (text.includes(`_${term}`) || text.includes(`${term}_`)) score += 500;
+    else if (text.includes(term)) score += 300;
+  }
+  return score;
+}
+app.get("/v1/public/search", rateLimit("public-search", 180, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const query=clip(req.query?.q,120);
+    const limit=Math.max(1,Math.min(48,integer(req.query?.limit,24)));
+    const terms=searchTermsForQuery(query);
+    if(query.length<2 || !terms.length) return res.status(422).json({ok:false,code:"SEARCH_QUERY_REQUIRED",message:"Digite pelo menos 2 caracteres."});
+
+    const scores=new Map();
+    for(let i=0;i<Math.min(4,terms.length);i+=1){
+      const term=terms[i];
+      const snap=await db.ref(`search_index_basic/${firebaseSafeKey(term)}`).orderByChild("score").limitToLast(80).get();
+      snap.forEach(child=>{
+        const row=map(child.val());
+        const productId=safe(row.productId||child.key);
+        if(!productId)return;
+        scores.set(productId,(scores.get(productId)||0)+finiteNumber(row.score,0)+(terms.length-i)*1000);
+      });
+    }
+
+    const collected=new Map();
+    const rankedIds=[...scores.keys()].sort((a,b)=>(scores.get(b)||0)-(scores.get(a)||0)).slice(0,Math.min(80,limit*3));
+    for(let i=0;i<rankedIds.length;i+=12){
+      const batch=await Promise.all(rankedIds.slice(i,i+12).map(async productId=>{
+        const snap=await db.ref(`product_cards/${productId}`).get();
+        return snap.exists()?{productId,...map(snap.val())}:null;
+      }));
+      for(const card of batch.filter(Boolean)) collected.set(card.productId,card);
+    }
+
+    if(collected.size<Math.min(12,limit)){
+      const [firstSnap,lastSnap]=await Promise.all([
+        db.ref("product_cards").limitToFirst(160).get(),
+        db.ref("product_cards").limitToLast(160).get(),
+      ]);
+      const addFallback=snap=>snap.forEach(child=>{
+        const productId=child.key;
+        const card={productId,...map(child.val())};
+        const localScore=scorePublicSearchCard(card,terms);
+        if(localScore>0 && !collected.has(productId)) collected.set(productId,{...card,__searchScore:localScore});
+      });
+      addFallback(firstSnap);addFallback(lastSnap);
+    }
+
+    const items=[...collected.values()]
+      .map(card=>({card,score:(scores.get(card.productId)||0)+finiteNumber(card.__searchScore,0)+scorePublicSearchCard(card,terms)}))
+      .filter(x=>x.score>0)
+      .sort((a,b)=>b.score-a.score)
+      .slice(0,limit)
+      .map(x=>{const out={...x.card};delete out.__searchScore;return out});
+
+    return res.json({ok:true,query,items,count:items.length});
+  }catch(e){return publicError(res,e,"NÃ£o foi possÃ­vel pesquisar agora.");}
+});
+
 app.post("/v1/account/privacy", requireUser, rateLimit("account-privacy",12,60*60*1000), async(req,res)=>{
   try{
     const uid=req.auth.uid, visibility=safe(req.body?.visibility).toLowerCase(), t=nowMs();
-    if(!["public","private"].includes(visibility)) return res.status(422).json({ok:false,code:"INVALID_VISIBILITY",message:"Privacidade inválida."});
-
+    if(!["public","private"].includes(visibility)) return res.status(422).json({ok:false,code:"INVALID_VISIBILITY",message:"Privacidade invÃ¡lida."});
     const updates={
       [`account_visibility/${uid}`]:visibility,
       [`public_users/${uid}/accountVisibility`]:visibility,
       [`public_users/${uid}/updatedAtMs`]:t,
     };
-
     const productsSnap=await db.ref("products").orderByChild("ownerUid").equalTo(uid).get();
     productsSnap.forEach(child=>{
-      const product=map(child.val());
+      const product={...map(child.val()),productId:child.key};
       const productId=child.key;
       const categoryId=safe(product.categoryId);
+      const terms=searchTermsForProduct(product.title,categoryId);
       const isPublishable=product.status==="active" && safe(product.visibility||"public")==="public" && safe(product.moderation?.status||"approved")==="approved" && finiteNumber(product.lifecycle?.deletedAtMs,0)===0;
-
+      updates[`search_index_basic/${productId}`]=null;
       if(visibility==="private" || !isPublishable){
-        updates[`product_cards/${productId}`]=null;
-        updates[`feed_index/${productId}`]=null;
-        updates[`search_index_basic/${productId}`]=null;
-        updates[`active_boost_cards/${productId}`]=null;
-        if(categoryId) updates[`category_index/${categoryId}/${productId}`]=null;
+        addProjectionRemovals(updates,product,terms);
         return;
       }
-
-      const pricing=map(product.pricing);
       const media=map(product.media);
-      const card={
-        productId,
-        ownerUid:uid,
-        storeId:safe(product.storeId),
-        categoryId,
-        title:clip(product.title,180),
-        productType:safe(product.productType),
-        coverUrl:safe(media.coverUrl),
-        priceCents:integer(pricing.priceCents,0),
-        currency:safe(pricing.currency)||"BRL",
-        createdAtMs:finiteNumber(product.lifecycle?.createdAtMs,t),
-        updatedAtMs:t,
-        accountVisibility:"public",
-      };
-      updates[`product_cards/${productId}`]=card;
-      updates[`feed_index/${productId}`]={productId,createdAtMs:card.createdAtMs,score:0};
-      updates[`search_index_basic/${productId}`]={productId,title:card.title.toLowerCase(),categoryId,storeId:card.storeId,ownerUid:uid,updatedAtMs:t};
-      if(categoryId) updates[`category_index/${categoryId}/${productId}`]={productId,createdAtMs:card.createdAtMs,score:0};
+      const card=publicProductCard(product,safe(Array.isArray(media.thumbUrls)?media.thumbUrls[0]:"")||safe(media.coverUrl),t);
+      card.accountVisibility="public";
+      addPublicProjections(updates,product,card,terms,t);
     });
-
     await db.ref().update(updates);
     await appendAudit("account_privacy_changed",{actorUid:uid,targetUid:uid,status:visibility});
     return res.json({ok:true,visibility});
-  }catch(e){return publicError(res,e,"Não foi possível alterar a privacidade.");}
+  }catch(e){return publicError(res,e,"NÃ£o foi possÃ­vel alterar a privacidade.");}
 });
-
+// FIRERANK_PUBLIC_SEARCH_V341_END
 app.post("/v1/support/chat", requireUser, rateLimit("support-chat",15,60*60*1000), async(req,res)=>{
   try{
     const uid=req.auth.uid,t=nowMs(); const ent=map((await db.ref(`entitlements/${uid}`).get()).val());
