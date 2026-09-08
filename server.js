@@ -10756,22 +10756,93 @@ app.post(
   }
 );
 
+// FIRERANK_AI_MARKETPLACE_V36_BEGIN
+function aiMarketplaceNormalize(value){
+  return safe(value).normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase().replace(/[^a-z0-9]+/g," ").replace(/\s+/g," ").trim();
+}
+function aiMarketplaceBudget(message){
+  const text=aiMarketplaceNormalize(message);
+  const read=(m)=>{if(!m)return 0;const raw=String(m[1]||"").replace(/,/g,".");const n=Number(raw);return Number.isFinite(n)&&n>0?Math.round(n*100):0};
+  let max=read(text.match(/(?:ate|no maximo|maximo|menos de|por ate|tenho|orcamento de|orcamento)\s*(?:r\s*)?(\d{1,6}(?:[.,]\d{1,2})?)/));
+  let min=read(text.match(/(?:a partir de|mais de|minimo|minima)\s*(?:r\s*)?(\d{1,6}(?:[.,]\d{1,2})?)/));
+  if(!max){const m=text.match(/(?:r\s*)?(\d{1,6}(?:[.,]\d{1,2})?)\s*(?:reais|real)\b/);if(m&&/(tenho|orcamento|ate|gastar|custar|preco)/.test(text))max=read(m)}
+  return{maxCents:max,minCents:min};
+}
+function aiMarketplaceIntent(message){
+  const text=aiMarketplaceNormalize(message),budget=aiMarketplaceBudget(message);
+  const stop=new Set(["quero","queria","preciso","procuro","procurando","busco","buscar","mostra","mostrar","mostre","tem","algum","alguma","algo","coisa","coisas","produto","produtos","para","pra","com","sem","uma","um","uns","umas","de","da","do","das","dos","em","no","na","nos","nas","o","a","os","as","e","ou","me","eu","por","favor","ate","reais","real","barato","barata","baratos","baratas","oferta","ofertas","local","locais","entrega","delivery"]);
+  const terms=text.split(" ").filter(x=>x.length>=2&&!stop.has(x)&&!/^\d+$/.test(x)).slice(0,10);
+  return{
+    text,terms,maxCents:budget.maxCents,minCents:budget.minCents,
+    local:/\b(local|locais|perto|proximo|proxima)\b/.test(text),
+    affiliate:/\b(afiliado|afiliados|loja externa)\b/.test(text),
+    offers:/\b(oferta|ofertas|promo|promocao|promocoes|desconto|descontos|barato|barata|baratos|baratas)\b/.test(text),
+    bestRated:/\b(bem avaliado|bem avaliados|melhor avaliado|melhores avaliados|avaliacao|avaliacoes)\b/.test(text),
+    recent:/\b(novo|nova|novos|novas|recente|recentes|novidade|novidades)\b/.test(text),
+    delivery:/\b(entrega|entregar|delivery)\b/.test(text),
+    pickup:/\b(retirada|retirar|buscar no local)\b/.test(text)
+  };
+}
+function aiMarketplaceLabels(intent){
+  const out=[];
+  const money=(c)=>{try{return new Intl.NumberFormat("pt-BR",{style:"currency",currency:"BRL"}).format(c/100)}catch(_){return `R$ ${(c/100).toFixed(2)}`}};
+  if(intent.maxCents)out.push(`até ${money(intent.maxCents)}`);if(intent.minCents)out.push(`a partir de ${money(intent.minCents)}`);
+  if(intent.local)out.push("produtos locais");if(intent.affiliate)out.push("afiliados");if(intent.offers)out.push("ofertas");if(intent.bestRated)out.push("bem avaliados");if(intent.recent)out.push("novidades");if(intent.delivery)out.push("com entrega");if(intent.pickup)out.push("com retirada");
+  return out.slice(0,6);
+}
+function aiMarketplacePublicCard(id,card){
+  const c=map(card);
+  return{
+    id:safe(c.id||c.productId||id),title:clip(c.title,180),coverUrl:clip(c.coverUrl||c.imageUrl,1200),productType:clip(c.productType,40),
+    currentPriceCents:Math.max(0,integer(c.currentPriceCents||c.promoPriceCents||c.priceCents,0)),priceCents:Math.max(0,integer(c.priceCents||c.originalPriceCents,0)),currency:clip(c.currency||"BRL",8),
+    categoryId:clip(c.categoryId,120),categoryTitle:clip(c.categoryTitle,160),city:clip(c.city,120),state:clip(c.state,80),storeId:clip(c.storeId,160),ownerUid:clip(c.ownerUid,160),
+    deliveryAvailable:c.deliveryAvailable===true,pickupAvailable:c.pickupAvailable===true,discountPercent:Math.max(0,finiteNumber(c.discountPercent,0)),ratingAverage:Math.max(0,finiteNumber(c.ratingAverage,0)),ratingCount:Math.max(0,integer(c.ratingCount,0)),createdAtMs:Math.max(0,integer(c.createdAtMs,0))
+  };
+}
+async function aiMarketplaceContext(message,limit=6){
+  const intent=aiMarketplaceIntent(message);
+  const snap=await db.ref("product_cards").limitToLast(180).get();
+  const cards=map(snap.val()),rows=[];
+  for(const [id,raw] of Object.entries(cards)){
+    const p=aiMarketplacePublicCard(id,raw);if(!p.id||!p.title)continue;
+    const price=p.currentPriceCents||p.priceCents||0;
+    if(intent.maxCents&&(!price||price>intent.maxCents))continue;if(intent.minCents&&price<intent.minCents)continue;
+    if(intent.local&&safe(p.productType).toLowerCase()!=="local")continue;if(intent.affiliate&&safe(p.productType).toLowerCase()!=="affiliate")continue;if(intent.delivery&&p.deliveryAvailable!==true)continue;if(intent.pickup&&p.pickupAvailable!==true)continue;if(intent.offers&&!(p.discountPercent>0||(p.priceCents>0&&p.currentPriceCents>0&&p.currentPriceCents<p.priceCents)))continue;if(intent.bestRated&&p.ratingAverage<4)continue;
+    const hay=aiMarketplaceNormalize([p.title,p.categoryTitle,p.city,p.state].filter(Boolean).join(" "));let score=0;
+    for(const term of intent.terms){if(hay===term)score+=120;else if(hay.startsWith(term))score+=70;else if(hay.includes(term))score+=35}
+    if(!intent.terms.length)score=1;if(intent.offers)score+=Math.min(40,p.discountPercent);if(intent.bestRated)score+=Math.round(p.ratingAverage*8);if(intent.recent)score+=Math.max(0,20-Math.floor((nowMs()-p.createdAtMs)/(7*DAY_MS)));
+    if(score>0)rows.push({p,score});
+  }
+  rows.sort((a,b)=>b.score-a.score||b.p.ratingAverage-a.p.ratingAverage||b.p.createdAtMs-a.p.createdAtMs);
+  return{intent,labels:aiMarketplaceLabels(intent),products:rows.slice(0,Math.max(1,Math.min(8,limit))).map(x=>x.p)};
+}
+
 app.post("/v1/ai/v2/chat", requireUser, rateLimit("gemini-chat",30,60*60*1000), async(req,res)=>{
   try{
     if(!GEMINI_API_KEY || !GEMINI_MODEL) return res.status(503).json({ok:false,code:"AI_NOT_CONFIGURED",message:"A IA ainda não está configurada."});
     const uid=req.auth.uid,t=nowMs(); const message=clip(req.body?.message||req.body?.text,6000); if(!message) return res.status(422).json({ok:false,code:"MESSAGE_REQUIRED"});
-    const quota=20; const plan="normal";
+    const ent=map((await db.ref(`entitlements/${uid}`).get()).val()); let quota=20; const plan=safe(ent.verifiedPlan).replace(/^verified_/,"").toLowerCase(); if(ent.subscriptionActive===true){if(plan==="plus")quota=100;if(plan==="pro")quota=300;}
     const day=new Date().toISOString().slice(0,10); const usageRef=db.ref(`ai_usage/${uid}/${day}`); const usage=map((await usageRef.get()).val()); const used=integer(usage.messages,0); if(used>=quota) return res.status(429).json({ok:false,code:"AI_DAILY_QUOTA",message:"Sua cota diária de IA foi atingida.",quota,used});
     const history=Array.isArray(req.body?.history)?req.body.history.slice(-6):[];
+    const shopping=await aiMarketplaceContext(message,6).catch(error=>{console.warn("[ai-marketplace-context]",error?.code||error?.message||error);return{intent:aiMarketplaceIntent(message),labels:[],products:[]}});
+    const publicCatalog=shopping.products.map(p=>({id:p.id,title:p.title,priceCents:p.currentPriceCents||p.priceCents,currency:p.currency,type:p.productType,category:p.categoryTitle,city:p.city,state:p.state,delivery:p.deliveryAvailable,pickup:p.pickupAvailable,rating:p.ratingAverage,discountPercent:p.discountPercent}));
+    const system=[
+      "Você é o FireRank AI, assistente de compras e navegação do marketplace FireRank.",
+      "Entenda pedidos em linguagem natural, inclusive orçamento, categoria, entrega, retirada, localização, ofertas e preferência por avaliações.",
+      "Quando o usuário pedir produtos do FireRank, use SOMENTE os produtos reais fornecidos no contexto público do catálogo. Se não houver produto compatível, diga claramente que não encontrou opção correspondente agora; nunca invente produto, preço, vendedor ou disponibilidade.",
+      "Você pode ajudar a comparar opções e explicar como navegar, comprar e conversar no FireRank.",
+      "Nunca afirme ter alterado pagamentos, permissões, cadastros, estoque ou banco de dados. Não peça nem exponha segredos, documentos ou dados privados.",
+      publicCatalog.length?`Contexto público do catálogo para esta mensagem: ${JSON.stringify(publicCatalog)}`:"Nenhum produto público compatível foi encontrado para esta mensagem."
+    ].join("\n");
     const contents=[...history.map(x=>({role:safe(x.role)==="assistant"?"model":"user",parts:[{text:clip(x.text,3000)}]})),{role:"user",parts:[{text:message}]}];
     const url=`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-    const gr=await axios.post(url,{contents,systemInstruction:{parts:[{text:"Você é o FireRank AI. Ajude usuários do aplicativo FireRank com respostas úteis e seguras. Nunca afirme ter alterado pagamentos, permissões, cadastros ou banco de dados. Não peça nem exponha segredos."}]},generationConfig:{temperature:0.5,maxOutputTokens:900}},{timeout:30000});
+    const gr=await axios.post(url,{contents,systemInstruction:{parts:[{text:system}]},generationConfig:{temperature:0.35,maxOutputTokens:900}},{timeout:30000});
     const answer=safe(gr.data?.candidates?.[0]?.content?.parts?.map(p=>p.text||"").join("\n"))||"Não consegui gerar uma resposta agora.";
-    await usageRef.set({messages:used+1,quota,plan:"normal",updatedAtMs:t});
-    return res.json({ok:true,text:answer,answer,usage:{used:used+1,quota}});
+    await usageRef.set({messages:used+1,quota,plan:plan||"normal",updatedAtMs:t});
+    return res.json({ok:true,text:answer,answer,products:shopping.products,shopping:{labels:shopping.labels,matchedProducts:shopping.products.length},usage:{used:used+1,quota}});
   }catch(e){return publicError(res,e,"A IA não conseguiu responder agora.");}
 });
-
+// FIRERANK_AI_MARKETPLACE_V36_END
 app.post("/v1/analytics/banner", rateLimit("banner-analytics",120,60*60*1000), async(req,res)=>{
   try{
     const bannerId=clip(req.body?.bannerId,160);
