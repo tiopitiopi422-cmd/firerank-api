@@ -10994,6 +10994,205 @@ app.get('/v1/me/profile', requireUser, rateLimit('me-profile', 120, 10 * 60 * 10
   }catch(e){return publicError(res,e,'Não foi possível carregar seu perfil.');}
 });
 
+// FIRERANK_WEB_V3_1_1_CHAT_BADGE_API_BEGIN
+function webV311BadgePayload(raw, t = nowMs()) {
+  const badge = map(raw);
+  const type = safe(badge.badgeType || badge.type).toLowerCase();
+  const expiresAtMs = finiteNumber(
+    badge.expiresAtMs || badge.verifiedUntilMs || badge.untilMs,
+    0
+  );
+  const recognized = badge.official === true ||
+    badge.verified === true ||
+    ["official", "verified", "verification", "creator", "fire"].includes(type);
+  const active = badge.active === true && recognized &&
+    (expiresAtMs <= 0 || expiresAtMs > t);
+  return {
+    active,
+    official: active && (badge.official === true || type === "official"),
+    verified: active,
+    badgeType: active ? (type || (badge.official === true ? "official" : "verified")) : "",
+    label: active ? clip(badge.label || (badge.official === true ? "Oficial" : "Verificado"), 80) : "",
+    expiresAtMs: active ? expiresAtMs : 0,
+  };
+}
+
+function webV311PublicUserPayload(uid, raw, badgeRaw, { allowPrivateShell = false } = {}) {
+  const profile = map(raw);
+  const visibility = safe(profile.accountVisibility || profile.visibility || "public").toLowerCase();
+  if (!allowPrivateShell && visibility === "private") return null;
+  const badge = webV311BadgePayload(badgeRaw);
+  return {
+    uid: safe(uid),
+    displayName: clip(profile.displayName || profile.nickname || profile.name, 120),
+    username: clip(profile.username, 40),
+    bio: allowPrivateShell ? "" : clip(profile.bio, 500),
+    photoUrl: safe(profile.photoUrl || profile.photoURL || profile.profilePhotoUrl || profile.photo || profile.avatarUrl),
+    city: allowPrivateShell ? "" : clip(profile.city, 100),
+    state: allowPrivateShell ? "" : clip(profile.state, 40),
+    accountVisibility: visibility === "private" ? "private" : "public",
+    verifiedBadge: badge.active,
+    publicVerified: badge.active,
+    badgeActive: badge.active,
+    verifiedBadgeType: badge.badgeType,
+    verifiedUntilMs: badge.expiresAtMs,
+    _verified: badge,
+  };
+}
+
+async function webV311LoadPublicUser(uid, options = {}) {
+  const id = safe(uid);
+  if (!id) return null;
+  const [userSnap, badgeSnap] = await Promise.all([
+    db.ref(`public_users/${id}`).get(),
+    db.ref(`public_badges/${id}`).get(),
+  ]);
+  if (!userSnap.exists() && !options.allowMissingProfile) return null;
+  const payload = webV311PublicUserPayload(id, userSnap.val(), badgeSnap.val(), options);
+  if (payload) return payload;
+  if (options.allowPrivateShell) {
+    const badge = webV311BadgePayload(badgeSnap.val());
+    return {
+      uid: id,
+      displayName: "",
+      username: "",
+      bio: "",
+      photoUrl: "",
+      city: "",
+      state: "",
+      accountVisibility: "private",
+      verifiedBadge: badge.active,
+      publicVerified: badge.active,
+      badgeActive: badge.active,
+      verifiedBadgeType: badge.badgeType,
+      verifiedUntilMs: badge.expiresAtMs,
+      _verified: badge,
+    };
+  }
+  return null;
+}
+
+app.get('/v1/public/users/:uid', rateLimit('web-public-user', 240, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=safe(req.params.uid);
+    if(!uid) return res.status(422).json({ok:false,code:'UID_REQUIRED'});
+    const user=await webV311LoadPublicUser(uid);
+    if(!user) return res.status(404).json({ok:false,code:'PUBLIC_USER_NOT_FOUND'});
+    return res.json({ok:true,user,badge:user._verified});
+  }catch(e){return publicError(res,e,'Não foi possível carregar este perfil público.');}
+});
+
+app.post('/v1/public/users/batch', rateLimit('web-public-user-batch', 120, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const input=Array.isArray(req.body?.uids)?req.body.uids:[];
+    const uids=[...new Set(input.map(safe).filter(Boolean))].slice(0,50);
+    const users=[];
+    for(let i=0;i<uids.length;i+=10){
+      const batch=await Promise.all(uids.slice(i,i+10).map(uid=>webV311LoadPublicUser(uid).catch(()=>null)));
+      users.push(...batch.filter(Boolean));
+    }
+    return res.json({ok:true,users});
+  }catch(e){return publicError(res,e,'Não foi possível carregar os perfis públicos.');}
+});
+
+app.get('/v1/chats', requireUser, rateLimit('web-chat-list', 180, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid;
+    const limit=Math.max(1,Math.min(80,integer(req.query?.limit,60)));
+    const indexSnap=await db.ref(`chats_by_user/${uid}`).get();
+    const indexMap=map(indexSnap.val());
+    const entries=Object.entries(indexMap)
+      .sort((a,b)=>finiteNumber(map(b[1]).updatedAtMs||map(b[1]).lastMessageAtMs,0)-finiteNumber(map(a[1]).updatedAtMs||map(a[1]).lastMessageAtMs,0))
+      .slice(0,limit);
+    const items=[];
+    for(let i=0;i<entries.length;i+=8){
+      const batch=await Promise.all(entries.slice(i,i+8).map(async([chatId,indexRaw])=>{
+        try{
+          const index=map(indexRaw);
+          const chatSnap=await db.ref(`chats/${chatId}`).get();
+          const chat=map(chatSnap.val());
+          if(!chatSnap.exists()||map(chat.participants)[uid]!==true)return null;
+          const participants=map(chat.participants);
+          const otherUid=safe(index.otherUid)||Object.keys(participants).find(x=>x!==uid&&participants[x]===true)||'';
+          const productId=safe(chat.productId||index.productId||map(chat.productSnapshot).productId);
+          const [otherUser,productSnap]=await Promise.all([
+            otherUid?webV311LoadPublicUser(otherUid,{allowPrivateShell:true,allowMissingProfile:true}).catch(()=>null):null,
+            productId?db.ref(`product_cards/${productId}`).get():Promise.resolve(null),
+          ]);
+          const product=productSnap&&productSnap.exists()?map(productSnap.val()):{};
+          const otherSnap=map(chat.otherSnapshot);
+          const displayName=clip(otherUser?.displayName||index.otherName||otherSnap.displayName||chat.otherName||'Conversa',120);
+          return{
+            id:chatId,
+            chatId,
+            type:clip(chat.type||index.type||'private',40),
+            status:clip(chat.status||'open',40),
+            otherUid,
+            otherName:displayName,
+            otherPhoto:safe(otherUser?.photoUrl||index.otherPhoto||otherSnap.photoUrl||chat.otherPhoto),
+            otherVerified:otherUser?._verified?.active===true,
+            otherUser:otherUser?{...otherUser,displayName:displayName||otherUser.displayName}:null,
+            productId,
+            productTitle:clip(product.title||map(chat.productSnapshot).title||index.productTitle||chat.productTitle,160),
+            lastMessage:clip(index.lastMessage||index.lastMessageBody||chat.lastMessage||chat.lastMessageBody,4000),
+            lastMessageAtMs:finiteNumber(index.lastMessageAtMs||chat.lastMessageAtMs,0),
+            updatedAtMs:finiteNumber(index.updatedAtMs||chat.updatedAtMs,0),
+            unread:Math.max(0,integer(index.unreadCount||index.unread,0)),
+          };
+        }catch(error){console.error('[web-chat-list-item]',safe(chatId),error?.code||error?.message||'error');return null;}
+      }));
+      items.push(...batch.filter(Boolean));
+    }
+    items.sort((a,b)=>(b.lastMessageAtMs||b.updatedAtMs)-(a.lastMessageAtMs||a.updatedAtMs));
+    return res.json({ok:true,items});
+  }catch(e){return publicError(res,e,'Não foi possível carregar suas conversas.');}
+});
+
+app.get('/v1/chats/:chatId/messages', requireUser, rateLimit('web-chat-messages', 300, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,chatId=safe(req.params.chatId);
+    const chatSnap=await db.ref(`chats/${chatId}`).get();
+    const chat=map(chatSnap.val());
+    if(!chatSnap.exists()||map(chat.participants)[uid]!==true)return res.status(403).json({ok:false,code:'CHAT_PARTICIPANT_REQUIRED'});
+    const limit=Math.max(1,Math.min(120,integer(req.query?.limit,80)));
+    const afterMs=Math.max(0,finiteNumber(req.query?.afterMs,0));
+    const messagesSnap=await db.ref(`chat_messages/${chatId}`).orderByChild('createdAtMs').limitToLast(limit).get();
+    const messages=[];
+    messagesSnap.forEach(child=>{
+      const raw=map(child.val());
+      const createdAtMs=finiteNumber(raw.createdAtMs,0);
+      if(afterMs>0&&createdAtMs<=afterMs)return;
+      messages.push({id:child.key,senderUid:safe(raw.senderUid),type:clip(raw.type||'text',30),body:clip(raw.body,4000),createdAtMs});
+    });
+    messages.sort((a,b)=>a.createdAtMs-b.createdAtMs);
+    return res.json({ok:true,chatId,messages});
+  }catch(e){return publicError(res,e,'Não foi possível carregar as mensagens.');}
+});
+
+app.get('/v1/chats/:chatId', requireUser, rateLimit('web-chat-detail', 180, 10 * 60 * 1000), async(req,res)=>{
+  try{
+    const uid=req.auth.uid,chatId=safe(req.params.chatId);
+    const chatSnap=await db.ref(`chats/${chatId}`).get();
+    const chat=map(chatSnap.val());
+    if(!chatSnap.exists()||map(chat.participants)[uid]!==true)return res.status(403).json({ok:false,code:'CHAT_PARTICIPANT_REQUIRED'});
+    const participants=map(chat.participants);
+    const otherUid=Object.keys(participants).find(x=>x!==uid&&participants[x]===true)||'';
+    const otherUser=otherUid?await webV311LoadPublicUser(otherUid,{allowPrivateShell:true,allowMissingProfile:true}).catch(()=>null):null;
+    const messageLimit=Math.max(1,Math.min(100,integer(req.query?.limit,60)));
+    const messagesSnap=await db.ref(`chat_messages/${chatId}`).orderByChild('createdAtMs').limitToLast(messageLimit).get();
+    const messages=[];
+    messagesSnap.forEach(child=>{const raw=map(child.val());messages.push({id:child.key,senderUid:safe(raw.senderUid),type:clip(raw.type||'text',30),body:clip(raw.body,4000),createdAtMs:finiteNumber(raw.createdAtMs,0)});});
+    messages.sort((a,b)=>a.createdAtMs-b.createdAtMs);
+    return res.json({
+      ok:true,
+      chat:{chatId,type:clip(chat.type||'private',40),status:clip(chat.status||'open',40),productId:safe(chat.productId),otherUid},
+      otherUser,
+      messages,
+    });
+  }catch(e){return publicError(res,e,'Não foi possível abrir esta conversa.');}
+});
+// FIRERANK_WEB_V3_1_1_CHAT_BADGE_API_END
+
 app.post('/v1/chats/:chatId/messages', requireUser, rateLimit('chat-message-send', 90, 10 * 60 * 1000), async(req,res)=>{
   try{
     const uid=req.auth.uid,chatId=safe(req.params.chatId),body=clip(req.body?.body||req.body?.message,4000),t=nowMs();
