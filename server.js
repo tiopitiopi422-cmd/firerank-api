@@ -2573,6 +2573,7 @@ function normalizePaymentMethods(
 ) {
   const allowed =
     new Set([
+      "pix_direct",
       "pix_on_delivery",
       "cash_on_delivery",
       "card_machine",
@@ -11833,6 +11834,1055 @@ async function runDailyNotifications() {
   return {active:true,notified,skipped,day};
 }
 // FIRERANK_PRODUCTION_FLOW_V1_SCHEDULED_END
+
+// FIRERANK_MASTER_V5_BEGIN
+// FireRank Master V5: Pix direto + pre-pedido + Entrega FireRank regional.
+// O FireRank registra estados/valores, mas nao recebe nem custodia o dinheiro da compra.
+
+const FIRERANK_REGIONAL_DELIVERY_TIMEZONE = "America/Sao_Paulo";
+const FIRERANK_REGIONAL_DELIVERY_START_HOUR = 19;
+const FIRERANK_REGIONAL_DELIVERY_END_HOUR = 23;
+const FIRERANK_REGIONAL_DELIVERY_PRESENCE_TTL_MS = 12 * 60 * 1000;
+const FIRERANK_REGIONAL_DELIVERY_OFFER_TTL_MS = 5 * 60 * 1000;
+const FIRERANK_COURIER_INACTIVITY_MS = 7 * DAY_MS;
+const FIRERANK_PIX_INTENT_TTL_MS = 30 * 60 * 1000;
+const FIRERANK_COURIER_INITIAL_SCORE = 100;
+
+function frMasterFold(value) {
+  return safe(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function frMasterRegionKey(state, city) {
+  const region = `${frMasterFold(state)}_${frMasterFold(city)}`
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 120);
+  return firebaseSafeKey(region || "unknown");
+}
+
+function frMasterRegionalWindow(atMs = nowMs()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: FIRERANK_REGIONAL_DELIVERY_TIMEZONE,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(atMs));
+  const values = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  const weekday = safe(values.weekday).toLowerCase();
+  const hour = integer(values.hour, -1);
+  const minute = integer(values.minute, 0);
+  const allowedDay = weekday === "fri" || weekday === "sat" || weekday === "sun";
+  const withinHours = hour >= FIRERANK_REGIONAL_DELIVERY_START_HOUR &&
+    (hour < FIRERANK_REGIONAL_DELIVERY_END_HOUR ||
+      (hour === FIRERANK_REGIONAL_DELIVERY_END_HOUR && minute <= 59));
+  return {
+    open: allowedDay && withinHours,
+    weekday,
+    hour,
+    minute,
+    timeZone: FIRERANK_REGIONAL_DELIVERY_TIMEZONE,
+    schedule: "sexta a domingo, das 19h as 23:59",
+  };
+}
+
+function frMasterCoords(value) {
+  const v = map(value);
+  const latitude = finiteNumber(v.latitude, 0);
+  const longitude = finiteNumber(v.longitude, 0);
+  const valid = latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180 && latitude !== 0 && longitude !== 0;
+  return { valid, latitude, longitude };
+}
+
+function frMasterDistanceKm(a, b) {
+  const ca = frMasterCoords(a);
+  const cb = frMasterCoords(b);
+  if (!ca.valid || !cb.valid) return 0;
+  const rad = (degrees) => degrees * Math.PI / 180;
+  const dLat = rad(cb.latitude - ca.latitude);
+  const dLon = rad(cb.longitude - ca.longitude);
+  const lat1 = rad(ca.latitude);
+  const lat2 = rad(cb.latitude);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+function frMasterVehicleClass(distanceKm) {
+  const km = Math.max(0, finiteNumber(distanceKm, 0));
+  if (km > 12) return "car";
+  if (km > 4) return "motorcycle";
+  return "electric_bike";
+}
+
+function frMasterVehicleType(value) {
+  const text = frMasterFold(value);
+  if (text.includes("carro") || text.includes("car")) return "car";
+  if (text.includes("moto") || text.includes("motorcycle")) return "motorcycle";
+  if (text.includes("eletrica") || text.includes("electric") || text.includes("e-bike") || text.includes("ebike")) return "electric_bike";
+  if (text.includes("bicic") || text.includes("bike")) return "bike";
+  return "other";
+}
+
+function frMasterVehicleCompatible(actual, requested) {
+  const a = frMasterVehicleType(actual);
+  const r = safe(requested);
+  if (r === "electric_bike") return ["electric_bike", "motorcycle", "car"].includes(a);
+  if (r === "motorcycle") return ["motorcycle", "car"].includes(a);
+  if (r === "car") return a === "car";
+  return ["bike", "electric_bike", "motorcycle", "car"].includes(a);
+}
+
+function frMasterDeliveryQuote(distanceKm, fallbackCents = 0) {
+  const km = Math.max(0, finiteNumber(distanceKm, 0));
+  if (!km) {
+    const fee = Math.max(0, integer(fallbackCents, 0));
+    return { distanceKm: 0, vehicleClass: "store_configured", deliveryFeeCents: fee, courierPayoutCents: fee };
+  }
+  const vehicleClass = frMasterVehicleClass(km);
+  const rate = vehicleClass === "electric_bike"
+    ? { base: 350, perKm: 110, min: 450, max: 2200 }
+    : vehicleClass === "motorcycle"
+      ? { base: 500, perKm: 165, min: 650, max: 3500 }
+      : { base: 750, perKm: 230, min: 950, max: 5000 };
+  const fee = Math.max(rate.min, Math.min(rate.max, Math.round(rate.base + km * rate.perKm)));
+  return { distanceKm: Number(km.toFixed(2)), vehicleClass, deliveryFeeCents: fee, courierPayoutCents: fee };
+}
+
+function frMasterMaskPixKey(value) {
+  const text = safe(value);
+  if (!text) return "";
+  if (text.length <= 6) return `${text.slice(0, 1)}••••${text.slice(-1)}`;
+  return `${text.slice(0, 3)}••••••${text.slice(-3)}`;
+}
+
+async function frMasterAssertStoreOwner(uid, requestedStoreId) {
+  await assertSellerCanPublish(uid);
+  const storeId = await resolveStoreForUser(uid, requestedStoreId);
+  if (!(await v42SellerOwnsStore(uid, storeId))) {
+    const error = new Error("STORE_ACCESS_DENIED");
+    error.statusCode = 403;
+    error.publicMessage = "Voce nao possui acesso a esta loja.";
+    throw error;
+  }
+  return storeId;
+}
+
+async function frMasterDeliveryOperationalState(uid, { touch = false } = {}) {
+  await v42AssertDeliveryActive(uid);
+  const t = nowMs();
+  const ref = db.ref(`delivery_operational_state/${uid}`);
+  const [snap, roleSnap] = await Promise.all([
+    ref.get(),
+    db.ref(`role_state/${uid}/delivery`).get(),
+  ]);
+  const current = map(snap.val());
+  const roleState = map(roleSnap.val());
+  let status = safe(current.status || "active").toLowerCase();
+  const score = Math.max(0, Math.min(100, integer(current.score, FIRERANK_COURIER_INITIAL_SCORE)));
+  const everWorked = current.everWorked === true;
+  const activatedAtMs = Math.max(
+    finiteNumber(current.activatedAtMs, 0),
+    finiteNumber(roleState.approvedAtMs, 0),
+    finiteNumber(roleState.activatedAtMs, 0),
+    finiteNumber(roleState.createdAtMs, 0),
+  ) || t;
+  const lastWorkAtMs = Math.max(
+    finiteNumber(current.lastCompletedAtMs, 0),
+    finiteNumber(current.lastAcceptedAtMs, 0),
+    finiteNumber(current.lastWorkAtMs, 0),
+  );
+  const inactivityAnchorMs = lastWorkAtMs || activatedAtMs;
+  if (score <= 0) status = "suspended";
+  if (status === "active" && inactivityAnchorMs > 0 && t - inactivityAnchorMs > FIRERANK_COURIER_INACTIVITY_MS) {
+    status = "waitlist";
+  }
+  const next = {
+    status,
+    score,
+    everWorked,
+    activatedAtMs,
+    inactivityAnchorMs,
+    updatedAtMs: t,
+    ...(touch ? { lastActiveAtMs: t } : {}),
+  };
+  if (!snap.exists() || status !== safe(current.status) || touch || !finiteNumber(current.activatedAtMs, 0)) await ref.update(next);
+  return { ...current, ...next };
+}
+
+async function frMasterAdjustCourierScore(uid, delta, reason, orderId = "") {
+  const ref = db.ref(`delivery_operational_state/${uid}`);
+  let finalScore = FIRERANK_COURIER_INITIAL_SCORE;
+  await ref.transaction((raw) => {
+    const current = map(raw);
+    const before = Math.max(0, Math.min(100, integer(current.score, FIRERANK_COURIER_INITIAL_SCORE)));
+    finalScore = Math.max(0, Math.min(100, before + integer(delta, 0)));
+    return {
+      ...current,
+      score: finalScore,
+      status: finalScore <= 0 ? "suspended" : safe(current.status || "active"),
+      updatedAtMs: nowMs(),
+    };
+  }, { applyLocally: false });
+  const eventRef = db.ref(`delivery_score_events/${uid}`).push();
+  await eventRef.set({
+    eventId: eventRef.key,
+    uid,
+    delta: integer(delta, 0),
+    score: finalScore,
+    reason: clip(reason, 80),
+    orderId: clip(orderId, 180),
+    createdAtMs: nowMs(),
+    immutable: true,
+  });
+  return finalScore;
+}
+
+app.get("/v1/seller/store/pix", requireUser, rateLimit("seller-pix-get", 60, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const storeId = await frMasterAssertStoreOwner(uid, safe(req.query?.storeId));
+    const profile = map((await db.ref(`seller_payment_profiles/${storeId}`).get()).val());
+    return res.json({
+      ok: true,
+      storeId,
+      configured: !!safe(profile.pixKey),
+      pixKeyMasked: frMasterMaskPixKey(profile.pixKey),
+      pixKeyType: safe(profile.pixKeyType),
+      beneficiaryName: safe(profile.beneficiaryName),
+      enabled: profile.enabled !== false && !!safe(profile.pixKey),
+      updatedAtMs: finiteNumber(profile.updatedAtMs, 0),
+    });
+  } catch (e) { return publicError(res, e, "Nao foi possivel carregar o Pix da loja."); }
+});
+
+app.post("/v1/seller/store/pix", requireUser, rateLimit("seller-pix-save", 12, 60 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const body = map(req.body);
+    const storeId = await frMasterAssertStoreOwner(uid, safe(body.storeId));
+    const pixKey = clip(body.pixKey, 140);
+    const pixKeyType = safe(body.pixKeyType).toLowerCase();
+    const beneficiaryName = clip(body.beneficiaryName, 120);
+    if (pixKey.length < 3 || !["cpf", "cnpj", "email", "phone", "random"].includes(pixKeyType)) {
+      return res.status(422).json({ ok: false, code: "PIX_DATA_INVALID", message: "Revise a chave Pix e o tipo informado." });
+    }
+    const t = nowMs();
+    await db.ref(`seller_payment_profiles/${storeId}`).set({
+      storeId,
+      sellerUid: uid,
+      pixKey,
+      pixKeyType,
+      beneficiaryName,
+      enabled: true,
+      provider: "direct_pix",
+      custodyByFireRank: false,
+      updatedAtMs: t,
+    });
+    await appendAudit("seller_pix_updated", { actorUid: uid, targetUid: uid, referenceId: storeId, status: "configured" });
+    return res.json({ ok: true, storeId, pixKeyMasked: frMasterMaskPixKey(pixKey), pixKeyType, beneficiaryName, enabled: true });
+  } catch (e) { return publicError(res, e, "Nao foi possivel salvar o Pix da loja."); }
+});
+
+async function frMasterCreatePixIntent(uid, body) {
+  const productId = safe(body.productId);
+  const quantity = Math.max(1, Math.min(20, integer(body.quantity, 1)));
+  const fulfillmentType = safe(body.fulfillmentType).toLowerCase();
+  const productSnap = await db.ref(`products/${productId}`).get();
+  const product = map(productSnap.val());
+  if (!productSnap.exists() || safe(product.status) !== "active" || safe(product.productType) !== "local") {
+    const error = new Error("PRODUCT_NOT_AVAILABLE");
+    error.statusCode = 404;
+    error.publicMessage = "Produto local indisponivel.";
+    throw error;
+  }
+  const sellerUid = safe(product.ownerUid);
+  if (!sellerUid || sellerUid === uid) {
+    const error = new Error("OWN_PRODUCT");
+    error.statusCode = 403;
+    error.publicMessage = "Voce nao pode comprar seu proprio produto.";
+    throw error;
+  }
+  if (!(await v42CanBuyerAccessProduct(uid, product))) {
+    const error = new Error("PRODUCT_PRIVATE");
+    error.statusCode = 403;
+    error.publicMessage = "Produto indisponivel para esta conta.";
+    throw error;
+  }
+  const local = map(product.local);
+  const localType = safe(local.localType).toLowerCase();
+  const preorderAllowed = localType === "custom_order" || safe(local.orderType).toLowerCase() === "preorder";
+  if (!["delivery", "pickup", "preorder"].includes(fulfillmentType)) {
+    const error = new Error("INVALID_FULFILLMENT");
+    error.statusCode = 422;
+    throw error;
+  }
+  if (fulfillmentType === "delivery" && local.deliveryAvailable !== true) {
+    const error = new Error("DELIVERY_UNAVAILABLE"); error.statusCode = 422; throw error;
+  }
+  if (fulfillmentType === "pickup" && local.pickupAvailable !== true) {
+    const error = new Error("PICKUP_UNAVAILABLE"); error.statusCode = 422; throw error;
+  }
+  if (fulfillmentType === "preorder" && !preorderAllowed) {
+    const error = new Error("PREORDER_UNAVAILABLE"); error.statusCode = 422; throw error;
+  }
+
+  const storeId = safe(product.storeId);
+  const store = map((await db.ref(`stores/${storeId}`).get()).val());
+  const paymentProfile = map((await db.ref(`seller_payment_profiles/${storeId}`).get()).val());
+  if (!safe(paymentProfile.pixKey) || paymentProfile.enabled === false) {
+    const error = new Error("SELLER_PIX_NOT_CONFIGURED");
+    error.statusCode = 409;
+    error.publicMessage = "A loja ainda nao configurou a chave Pix.";
+    throw error;
+  }
+
+  const unitPriceCents = integer(product.pricing?.priceCents, 0);
+  if (unitPriceCents <= 0) {
+    const error = new Error("PRICE_CHANGED"); error.statusCode = 409; throw error;
+  }
+  const productAmountCents = unitPriceCents * quantity;
+  let buyerAddress = {};
+  let sellerAddress = {};
+  let quote = { distanceKm: 0, vehicleClass: "none", deliveryFeeCents: 0, courierPayoutCents: 0 };
+  if (fulfillmentType === "delivery") {
+    const addressKey = safe(body.addressKey || "primary");
+    const buyerSnap = await db.ref(`user_addresses/${uid}/${addressKey}`).get();
+    buyerAddress = map(buyerSnap.val());
+    if (!buyerSnap.exists() || !safe(buyerAddress.city) || !safe(buyerAddress.state)) {
+      const error = new Error("ADDRESS_REQUIRED");
+      error.statusCode = 422;
+      error.publicMessage = "Cadastre um endereco valido para entrega.";
+      throw error;
+    }
+    const sellerAddressKey = safe(local.addressId || local.sellerAddressKey || "primary");
+    sellerAddress = map((await db.ref(`user_addresses/${sellerUid}/${sellerAddressKey}`).get()).val());
+    const distanceKm = frMasterDistanceKm(buyerAddress, sellerAddress);
+    const serviceRadiusKm = finiteNumber(local.serviceRadiusKm, 0);
+    if (distanceKm > 0 && serviceRadiusKm > 0 && distanceKm > serviceRadiusKm) {
+      const error = new Error("OUTSIDE_DELIVERY_RADIUS");
+      error.statusCode = 422;
+      error.publicMessage = "Este endereco esta fora do raio de entrega da loja.";
+      throw error;
+    }
+    quote = frMasterDeliveryQuote(distanceKm, integer(local.deliveryFeeCents, 0));
+    if (quote.deliveryFeeCents <= 0) {
+      const error = new Error("DELIVERY_QUOTE_UNAVAILABLE");
+      error.statusCode = 409;
+      error.publicMessage = "Nao foi possivel calcular a entrega agora.";
+      throw error;
+    }
+  }
+
+  const t = nowMs();
+  const intentRef = db.ref("pix_checkout_intents").push();
+  const intentId = intentRef.key;
+  const totalCents = productAmountCents + quote.deliveryFeeCents;
+  const intent = {
+    intentId,
+    buyerUid: uid,
+    sellerUid,
+    storeId,
+    productId,
+    productTitle: clip(product.title, 180),
+    quantity,
+    fulfillmentType,
+    localType,
+    paymentMethod: "pix_direct",
+    paymentCustody: "seller_direct",
+    status: "awaiting_pix",
+    unitPriceCents,
+    productAmountCents,
+    deliveryFeeCents: quote.deliveryFeeCents,
+    courierPayoutCents: quote.courierPayoutCents,
+    deliveryDistanceKm: quote.distanceKm,
+    deliveryVehicleClass: quote.vehicleClass,
+    buyerNote: clip(body.buyerNote, 1000),
+    scheduledAtMs: finiteNumber(body.scheduledAtMs, 0),
+    expiresAtMs: t + FIRERANK_PIX_INTENT_TTL_MS,
+    createdAtMs: t,
+    updatedAtMs: t,
+  };
+  await db.ref().update({
+    [`pix_checkout_intents/${intentId}`]: intent,
+    [`pix_intents_by_buyer/${uid}/${intentId}`]: { intentId, status: intent.status, storeId, updatedAtMs: t },
+    [`pix_intents_by_store/${storeId}/${intentId}`]: { intentId, status: intent.status, buyerUid: uid, updatedAtMs: t },
+    [`pix_checkout_private/${intentId}/deliveryAddress`]: fulfillmentType === "delivery" ? buyerAddress : null,
+    [`pix_checkout_private/${intentId}/pickupAddress`]: fulfillmentType === "delivery" ? sellerAddress : null,
+  });
+  await appendAudit("pix_intent_created", { actorUid: uid, targetUid: sellerUid, referenceId: intentId, status: "awaiting_pix" });
+  return {
+    ...intent,
+    totalCents,
+    pixKey: safe(paymentProfile.pixKey),
+    pixKeyType: safe(paymentProfile.pixKeyType),
+    beneficiaryName: safe(paymentProfile.beneficiaryName),
+    custodyByFireRank: false,
+  };
+}
+
+app.post("/v1/checkout/pix-intent", requireUser, rateLimit("pix-intent-create", 12, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const result = await frMasterCreatePixIntent(req.auth.uid, map(req.body));
+    return res.status(201).json({ ok: true, ...result });
+  } catch (e) { return publicError(res, e, "Nao foi possivel preparar o Pix."); }
+});
+
+app.get("/v1/checkout/pix-intent", requireUser, rateLimit("pix-intent-get", 60, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const intentId = safe(req.query?.intentId);
+    const snap = await db.ref(`pix_checkout_intents/${intentId}`).get();
+    const intent = map(snap.val());
+    if (!snap.exists()) return res.status(404).json({ ok: false, code: "PIX_INTENT_NOT_FOUND" });
+    const buyer = safe(intent.buyerUid) === uid;
+    const seller = await v42SellerOwnsStore(uid, safe(intent.storeId));
+    if (!buyer && !seller) return res.status(403).json({ ok: false, code: "PIX_INTENT_ACCESS_DENIED" });
+    const paymentProfile = buyer ? map((await db.ref(`seller_payment_profiles/${safe(intent.storeId)}`).get()).val()) : {};
+    return res.json({
+      ok: true,
+      ...intent,
+      totalCents: integer(intent.productAmountCents, 0) + integer(intent.deliveryFeeCents, 0),
+      ...(buyer && safe(paymentProfile.pixKey) ? {
+        pixKey: safe(paymentProfile.pixKey),
+        pixKeyType: safe(paymentProfile.pixKeyType),
+        beneficiaryName: safe(paymentProfile.beneficiaryName),
+      } : {}),
+      custodyByFireRank: false,
+    });
+  } catch (e) { return publicError(res, e, "Nao foi possivel carregar o pre-pedido."); }
+});
+
+async function frMasterCreateOrderFromPixIntent(intent) {
+  const t = nowMs();
+  const orderId = db.ref("orders").push().key;
+  const fulfillmentType = safe(intent.fulfillmentType);
+  const delivery = fulfillmentType === "delivery";
+  const code = delivery ? String(crypto.randomInt(100000, 999999)) : "";
+  const codeHash = delivery ? stableHash(`${orderId}:${code}`) : "";
+  const productSnap = await db.ref(`products/${safe(intent.productId)}`).get();
+  const product = map(productSnap.val());
+  if (
+    !productSnap.exists() ||
+    safe(product.status).toLowerCase() !== "active" ||
+    safe(product.ownerUid) !== safe(intent.sellerUid) ||
+    safe(product.storeId) !== safe(intent.storeId) ||
+    safe(product.productType).toLowerCase() !== "local"
+  ) {
+    const error = new Error("PRODUCT_NOT_AVAILABLE");
+    error.statusCode = 409;
+    error.publicMessage = "O produto mudou ou ficou indisponivel. Nao confirme o Pix por este pre-pedido.";
+    throw error;
+  }
+  const store = map((await db.ref(`stores/${safe(intent.storeId)}`).get()).val());
+  const privateCheckout = map((await db.ref(`pix_checkout_private/${safe(intent.intentId)}`).get()).val());
+  const order = {
+    orderId,
+    buyerUid: safe(intent.buyerUid),
+    sellerUid: safe(intent.sellerUid),
+    storeId: safe(intent.storeId),
+    productId: safe(intent.productId),
+    quantity: integer(intent.quantity, 1),
+    status: "sent",
+    fulfillmentType,
+    paymentMethod: "pix_direct",
+    paymentState: "confirmed_by_seller",
+    pixIntentId: safe(intent.intentId),
+    productAmountCents: integer(intent.productAmountCents, 0),
+    deliveryFeeCents: integer(intent.deliveryFeeCents, 0),
+    courierPayoutCents: integer(intent.courierPayoutCents, 0),
+    totalCents: integer(intent.productAmountCents, 0) + integer(intent.deliveryFeeCents, 0),
+    deliveryVehicleClass: safe(intent.deliveryVehicleClass),
+    deliveryDistanceKm: finiteNumber(intent.deliveryDistanceKm, 0),
+    deliveryCodeRequired: delivery,
+    deliveryCodeVerified: false,
+    productSnapshot: {
+      productId: safe(intent.productId),
+      title: safe(intent.productTitle || product.title),
+      coverUrl: safe(product.media?.coverUrl),
+      priceCents: integer(intent.unitPriceCents, 0),
+    },
+    storeSnapshot: { storeId: safe(intent.storeId), name: safe(store.name) },
+    review: { status: "pending" },
+    createdAtMs: t,
+    updatedAtMs: t,
+    timestamps: { createdAtMs: t, updatedAtMs: t },
+  };
+  const privateData = {
+    buyer: { uid: safe(intent.buyerUid) },
+    buyerNote: clip(intent.buyerNote, 1000),
+    payment: {
+      method: "pix_direct",
+      status: "confirmed_by_seller",
+      custodyByFireRank: false,
+      totalCents: order.totalCents,
+      productAmountCents: order.productAmountCents,
+      deliveryFeeCents: order.deliveryFeeCents,
+      confirmedAtMs: t,
+    },
+    deliveryAddress: delivery ? map(privateCheckout.deliveryAddress) : null,
+    deliveryCode: delivery ? { plainForBuyer: code, codeHash, required: true, verified: false } : null,
+  };
+  const updates = {
+    [`orders/${orderId}`]: order,
+    [`order_private/${orderId}`]: privateData,
+    [`orders_by_buyer/${order.buyerUid}/${orderId}`]: v42OrderIndexValue(orderId, "sent", t),
+    [`orders_by_store/${order.storeId}/${orderId}`]: v42OrderIndexValue(orderId, "sent", t),
+    [`buyer_orders/${order.buyerUid}/${orderId}`]: { orderId, status: "sent", updatedAtMs: t },
+    [`pix_checkout_intents/${safe(intent.intentId)}/status`]: "confirmed",
+    [`pix_checkout_intents/${safe(intent.intentId)}/orderId`]: orderId,
+    [`pix_checkout_intents/${safe(intent.intentId)}/confirmedAtMs`]: t,
+    [`pix_checkout_intents/${safe(intent.intentId)}/updatedAtMs`]: t,
+    [`pix_intents_by_buyer/${order.buyerUid}/${safe(intent.intentId)}/status`]: "confirmed",
+    [`pix_intents_by_buyer/${order.buyerUid}/${safe(intent.intentId)}/updatedAtMs`]: t,
+    [`pix_intents_by_store/${order.storeId}/${safe(intent.intentId)}/status`]: "confirmed",
+    [`pix_intents_by_store/${order.storeId}/${safe(intent.intentId)}/updatedAtMs`]: t,
+  };
+  await db.ref().update(updates);
+  await appendAudit("pix_confirmed_order_created", { actorUid: safe(intent.sellerUid), targetUid: order.buyerUid, referenceId: orderId, status: "sent" });
+  await pushNotification(order.buyerUid, { title: "Pix confirmado", body: "A loja confirmou o Pix e seu pedido foi gerado.", type: "pix_confirmed", data: { orderId, intentId: safe(intent.intentId) } });
+  return orderId;
+}
+
+app.post("/v1/checkout/pix-intents/action", requireUser, rateLimit("pix-intent-action", 30, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const intentId = safe(req.body?.intentId);
+    const action = safe(req.body?.action).toLowerCase();
+    const ref = db.ref(`pix_checkout_intents/${intentId}`);
+    const snap = await ref.get();
+    const intent = map(snap.val());
+    if (!snap.exists()) return res.status(404).json({ ok: false, code: "PIX_INTENT_NOT_FOUND" });
+    const t = nowMs();
+
+    if (action === "mark_pix_sent") {
+      if (safe(intent.buyerUid) !== uid) return res.status(403).json({ ok: false, code: "BUYER_REQUIRED" });
+      if (finiteNumber(intent.expiresAtMs, 0) > 0 && finiteNumber(intent.expiresAtMs, 0) < t) return res.status(409).json({ ok: false, code: "PIX_INTENT_EXPIRED", message: "Este pre-pedido expirou. Gere um novo Pix." });
+      if (safe(intent.status) !== "awaiting_pix") return res.status(409).json({ ok: false, code: "PIX_INTENT_STATE_INVALID", status: safe(intent.status) });
+      await db.ref().update({
+        [`pix_checkout_intents/${intentId}/status`]: "pix_sent",
+        [`pix_checkout_intents/${intentId}/pixSentAtMs`]: t,
+        [`pix_checkout_intents/${intentId}/updatedAtMs`]: t,
+        [`pix_intents_by_buyer/${uid}/${intentId}/status`]: "pix_sent",
+        [`pix_intents_by_buyer/${uid}/${intentId}/updatedAtMs`]: t,
+        [`pix_intents_by_store/${safe(intent.storeId)}/${intentId}/status`]: "pix_sent",
+        [`pix_intents_by_store/${safe(intent.storeId)}/${intentId}/updatedAtMs`]: t,
+      });
+      await pushNotification(safe(intent.sellerUid), { title: "Pix informado", body: "Um comprador informou que enviou o Pix. Confira sua conta antes de confirmar.", type: "pix_sent", data: { intentId } });
+      return res.json({ ok: true, intentId, status: "pix_sent" });
+    }
+
+    const sellerAllowed = await v42SellerOwnsStore(uid, safe(intent.storeId));
+    if (!sellerAllowed) return res.status(403).json({ ok: false, code: "SELLER_REQUIRED" });
+
+    if (action === "reject") {
+      if (!["awaiting_pix", "pix_sent"].includes(safe(intent.status))) return res.status(409).json({ ok: false, code: "PIX_INTENT_STATE_INVALID" });
+      await db.ref().update({
+        [`pix_checkout_intents/${intentId}/status`]: "rejected",
+        [`pix_checkout_intents/${intentId}/rejectedAtMs`]: t,
+        [`pix_checkout_intents/${intentId}/updatedAtMs`]: t,
+        [`pix_intents_by_buyer/${safe(intent.buyerUid)}/${intentId}/status`]: "rejected",
+        [`pix_intents_by_store/${safe(intent.storeId)}/${intentId}/status`]: "rejected",
+      });
+      await pushNotification(safe(intent.buyerUid), { title: "Pix nao confirmado", body: "A loja informou que nao localizou o Pix. Confira os dados e fale com o vendedor.", type: "pix_rejected", data: { intentId } });
+      return res.json({ ok: true, intentId, status: "rejected" });
+    }
+
+    if (action === "confirm_pix_received") {
+      const tx = await ref.transaction((raw) => {
+        const current = map(raw);
+        if (safe(current.status) !== "pix_sent") return;
+        return { ...current, status: "confirming", confirmingAtMs: t, confirmingByUid: uid, updatedAtMs: t };
+      }, { applyLocally: false });
+      if (!tx.committed) {
+        const latest = map((await ref.get()).val());
+        if (safe(latest.status) === "confirmed" && safe(latest.orderId)) return res.json({ ok: true, intentId, status: "confirmed", orderId: safe(latest.orderId), idempotent: true });
+        return res.status(409).json({ ok: false, code: "PIX_INTENT_STATE_INVALID", status: safe(latest.status) });
+      }
+      try {
+        const locked = map(tx.snapshot.val());
+        const orderId = await frMasterCreateOrderFromPixIntent(locked);
+        return res.json({ ok: true, intentId, status: "confirmed", orderId });
+      } catch (error) {
+        await ref.update({ status: "pix_sent", updatedAtMs: nowMs(), lastConfirmError: clip(error?.code || error?.message || "error", 80) });
+        throw error;
+      }
+    }
+
+    return res.status(422).json({ ok: false, code: "INVALID_ACTION" });
+  } catch (e) { return publicError(res, e, "Nao foi possivel atualizar o Pix."); }
+});
+
+app.get("/v1/seller/pix-intents", requireUser, rateLimit("seller-pix-intents", 60, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const storeId = await frMasterAssertStoreOwner(uid, safe(req.query?.storeId));
+    const indexSnap = await db.ref(`pix_intents_by_store/${storeId}`).get();
+    const index = map(indexSnap.val());
+    const ids = Object.values(index)
+      .map((item) => map(item))
+      .sort((a, b) => finiteNumber(b.updatedAtMs, 0) - finiteNumber(a.updatedAtMs, 0))
+      .slice(0, 80)
+      .map((item) => safe(item.intentId))
+      .filter(Boolean);
+    const intents = [];
+    for (const id of ids) {
+      const item = map((await db.ref(`pix_checkout_intents/${id}`).get()).val());
+      if (safe(item.storeId) !== storeId) continue;
+      intents.push({
+        intentId: id,
+        productId: safe(item.productId),
+        productTitle: safe(item.productTitle),
+        buyerUid: safe(item.buyerUid),
+        status: safe(item.status),
+        quantity: integer(item.quantity, 1),
+        productAmountCents: integer(item.productAmountCents, 0),
+        deliveryFeeCents: integer(item.deliveryFeeCents, 0),
+        totalCents: integer(item.productAmountCents, 0) + integer(item.deliveryFeeCents, 0),
+        fulfillmentType: safe(item.fulfillmentType),
+        createdAtMs: finiteNumber(item.createdAtMs, 0),
+        updatedAtMs: finiteNumber(item.updatedAtMs, 0),
+      });
+    }
+    return res.json({ ok: true, storeId, intents });
+  } catch (e) { return publicError(res, e, "Nao foi possivel carregar os Pix da loja."); }
+});
+
+
+app.get("/v1/seller/delivery-connections", requireUser, rateLimit("seller-delivery-connections", 60, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const storeId = await frMasterAssertStoreOwner(uid, safe(req.query?.storeId));
+    const snap = await db.ref(`delivery_connections/${storeId}`).get();
+    const rows = map(snap.val());
+    const couriers = [];
+    for (const [deliveryUid, raw] of Object.entries(rows)) {
+      const connection = map(raw);
+      if (!["active", "accepted"].includes(safe(connection.status).toLowerCase())) continue;
+      const profile = map((await db.ref(`delivery_public_profiles/${deliveryUid}`).get()).val());
+      couriers.push({
+        deliveryUid,
+        connectionId: safe(connection.connectionId),
+        status: safe(connection.status),
+        displayName: clip(profile.displayName || profile.fullName || connection.displayName, 120),
+        publicCode: clip(profile.publicCode || connection.publicCode, 40),
+        vehicleType: clip(profile.vehicleType || connection.vehicleType, 60),
+      });
+    }
+    return res.json({ ok: true, storeId, couriers: couriers.slice(0, 100) });
+  } catch (e) { return publicError(res, e, "Nao foi possivel carregar os entregadores da loja."); }
+});
+
+
+async function frMasterCreateRegionalPayout(order, dispatch, t = nowMs()) {
+  const orderId = safe(order.orderId || dispatch.orderId);
+  const deliveryUid = safe(dispatch.deliveryUid || order.deliveryUid);
+  const storeId = safe(order.storeId || dispatch.storeId);
+  const sellerUid = safe(order.sellerUid || dispatch.sellerUid);
+  const amountCents = Math.max(0, integer(dispatch.payoutCents || order.courierPayoutCents || order.deliveryFeeCents, 0));
+  if (!orderId || !deliveryUid || !storeId || amountCents <= 0) return null;
+  const ref = db.ref(`regional_delivery_payouts/${orderId}`);
+  await ref.transaction((raw) => {
+    if (isObject(raw) && safe(raw.orderId)) return raw;
+    return {
+      orderId,
+      dispatchId: safe(dispatch.dispatchId),
+      storeId,
+      sellerUid,
+      deliveryUid,
+      amountCents,
+      status: "due",
+      custodyByFireRank: false,
+      payer: "store",
+      recipient: "courier",
+      createdAtMs: t,
+      updatedAtMs: t,
+    };
+  }, { applyLocally: false });
+  return map((await ref.get()).val());
+}
+
+app.get("/v1/delivery/regional/availability", requireUser, rateLimit("regional-delivery-availability", 60, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const enabled = await getFeatureFlag("regional_delivery_v1", true);
+    const window = frMasterRegionalWindow();
+    const operational = await frMasterDeliveryOperationalState(uid);
+    const presence = map((await db.ref(`regional_delivery_presence_by_uid/${uid}`).get()).val());
+    const online = presence.online === true && finiteNumber(presence.updatedAtMs, 0) >= nowMs() - FIRERANK_REGIONAL_DELIVERY_PRESENCE_TTL_MS;
+    let message = enabled ? (window.open ? "Entrega FireRank regional disponivel." : "O radar regional funciona sexta a domingo, das 19h as 23:59.") : "Entrega FireRank regional temporariamente desativada.";
+    if (safe(operational.status) === "waitlist") message = "Voce esta na lista de espera regional por inatividade. Reative sua disponibilidade para voltar a fila.";
+    if (safe(operational.status) === "suspended") message = "Seu acesso regional esta suspenso. Consulte suporte.";
+    const activeDispatchId = safe((await db.ref(`regional_delivery_active_by_courier/${uid}`).get()).val());
+    let activeDelivery = null;
+    if (activeDispatchId) {
+      const activeDispatch = map((await db.ref(`regional_delivery_dispatches/${activeDispatchId}`).get()).val());
+      if (safe(activeDispatch.deliveryUid) === uid && safe(activeDispatch.status) === "assigned") {
+        const activeOrder = map((await db.ref(`orders/${safe(activeDispatch.orderId)}`).get()).val());
+        activeDelivery = {
+          dispatchId: activeDispatchId,
+          orderId: safe(activeDispatch.orderId),
+          storeId: safe(activeDispatch.storeId),
+          storeName: safe(activeDispatch.storeName),
+          status: safe(activeOrder.regionalDelivery?.status || activeDispatch.deliveryStatus || "assigned"),
+          payoutCents: integer(activeDispatch.payoutCents, 0),
+          tripDistanceKm: finiteNumber(activeDispatch.tripDistanceKm, 0),
+          vehicleClass: safe(activeDispatch.vehicleClass),
+          pickup: map(activeDispatch.pickup),
+        };
+      }
+    }
+    return res.json({
+      ok: true,
+      regionalEnabled: enabled,
+      windowOpen: enabled && window.open,
+      online,
+      operationalStatus: safe(operational.status),
+      score: integer(operational.score, FIRERANK_COURIER_INITIAL_SCORE),
+      schedule: window.schedule,
+      timeZone: window.timeZone,
+      activeDelivery,
+      message,
+    });
+  } catch (e) { return publicError(res, e, "Nao foi possivel consultar a Entrega FireRank."); }
+});
+
+app.post("/v1/delivery/regional/presence", requireUser, rateLimit("regional-delivery-presence", 30, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const online = req.body?.online === true;
+    const enabled = await getFeatureFlag("regional_delivery_v1", true);
+    const window = frMasterRegionalWindow();
+    const operational = await frMasterDeliveryOperationalState(uid, { touch: true });
+    const old = map((await db.ref(`regional_delivery_presence_by_uid/${uid}`).get()).val());
+    if (!online) {
+      const updates = { [`regional_delivery_presence_by_uid/${uid}`]: { ...old, online: false, updatedAtMs: nowMs() } };
+      const oldRegion = safe(old.regionKey);
+      if (oldRegion) updates[`regional_delivery_presence/${oldRegion}/${uid}`] = null;
+      await db.ref().update(updates);
+      return res.json({ ok: true, online: false });
+    }
+    if (!enabled || !window.open) return res.status(409).json({ ok: false, code: "REGIONAL_WINDOW_CLOSED", message: "O radar regional funciona sexta a domingo, das 19h as 23:59." });
+    if (safe(operational.status) === "suspended" || integer(operational.score, 0) <= 0) return res.status(403).json({ ok: false, code: "DELIVERY_OPERATION_SUSPENDED", message: "Seu acesso regional esta suspenso." });
+    const coords = frMasterCoords(req.body);
+    if (!coords.valid) return res.status(422).json({ ok: false, code: "LOCATION_REQUIRED", message: "Ative a localizacao para entrar no radar." });
+    const profile = map((await db.ref(`delivery_private_profiles/${uid}`).get()).val());
+    const city = clip(profile.city, 100);
+    const state = clip(profile.state, 8);
+    const vehicleType = clip(profile.vehicleType, 60);
+    const regionKey = frMasterRegionKey(state, city);
+    const t = nowMs();
+    const status = safe(operational.status) === "waitlist" ? "active" : safe(operational.status || "active");
+    const presence = { uid, online: true, latitude: coords.latitude, longitude: coords.longitude, city, state, regionKey, vehicleType, status: "available", updatedAtMs: t };
+    const updates = {
+      [`regional_delivery_presence/${regionKey}/${uid}`]: presence,
+      [`regional_delivery_presence_by_uid/${uid}`]: presence,
+      [`delivery_operational_state/${uid}/status`]: status,
+      [`delivery_operational_state/${uid}/lastActiveAtMs`]: t,
+      [`delivery_operational_state/${uid}/updatedAtMs`]: t,
+    };
+    const oldRegion = safe(old.regionKey);
+    if (oldRegion && oldRegion !== regionKey) updates[`regional_delivery_presence/${oldRegion}/${uid}`] = null;
+    await db.ref().update(updates);
+    return res.json({ ok: true, online: true, operationalStatus: status, score: integer(operational.score, FIRERANK_COURIER_INITIAL_SCORE) });
+  } catch (e) { return publicError(res, e, "Nao foi possivel atualizar sua disponibilidade."); }
+});
+
+async function frMasterRegionalOffersFor(uid) {
+  const index = map((await db.ref(`regional_delivery_offers_by_courier/${uid}`).get()).val());
+  const offers = [];
+  const t = nowMs();
+  for (const [dispatchId, raw] of Object.entries(index)) {
+    const item = map(raw);
+    if (finiteNumber(item.expiresAtMs, 0) <= t) continue;
+    const dispatch = map((await db.ref(`regional_delivery_dispatches/${dispatchId}`).get()).val());
+    if (!dispatch || safe(dispatch.status) !== "searching") continue;
+    offers.push({
+      dispatchId,
+      orderId: safe(dispatch.orderId),
+      storeId: safe(dispatch.storeId),
+      storeName: safe(dispatch.storeName),
+      payoutCents: integer(dispatch.payoutCents, 0),
+      distanceToStoreKm: finiteNumber(item.distanceToStoreKm, 0),
+      tripDistanceKm: finiteNumber(dispatch.tripDistanceKm, 0),
+      vehicleClass: safe(dispatch.vehicleClass),
+      expiresAtMs: finiteNumber(item.expiresAtMs, 0),
+    });
+  }
+  offers.sort((a, b) => a.distanceToStoreKm - b.distanceToStoreKm);
+  return offers.slice(0, 20);
+}
+
+app.get("/v1/delivery/regional/offers", requireUser, rateLimit("regional-delivery-offers", 90, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    await frMasterDeliveryOperationalState(uid);
+    return res.json({ ok: true, offers: await frMasterRegionalOffersFor(uid) });
+  } catch (e) { return publicError(res, e, "Nao foi possivel carregar as ofertas."); }
+});
+
+app.post("/v1/delivery/regional/request", requireUser, rateLimit("regional-delivery-request", 20, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const orderId = safe(req.body?.orderId);
+    const order = await v42LoadOrder(orderId);
+    const storeId = safe(order.storeId);
+    if (!(await v42SellerOwnsStore(uid, storeId))) return res.status(403).json({ ok: false, code: "SELLER_REQUIRED" });
+    if (safe(order.fulfillmentType) !== "delivery") return res.status(409).json({ ok: false, code: "DELIVERY_NOT_REQUIRED" });
+    if (!["accepted", "preparing", "ready"].includes(v42NormalizeStatus(order.status))) return res.status(409).json({ ok: false, code: "ORDER_NOT_READY_FOR_DISPATCH", message: "Aceite o pedido antes de procurar um entregador regional." });
+    if (!(await getFeatureFlag("regional_delivery_v1", true))) return res.status(409).json({ ok: false, code: "REGIONAL_DELIVERY_DISABLED" });
+    const window = frMasterRegionalWindow();
+    if (!window.open) return res.status(409).json({ ok: false, code: "REGIONAL_WINDOW_CLOSED", message: "Entrega FireRank funciona sexta a domingo, das 19h as 23:59." });
+
+    const existingId = safe((await db.ref(`regional_delivery_by_order/${orderId}`).get()).val());
+    if (existingId) {
+      const existing = map((await db.ref(`regional_delivery_dispatches/${existingId}`).get()).val());
+      if (["searching", "assigned"].includes(safe(existing.status))) return res.json({ ok: true, dispatchId: existingId, status: safe(existing.status), message: safe(existing.status) === "assigned" ? "Um entregador ja aceitou esta entrega." : "O radar ja esta procurando entregadores." });
+    }
+
+    const product = map((await db.ref(`products/${safe(order.productId)}`).get()).val());
+    const local = map(product.local);
+    const sellerUid = safe(order.sellerUid || product.ownerUid);
+    const sellerAddressKey = safe(local.addressId || local.sellerAddressKey || "primary");
+    const storeAddress = map((await db.ref(`user_addresses/${sellerUid}/${sellerAddressKey}`).get()).val());
+    const privateOrder = map((await db.ref(`order_private/${orderId}`).get()).val());
+    const customerAddress = map(privateOrder.deliveryAddress);
+    const storeCoords = frMasterCoords(storeAddress);
+    const customerCoords = frMasterCoords(customerAddress);
+    if (!storeCoords.valid || !customerCoords.valid) return res.status(409).json({ ok: false, code: "DELIVERY_LOCATION_UNAVAILABLE", message: "A loja e o cliente precisam ter localizacao validada para Entrega FireRank." });
+
+    const tripKm = frMasterDistanceKm(storeAddress, customerAddress);
+    const vehicleClass = safe(order.deliveryVehicleClass) || frMasterVehicleClass(tripKm);
+    const payoutCents = Math.max(0, integer(order.courierPayoutCents || order.deliveryFeeCents, 0));
+    if (payoutCents <= 0) return res.status(409).json({ ok: false, code: "DELIVERY_FEE_REQUIRED" });
+    const regionKey = frMasterRegionKey(storeAddress.state, storeAddress.city);
+    const presences = map((await db.ref(`regional_delivery_presence/${regionKey}`).get()).val());
+    const candidates = [];
+    const t = nowMs();
+    for (const [deliveryUid, raw] of Object.entries(presences)) {
+      const p = map(raw);
+      if (p.online !== true || safe(p.status) !== "available" || finiteNumber(p.updatedAtMs, 0) < t - FIRERANK_REGIONAL_DELIVERY_PRESENCE_TTL_MS) continue;
+      if (!frMasterVehicleCompatible(p.vehicleType, vehicleClass)) continue;
+      const operational = map((await db.ref(`delivery_operational_state/${deliveryUid}`).get()).val());
+      if (safe(operational.status || "active") !== "active" || integer(operational.score, FIRERANK_COURIER_INITIAL_SCORE) <= 0) continue;
+      const activeDispatch = safe((await db.ref(`regional_delivery_active_by_courier/${deliveryUid}`).get()).val());
+      if (activeDispatch) continue;
+      const distanceToStoreKm = frMasterDistanceKm(p, storeAddress);
+      if (!distanceToStoreKm || distanceToStoreKm > 15) continue;
+      candidates.push({ deliveryUid, distanceToStoreKm });
+    }
+    candidates.sort((a, b) => a.distanceToStoreKm - b.distanceToStoreKm);
+    const selected = candidates.slice(0, 5);
+    if (!selected.length) return res.status(404).json({ ok: false, code: "NO_REGIONAL_COURIER", message: "Nenhum entregador FireRank disponivel perto da loja agora." });
+
+    const dispatchRef = db.ref("regional_delivery_dispatches").push();
+    const dispatchId = dispatchRef.key;
+    const expiresAtMs = t + FIRERANK_REGIONAL_DELIVERY_OFFER_TTL_MS;
+    const store = map((await db.ref(`stores/${storeId}`).get()).val());
+    const offeredTo = Object.fromEntries(selected.map((c) => [c.deliveryUid, true]));
+    const dispatch = {
+      dispatchId,
+      orderId,
+      storeId,
+      sellerUid: uid,
+      storeName: clip(store.name, 120),
+      status: "searching",
+      offeredTo,
+      payoutCents,
+      tripDistanceKm: Number(tripKm.toFixed(2)),
+      vehicleClass,
+      regionKey,
+      pickup: { latitude: storeCoords.latitude, longitude: storeCoords.longitude },
+      createdAtMs: t,
+      expiresAtMs,
+      updatedAtMs: t,
+    };
+    const updates = {
+      [`regional_delivery_dispatches/${dispatchId}`]: dispatch,
+      [`regional_delivery_by_order/${orderId}`]: dispatchId,
+      [`orders/${orderId}/regionalDelivery`]: { dispatchId, status: "searching", payoutCents, vehicleClass, requestedAtMs: t },
+    };
+    for (const c of selected) {
+      updates[`regional_delivery_offers_by_courier/${c.deliveryUid}/${dispatchId}`] = { dispatchId, orderId, payoutCents, distanceToStoreKm: Number(c.distanceToStoreKm.toFixed(2)), expiresAtMs, createdAtMs: t };
+    }
+    await db.ref().update(updates);
+    await Promise.all(selected.map((c) => pushNotification(c.deliveryUid, { title: "Nova Entrega FireRank", body: `Entrega disponivel. Ganho: R$ ${(payoutCents / 100).toFixed(2).replace(".", ",")}.`, type: "regional_delivery_offer", data: { dispatchId, orderId } })));
+    await appendAudit("regional_delivery_requested", { actorUid: uid, referenceId: dispatchId, status: "searching" });
+    return res.status(201).json({ ok: true, dispatchId, status: "searching", offeredCount: selected.length, payoutCents, message: "Radar FireRank acionado para entregadores proximos." });
+  } catch (e) { return publicError(res, e, "Nao foi possivel iniciar o radar de entrega."); }
+});
+
+app.post("/v1/delivery/regional/accept", requireUser, rateLimit("regional-delivery-accept", 30, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const dispatchId = safe(req.body?.dispatchId);
+    const operational = await frMasterDeliveryOperationalState(uid, { touch: true });
+    if (safe(operational.status) !== "active" || integer(operational.score, 0) <= 0) return res.status(403).json({ ok: false, code: "DELIVERY_OPERATION_NOT_ACTIVE" });
+    const window = frMasterRegionalWindow();
+    if (!window.open) return res.status(409).json({ ok: false, code: "REGIONAL_WINDOW_CLOSED" });
+    const ref = db.ref(`regional_delivery_dispatches/${dispatchId}`);
+    const t = nowMs();
+    const tx = await ref.transaction((raw) => {
+      const current = map(raw);
+      if (safe(current.status) !== "searching" || current.offeredTo?.[uid] !== true || finiteNumber(current.expiresAtMs, 0) <= t) return;
+      return { ...current, status: "assigned", deliveryUid: uid, acceptedAtMs: t, updatedAtMs: t };
+    }, { applyLocally: false });
+    if (!tx.committed) return res.status(409).json({ ok: false, code: "DELIVERY_ALREADY_TAKEN", message: "Esta entrega ja foi aceita por outro entregador ou expirou." });
+    const dispatch = map(tx.snapshot.val());
+    const orderId = safe(dispatch.orderId);
+    const order = await v42LoadOrder(orderId);
+    const updates = {
+      [`orders/${orderId}/deliveryUid`]: uid,
+      [`orders/${orderId}/regionalDelivery/status`]: "assigned",
+      [`orders/${orderId}/regionalDelivery/deliveryUid`]: uid,
+      [`orders/${orderId}/regionalDelivery/acceptedAtMs`]: t,
+      [`orders_by_delivery/${uid}/${orderId}`]: v42OrderIndexValue(orderId, v42NormalizeStatus(order.status), t),
+      [`regional_delivery_active_by_courier/${uid}`]: dispatchId,
+      [`delivery_operational_state/${uid}/everWorked`]: true,
+      [`delivery_operational_state/${uid}/lastAcceptedAtMs`]: t,
+      [`delivery_operational_state/${uid}/lastWorkAtMs`]: t,
+      [`delivery_operational_state/${uid}/updatedAtMs`]: t,
+    };
+    for (const deliveryUid of Object.keys(map(dispatch.offeredTo))) updates[`regional_delivery_offers_by_courier/${deliveryUid}/${dispatchId}`] = null;
+    await db.ref().update(updates);
+    await pushNotification(safe(order.sellerUid), { title: "Entregador encontrado", body: "Um entregador FireRank aceitou a entrega e foi direcionado para a loja.", type: "regional_delivery_assigned", data: { orderId, dispatchId } });
+    await pushNotification(safe(order.buyerUid), { title: "Entregador encontrado", body: "A loja ja encontrou um entregador FireRank para seu pedido.", type: "regional_delivery_assigned", data: { orderId } });
+    const pickup = map(dispatch.pickup);
+    const pickupMapsUrl = frMasterCoords(pickup).valid ? `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(`${pickup.latitude},${pickup.longitude}`)}` : "";
+    return res.json({ ok: true, dispatchId, orderId, status: "assigned", payoutCents: integer(dispatch.payoutCents, 0), pickupMapsUrl });
+  } catch (e) { return publicError(res, e, "Nao foi possivel aceitar a entrega."); }
+});
+
+app.post("/v1/delivery/regional/action", requireUser, rateLimit("regional-delivery-action", 60, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const orderId = safe(req.body?.orderId);
+    const action = safe(req.body?.action).toLowerCase();
+    const dispatchId = safe((await db.ref(`regional_delivery_by_order/${orderId}`).get()).val());
+    const dispatch = map((await db.ref(`regional_delivery_dispatches/${dispatchId}`).get()).val());
+    if (!dispatchId || safe(dispatch.deliveryUid) !== uid) return res.status(403).json({ ok: false, code: "REGIONAL_DELIVERY_NOT_ASSIGNED" });
+    const order = await v42LoadOrder(orderId);
+    const currentRegional = safe(order.regionalDelivery?.status || dispatch.status);
+    const transitions = {
+      start_to_store: { from: ["assigned"], to: "going_to_store" },
+      at_store: { from: ["going_to_store", "assigned"], to: "at_store" },
+      waiting_preparation: { from: ["at_store"], to: "waiting_preparation" },
+      picked_up: { from: ["at_store", "waiting_preparation"], to: "picked_up" },
+      start_route: { from: ["picked_up"], to: "on_route" },
+      arriving: { from: ["on_route"], to: "arriving" },
+      confirm_delivery: { from: ["arriving", "on_route"], to: "delivered" },
+      abandon: { from: ["assigned", "going_to_store", "at_store", "waiting_preparation"], to: "abandoned" },
+    };
+    const tr = transitions[action];
+    if (!tr || !tr.from.includes(currentRegional)) return res.status(409).json({ ok: false, code: "INVALID_REGIONAL_DELIVERY_TRANSITION", status: currentRegional });
+    if (action === "picked_up" && v42NormalizeStatus(order.status) !== "ready") return res.status(409).json({ ok: false, code: "ORDER_NOT_READY", message: "A loja ainda nao marcou o pedido como pronto." });
+    const t = nowMs();
+    if (action === "confirm_delivery") {
+      const typed = safe(req.body?.code || req.body?.deliveryCode).replace(/[^0-9A-Za-z]/g, "");
+      const priv = map((await db.ref(`order_private/${orderId}`).get()).val());
+      const codeData = map(priv.deliveryCode || priv.deliveryConfirmation);
+      const expected = safe(codeData.codeHash || priv.deliveryCodeHash || priv.confirmationCodeHash);
+      if (!typed || !expected || stableHash(`${orderId}:${typed}`) !== expected) {
+        return res.status(422).json({ ok: false, code: "DELIVERY_CODE_INVALID", message: "Codigo de entrega invalido." });
+      }
+      await db.ref().update({
+        [`orders/${orderId}/deliveryCodeVerified`]: true,
+        [`order_private/${orderId}/deliveryCode/verified`]: true,
+        [`order_private/${orderId}/deliveryCode/verifiedAtMs`]: t,
+        [`orders/${orderId}/regionalDelivery/status`]: "delivered",
+        [`orders/${orderId}/regionalDelivery/updatedAtMs`]: t,
+        [`regional_delivery_dispatches/${dispatchId}/status`]: "completed",
+        [`regional_delivery_dispatches/${dispatchId}/deliveryStatus`]: "delivered",
+        [`regional_delivery_dispatches/${dispatchId}/completedAtMs`]: t,
+        [`regional_delivery_dispatches/${dispatchId}/updatedAtMs`]: t,
+        [`regional_delivery_active_by_courier/${uid}`]: null,
+        [`delivery_operational_state/${uid}/lastCompletedAtMs`]: t,
+        [`delivery_operational_state/${uid}/lastWorkAtMs`]: t,
+        [`delivery_operational_state/${uid}/everWorked`]: true,
+      });
+      await v42WriteOrderState(orderId, order, "delivered", uid, "delivery", "regional_confirm_delivery", { deliveryUid: uid, deliveryCodeVerified: true });
+      const payout = await frMasterCreateRegionalPayout({ ...order, orderId }, { ...dispatch, dispatchId }, t);
+      await frMasterAdjustCourierScore(uid, 2, "delivery_completed", orderId);
+      await pushNotification(safe(order.buyerUid), { title: "Entrega concluida", body: "Seu pedido foi entregue com confirmacao por codigo.", type: "order_delivered", data: { orderId } });
+      await pushNotification(safe(order.sellerUid), { title: "Entrega concluida", body: "A Entrega FireRank foi concluida. Confira a taxa devida ao entregador.", type: "regional_delivery_completed", data: { orderId } });
+      return res.json({ ok: true, orderId, dispatchId, status: "delivered", payout: payout ? { amountCents: integer(payout.amountCents, 0), status: safe(payout.status), custodyByFireRank: false } : null });
+    }
+    if (action === "abandon") {
+      await frMasterAdjustCourierScore(uid, -10, "delivery_abandoned", orderId);
+      await db.ref().update({
+        [`regional_delivery_dispatches/${dispatchId}/status`]: "cancelled",
+        [`regional_delivery_dispatches/${dispatchId}/updatedAtMs`]: t,
+        [`orders/${orderId}/regionalDelivery/status`]: "cancelled",
+        [`orders/${orderId}/deliveryUid`]: null,
+        [`regional_delivery_active_by_courier/${uid}`]: null,
+        [`orders_by_delivery/${uid}/${orderId}`]: null,
+      });
+      return res.json({ ok: true, orderId, status: "abandoned" });
+    }
+    const updates = {
+      [`regional_delivery_dispatches/${dispatchId}/deliveryStatus`]: tr.to,
+      [`regional_delivery_dispatches/${dispatchId}/updatedAtMs`]: t,
+      [`orders/${orderId}/regionalDelivery/status`]: tr.to,
+      [`orders/${orderId}/regionalDelivery/updatedAtMs`]: t,
+      [`delivery_operational_state/${uid}/lastWorkAtMs`]: t,
+    };
+    await db.ref().update(updates);
+    if (tr.to === "picked_up") await v42WriteOrderState(orderId, order, "picked_up", uid, "delivery", "regional_picked_up", { deliveryUid: uid });
+    else if (tr.to === "on_route") await v42WriteOrderState(orderId, { ...order, status: "picked_up" }, "on_route", uid, "delivery", "regional_start_route", { deliveryUid: uid });
+    else if (tr.to === "arriving") await v42WriteOrderState(orderId, { ...order, status: "on_route" }, "arriving", uid, "delivery", "regional_arriving", { deliveryUid: uid });
+    let destinationMapsUrl = "";
+    if (["picked_up", "on_route", "arriving"].includes(tr.to)) {
+      const privateOrder = map((await db.ref(`order_private/${orderId}`).get()).val());
+      const destination = frMasterCoords(privateOrder.deliveryAddress);
+      if (destination.valid) destinationMapsUrl = `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(`${destination.latitude},${destination.longitude}`)}`;
+    }
+    return res.json({ ok: true, orderId, dispatchId, status: tr.to, destinationMapsUrl });
+  } catch (e) { return publicError(res, e, "Nao foi possivel atualizar a entrega regional."); }
+});
+
+app.get("/v1/delivery/regional/payout", requireUser, rateLimit("regional-delivery-payout-get", 60, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const orderId = safe(req.query?.orderId);
+    const payout = map((await db.ref(`regional_delivery_payouts/${orderId}`).get()).val());
+    if (!safe(payout.orderId)) return res.status(404).json({ ok: false, code: "PAYOUT_NOT_FOUND" });
+    const seller = await v42SellerOwnsStore(uid, safe(payout.storeId));
+    if (!seller && safe(payout.deliveryUid) !== uid) return res.status(403).json({ ok: false, code: "PAYOUT_ACCESS_DENIED" });
+    return res.json({ ok: true, ...payout, custodyByFireRank: false });
+  } catch (e) { return publicError(res, e, "Nao foi possivel carregar a taxa da entrega."); }
+});
+
+app.post("/v1/delivery/regional/payout", requireUser, rateLimit("regional-delivery-payout-action", 30, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const orderId = safe(req.body?.orderId);
+    const action = safe(req.body?.action).toLowerCase();
+    const ref = db.ref(`regional_delivery_payouts/${orderId}`);
+    const snap = await ref.get();
+    const payout = map(snap.val());
+    if (!snap.exists()) return res.status(404).json({ ok: false, code: "PAYOUT_NOT_FOUND" });
+    const t = nowMs();
+    if (action === "seller_mark_paid") {
+      if (!(await v42SellerOwnsStore(uid, safe(payout.storeId)))) return res.status(403).json({ ok: false, code: "SELLER_REQUIRED" });
+      if (safe(payout.status) !== "due") return res.status(409).json({ ok: false, code: "PAYOUT_STATE_INVALID", status: safe(payout.status) });
+      await ref.update({ status: "seller_marked_paid", sellerMarkedPaidAtMs: t, updatedAtMs: t });
+      await pushNotification(safe(payout.deliveryUid), { title: "Taxa marcada como paga", body: "A loja informou que pagou sua taxa de entrega. Confirme quando receber.", type: "delivery_payout_marked", data: { orderId } });
+      return res.json({ ok: true, orderId, status: "seller_marked_paid" });
+    }
+    if (action === "courier_confirm_received") {
+      if (safe(payout.deliveryUid) !== uid) return res.status(403).json({ ok: false, code: "DELIVERY_REQUIRED" });
+      if (safe(payout.status) !== "seller_marked_paid") return res.status(409).json({ ok: false, code: "PAYOUT_STATE_INVALID" });
+      await ref.update({ status: "paid", courierConfirmedAtMs: t, updatedAtMs: t });
+      return res.json({ ok: true, orderId, status: "paid" });
+    }
+    return res.status(422).json({ ok: false, code: "INVALID_ACTION" });
+  } catch (e) { return publicError(res, e, "Nao foi possivel atualizar a taxa da entrega."); }
+});
+
+// FIRERANK_MASTER_V5_END
 
 async function expireBoosts() {
   const t =
