@@ -3294,6 +3294,15 @@ function publicProductCard(
 
     productType:
       product.productType,
+    // FIRERANK_V51_CARD_FIELDS
+    vertical: frV51DeriveVertical(product.productType, product.local?.localType),
+    localType: clip(product.local?.localType || "", 40),
+    deliveryAvailable: product.local?.deliveryAvailable === true,
+    pickupAvailable: product.local?.pickupAvailable === true,
+    condition: clip(product.attributes?.condition || "", 30),
+    brand: clip(product.attributes?.brand || "", 80),
+    model: clip(product.attributes?.model || "", 100),
+
 
     ratingAverage:
       finiteNumber(
@@ -3352,6 +3361,9 @@ function addProjectionRemovals(
   if (!productId) {
     return;
   }
+  // FIRERANK_V51_PUBLIC_DETAIL_REMOVE
+  updates[`public_product_details/${productId}`] = null;
+
 
   updates[
     `product_cards/${productId}`
@@ -3412,6 +3424,9 @@ function addPublicProjections(
 ) {
   const productId =
     product.productId;
+  // FIRERANK_V51_PUBLIC_DETAIL_WRITE
+  updates[`public_product_details/${productId}`] = frV51PublicProductDetail(product, card, t);
+
 
   updates[
     `product_cards/${productId}`
@@ -4059,6 +4074,9 @@ app.post(
         map(
           req.body
         );
+      // FIRERANK_V51_PUBLISH_SESSION_VERIFY
+      const v51PublishSession = await frV51VerifyPublishSession(uid, body, req);
+      if (v51PublishSession.replay) return res.status(200).json(v51PublishSession.response);
 
       const productType =
         safe(
@@ -4387,7 +4405,12 @@ app.post(
         };
       }
 
-      const updates = {
+            // FIRERANK_V51_PRODUCT_ATTRIBUTES
+      const v51Attributes = frV51SanitizeProductAttributes(body.attributes);
+      if (Object.keys(v51Attributes).length) product.attributes = v51Attributes;
+      product.vertical = frV51DeriveVertical(productType, product.local?.localType);
+
+const updates = {
         [`products/${productId}`]:
           product,
 
@@ -4454,6 +4477,9 @@ app.post(
         .update(
           updates
         );
+      // FIRERANK_V51_COMMIT_PUBLISH_SESSION
+      await frV51CommitPublishSession(uid, body, { productId, visibility, publicProjected: publicEligible });
+      frV51ScheduleRecommendationRefresh(productId);
 
       await appendAudit(
         "product_created",
@@ -4477,6 +4503,8 @@ app.post(
             publicEligible,
         });
     } catch (error) {
+      // FIRERANK_V51_RELEASE_PUBLISH_SESSION
+      await frV51ReleasePublishSession(safe(req.auth?.uid), map(req.body));
       return publicError(
         res,
         error,
@@ -4809,7 +4837,15 @@ app.post(
         delete updated.local;
       }
 
-      const oldCardSnap =
+            // FIRERANK_V51_UPDATE_ATTRIBUTES
+      if (body.attributes !== undefined) {
+        const v51Attributes = frV51SanitizeProductAttributes(body.attributes);
+        if (Object.keys(v51Attributes).length) updated.attributes = v51Attributes;
+        else delete updated.attributes;
+      }
+      updated.vertical = frV51DeriveVertical(productType, updated.local?.localType);
+
+const oldCardSnap =
         await db
           .ref(
             `product_cards/${productId}`
@@ -4933,6 +4969,8 @@ app.post(
         .update(
           updates
         );
+      // FIRERANK_V51_UPDATE_SCORE
+      frV51ScheduleRecommendationRefresh(productId);
 
       await appendAudit(
         "product_updated",
@@ -11606,6 +11644,8 @@ app.post('/v1/products/event', rateLimit('product-event', 180, 60 * 60 * 1000), 
     await ref.set({eventId:ref.key,productId,event,createdAtMs:t,clientPlatform:clip(req.body?.clientPlatform,40)});
     const statKey=event==='view'?'views':event==='affiliate_click'?'affiliateClicks':event==='share'?'shares':'favorites';
     await db.ref(`product_stats/${productId}/${statKey}`).transaction((v)=>integer(v,0)+1,{applyLocally:false});
+    // FIRERANK_V51_EVENT_SCORE_REFRESH
+    frV51ScheduleRecommendationRefresh(productId);
     return res.status(202).json({ok:true});
   }catch(e){return publicError(res,e,'Evento não registrado.');}
 });
@@ -11630,7 +11670,10 @@ app.post('/v1/products/action', requireUser, rateLimit('product-action', 30, 10 
         const card=publicProductCard({...product,status:'active',visibility:'public'},safe(product.media?.coverUrl),t); addPublicProjections(updates,{...product,status:'active',visibility:'public'},card,searchTermsForProduct(safe(product.title),categoryId),t);
       }
     }
-    await db.ref().update(updates); await appendAudit(`product_${action}`,{actorUid:uid,targetUid:uid,referenceId:productId,status:nextStatus});
+    await db.ref().update(updates);
+    // FIRERANK_V51_PRODUCT_ACTION_REFRESH
+    await frV51RefreshPublicProductDetail(productId);
+    frV51ScheduleRecommendationRefresh(productId); await appendAudit(`product_${action}`,{actorUid:uid,targetUid:uid,referenceId:productId,status:nextStatus});
     return res.json({ok:true,productId,status:nextStatus});
   }catch(e){return publicError(res,e,'Não foi possível atualizar o produto.');}
 });
@@ -11840,13 +11883,13 @@ async function runDailyNotifications() {
 // O FireRank registra estados/valores, mas nao recebe nem custodia o dinheiro da compra.
 
 const FIRERANK_REGIONAL_DELIVERY_TIMEZONE = "America/Sao_Paulo";
-const FIRERANK_REGIONAL_DELIVERY_START_HOUR = 19;
-const FIRERANK_REGIONAL_DELIVERY_END_HOUR = 23;
-const FIRERANK_REGIONAL_DELIVERY_PRESENCE_TTL_MS = 12 * 60 * 1000;
-const FIRERANK_REGIONAL_DELIVERY_OFFER_TTL_MS = 5 * 60 * 1000;
-const FIRERANK_COURIER_INACTIVITY_MS = 7 * DAY_MS;
+let FIRERANK_REGIONAL_DELIVERY_START_HOUR = 19;
+let FIRERANK_REGIONAL_DELIVERY_END_HOUR = 23;
+let FIRERANK_REGIONAL_DELIVERY_PRESENCE_TTL_MS = 12 * 60 * 1000;
+let FIRERANK_REGIONAL_DELIVERY_OFFER_TTL_MS = 5 * 60 * 1000;
+let FIRERANK_COURIER_INACTIVITY_MS = 7 * DAY_MS;
 const FIRERANK_PIX_INTENT_TTL_MS = 30 * 60 * 1000;
-const FIRERANK_COURIER_INITIAL_SCORE = 100;
+let FIRERANK_COURIER_INITIAL_SCORE = 100;
 
 function frMasterFold(value) {
   return safe(value)
@@ -11876,7 +11919,7 @@ function frMasterRegionalWindow(atMs = nowMs()) {
   const weekday = safe(values.weekday).toLowerCase();
   const hour = integer(values.hour, -1);
   const minute = integer(values.minute, 0);
-  const allowedDay = weekday === "fri" || weekday === "sat" || weekday === "sun";
+  const allowedDay = FIRERANK_V51_DELIVERY_ALLOWED_DAYS.has(weekday);
   const withinHours = hour >= FIRERANK_REGIONAL_DELIVERY_START_HOUR &&
     (hour < FIRERANK_REGIONAL_DELIVERY_END_HOUR ||
       (hour === FIRERANK_REGIONAL_DELIVERY_END_HOUR && minute <= 59));
@@ -11943,11 +11986,21 @@ function frMasterDeliveryQuote(distanceKm, fallbackCents = 0) {
     return { distanceKm: 0, vehicleClass: "store_configured", deliveryFeeCents: fee, courierPayoutCents: fee };
   }
   const vehicleClass = frMasterVehicleClass(km);
-  const rate = vehicleClass === "electric_bike"
+  const defaults = vehicleClass === "electric_bike"
     ? { base: 350, perKm: 110, min: 450, max: 2200 }
     : vehicleClass === "motorcycle"
       ? { base: 500, perKm: 165, min: 650, max: 3500 }
       : { base: 750, perKm: 230, min: 950, max: 5000 };
+  const configured = typeof FIRERANK_V51_DELIVERY_RATES !== "undefined"
+    ? map(FIRERANK_V51_DELIVERY_RATES[vehicleClass])
+    : {};
+  const rate = {
+    base: Math.max(0, integer(configured.base, defaults.base)),
+    perKm: Math.max(0, integer(configured.perKm, defaults.perKm)),
+    min: Math.max(0, integer(configured.min, defaults.min)),
+    max: Math.max(0, integer(configured.max, defaults.max)),
+  };
+  rate.max = Math.max(rate.min, rate.max);
   const fee = Math.max(rate.min, Math.min(rate.max, Math.round(rate.base + km * rate.perKm)));
   return { distanceKm: Number(km.toFixed(2)), vehicleClass, deliveryFeeCents: fee, courierPayoutCents: fee };
 }
@@ -12675,7 +12728,7 @@ app.post("/v1/delivery/regional/request", requireUser, rateLimit("regional-deliv
       candidates.push({ deliveryUid, distanceToStoreKm });
     }
     candidates.sort((a, b) => a.distanceToStoreKm - b.distanceToStoreKm);
-    const selected = candidates.slice(0, 5);
+    const selected = candidates.slice(0, FIRERANK_V51_DELIVERY_OFFER_BATCH);
     if (!selected.length) return res.status(404).json({ ok: false, code: "NO_REGIONAL_COURIER", message: "Nenhum entregador FireRank disponivel perto da loja agora." });
 
     const dispatchRef = db.ref("regional_delivery_dispatches").push();
@@ -12805,13 +12858,13 @@ app.post("/v1/delivery/regional/action", requireUser, rateLimit("regional-delive
       });
       await v42WriteOrderState(orderId, order, "delivered", uid, "delivery", "regional_confirm_delivery", { deliveryUid: uid, deliveryCodeVerified: true });
       const payout = await frMasterCreateRegionalPayout({ ...order, orderId }, { ...dispatch, dispatchId }, t);
-      await frMasterAdjustCourierScore(uid, 2, "delivery_completed", orderId);
+      await frMasterAdjustCourierScore(uid, FIRERANK_V51_SCORE_COMPLETE_DELTA, "delivery_completed", orderId);
       await pushNotification(safe(order.buyerUid), { title: "Entrega concluida", body: "Seu pedido foi entregue com confirmacao por codigo.", type: "order_delivered", data: { orderId } });
       await pushNotification(safe(order.sellerUid), { title: "Entrega concluida", body: "A Entrega FireRank foi concluida. Confira a taxa devida ao entregador.", type: "regional_delivery_completed", data: { orderId } });
       return res.json({ ok: true, orderId, dispatchId, status: "delivered", payout: payout ? { amountCents: integer(payout.amountCents, 0), status: safe(payout.status), custodyByFireRank: false } : null });
     }
     if (action === "abandon") {
-      await frMasterAdjustCourierScore(uid, -10, "delivery_abandoned", orderId);
+      await frMasterAdjustCourierScore(uid, FIRERANK_V51_SCORE_ABANDON_DELTA, "delivery_abandoned", orderId);
       await db.ref().update({
         [`regional_delivery_dispatches/${dispatchId}/status`]: "cancelled",
         [`regional_delivery_dispatches/${dispatchId}/updatedAtMs`]: t,
@@ -12883,6 +12936,1027 @@ app.post("/v1/delivery/regional/payout", requireUser, rateLimit("regional-delive
 });
 
 // FIRERANK_MASTER_V5_END
+
+// FIRERANK_MASTER_V51_BEGIN
+// FireRank Master V5.1 / DB16 consolidation.
+// Goals: preflight before media upload, idempotent publish sessions,
+// safe public product details, configurable commerce policy, resilient ranking,
+// bounded cleanup and runtime diagnostics. Sensitive authority stays server-side.
+
+const FIRERANK_MASTER_V51_SCHEMA = "5.1.0";
+const FIRERANK_MASTER_V51_DB_REVISION = "DB16";
+const FIRERANK_PUBLISH_SESSION_TTL_MS = 15 * 60 * 1000;
+const FIRERANK_PUBLISH_LOCK_TTL_MS = 2 * 60 * 1000;
+const FIRERANK_V51_CONFIG_REFRESH_MS = 10 * 60 * 1000;
+const FIRERANK_V51_SCORE_REFRESH_MS = 30 * 1000;
+const FIRERANK_V51_MAX_STARTUP_BACKFILL = 500;
+
+let FIRERANK_V51_DELIVERY_ALLOWED_DAYS = new Set(["fri", "sat", "sun"]);
+let FIRERANK_V51_DELIVERY_OFFER_BATCH = 5;
+let FIRERANK_V51_SCORE_COMPLETE_DELTA = 2;
+let FIRERANK_V51_SCORE_ABANDON_DELTA = -10;
+
+let FIRERANK_V51_DELIVERY_RATES = {
+  electric_bike: { base: 350, perKm: 110, min: 450, max: 2200 },
+  motorcycle: { base: 500, perKm: 165, min: 650, max: 3500 },
+  car: { base: 750, perKm: 230, min: 950, max: 5000 },
+};
+
+const frV51ScoreRefreshAt = new Map();
+let frV51CleanupRunning = false;
+
+function frV51Object(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function frV51UniqueText(values, max = 30) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(values) ? values : []) {
+    const value = clip(raw, 120);
+    const key = value.toLowerCase();
+    if (!value || seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function frV51DeriveVertical(productType, localType = "") {
+  const type = safe(productType).toLowerCase();
+  const local = safe(localType).toLowerCase();
+  if (type === "affiliate") return "affiliate";
+  if (["food", "custom_order", "meal", "bakery", "dessert"].includes(local)) return "food";
+  return "marketplace";
+}
+
+function frV51SanitizeProductAttributes(raw) {
+  const input = map(raw);
+  const output = {};
+  const textFields = [
+    ["condition", 30],
+    ["brand", 80],
+    ["model", 100],
+    ["transmission", 40],
+    ["fuel", 40],
+    ["color", 50],
+    ["size", 50],
+  ];
+  for (const [key, max] of textFields) {
+    const value = clip(input[key], max);
+    if (value) output[key] = value;
+  }
+  const intFields = [
+    ["year", 1900, 2200],
+    ["mileageKm", 0, 10_000_000],
+    ["bedrooms", 0, 100],
+    ["bathrooms", 0, 100],
+    ["memoryGb", 0, 100_000],
+  ];
+  for (const [key, min, max] of intFields) {
+    if (input[key] === undefined || input[key] === null || input[key] === "") continue;
+    const value = integer(input[key], -1);
+    if (value < min || value > max) {
+      const error = new Error(`INVALID_ATTRIBUTE_${key.toUpperCase()}`);
+      error.statusCode = 422;
+      error.publicMessage = `Revise o campo ${key}.`;
+      throw error;
+    }
+    output[key] = value;
+  }
+  if (input.areaM2 !== undefined && input.areaM2 !== null && input.areaM2 !== "") {
+    const areaM2 = finiteNumber(input.areaM2, -1);
+    if (areaM2 < 0 || areaM2 > 10_000_000) {
+      const error = new Error("INVALID_ATTRIBUTE_AREA");
+      error.statusCode = 422;
+      error.publicMessage = "Revise a area informada.";
+      throw error;
+    }
+    output.areaM2 = Number(areaM2.toFixed(2));
+  }
+  if (input.negotiable === true) output.negotiable = true;
+  return output;
+}
+
+function frV51SearchTerms(product, baseTerms = []) {
+  const p = map(product);
+  const a = map(p.attributes);
+  const local = map(p.local);
+  const values = [
+    ...(Array.isArray(baseTerms) ? baseTerms : []),
+    p.title,
+    p.categoryId,
+    p.vertical,
+    local.localType,
+    a.brand,
+    a.model,
+    a.condition,
+    local.city,
+    local.state,
+  ];
+  const terms = [];
+  const seen = new Set();
+  for (const raw of values) {
+    const normalized = normalizeSearchTerm(raw);
+    if (!normalized) continue;
+    for (const token of normalized.split(/\s+/).filter(Boolean)) {
+      const safeToken = firebaseSafeKey(token).slice(0, 80);
+      if (safeToken && !seen.has(safeToken)) {
+        seen.add(safeToken);
+        terms.push(safeToken);
+      }
+    }
+    const phrase = firebaseSafeKey(normalized).slice(0, 120);
+    if (phrase && !seen.has(phrase)) {
+      seen.add(phrase);
+      terms.push(phrase);
+    }
+  }
+  return terms.slice(0, 40);
+}
+
+function frV51PublicProductDetail(product, card = {}, t = nowMs()) {
+  const p = map(product);
+  const c = map(card);
+  const pricing = map(p.pricing);
+  const media = map(p.media);
+  const local = map(p.local);
+  const commerce = map(p.commerce);
+  const affiliate = map(p.affiliate);
+  const attrs = frV51SanitizeProductAttributes(p.attributes);
+  const localType = clip(local.localType, 40);
+  const vertical = frV51DeriveVertical(p.productType, localType);
+  const images = frV51UniqueText(Array.isArray(media.images) ? media.images : [], 8);
+  const coverUrl = clip(c.coverUrl || media.coverUrl || images[0] || "", 3000);
+
+  const detail = {
+    productId: safe(p.productId),
+    storeId: safe(p.storeId),
+    ownerUid: safe(p.ownerUid),
+    title: clip(p.title, 120),
+    description: clip(p.description, 5000),
+    categoryId: clip(p.categoryId, 80),
+    categoryTitle: clip(p.categoryTitle || "", 120),
+    productType: safe(p.productType).toLowerCase(),
+    vertical,
+    localType,
+    status: "active",
+    visibility: "public",
+    priceCents: integer(pricing.priceCents || c.priceCents, 0),
+    currency: safe(pricing.currency || c.currency || "BRL") || "BRL",
+    coverUrl,
+    images,
+    media: { coverUrl, images },
+    attributes: attrs,
+    commerce: {
+      purchaseMode: clip(commerce.purchaseMode, 60),
+      allowChat: commerce.allowChat !== false,
+      stockManagedByFireRank: commerce.stockManagedByFireRank === true,
+    },
+    ratingAverage: finiteNumber(c.ratingAverage, 0),
+    ratingCount: integer(c.ratingCount, 0),
+    rankScore: finiteNumber(c.rankScore, 0),
+    createdAtMs: integer(p.lifecycle?.createdAtMs || c.createdAtMs, t),
+    updatedAtMs: t,
+  };
+
+  if (safe(p.productType).toLowerCase() === "affiliate") {
+    detail.affiliate = {
+      url: clip(affiliate.url, 3000),
+      host: clip(affiliate.host || affiliate.domain, 180),
+      externalStoreName: clip(affiliate.externalStoreName || affiliate.sourceStore, 120),
+    };
+  } else {
+    detail.local = {
+      localType,
+      orderType: clip(local.orderType, 40),
+      city: clip(local.city, 100),
+      state: clip(local.state, 64),
+      neighborhood: clip(local.neighborhood, 120),
+      locationPrivacy: "approximate_only_public",
+      deliveryAvailable: local.deliveryAvailable === true,
+      pickupAvailable: local.pickupAvailable === true,
+      sellerOwnDelivery: local.sellerOwnDelivery === true,
+      regionalDeliveryAllowed: local.regionalDeliveryAllowed !== false,
+      serviceRadiusKm: Math.max(0, finiteNumber(local.serviceRadiusKm, 0)),
+      preparationTimeMin: Math.max(0, integer(local.preparationTimeMin, 0)),
+      deliveryFeeCents: Math.max(0, integer(local.deliveryFeeCents, 0)),
+      prepaymentRequired: local.prepaymentRequired === true || ["food", "custom_order"].includes(localType),
+      paymentMethods: map(local.paymentMethods),
+    };
+  }
+
+  return detail;
+}
+
+function frV51PublishDigest(body) {
+  const b = map(body);
+  const local = map(b.local);
+  const inventory = map(b.inventory);
+  const affiliate = map(b.affiliate);
+  const normalized = {
+    productType: safe(b.productType).toLowerCase(),
+    title: safe(b.title),
+    description: safe(b.description),
+    priceCents: integer(b.priceCents, -1),
+    categoryId: safe(b.categoryId),
+    storeId: safe(b.storeId),
+    affiliateUrl: safe(affiliate.url),
+    local: {
+      localType: safe(local.localType),
+      orderType: safe(local.orderType),
+      sellerAddressKey: safe(local.sellerAddressKey || local.addressId),
+      deliveryAvailable: local.deliveryAvailable === true,
+      pickupAvailable: local.pickupAvailable === true,
+      sellerOwnDelivery: local.sellerOwnDelivery === true,
+      regionalDeliveryAllowed: local.regionalDeliveryAllowed !== false,
+      prepaymentRequired: local.prepaymentRequired === true,
+      preparationTimeMin: integer(local.preparationTimeMin, 0),
+      serviceRadiusKm: finiteNumber(local.serviceRadiusKm, 0),
+      deliveryFeeCents: integer(local.deliveryFeeCents, 0),
+      paymentMethods: local.paymentMethods,
+      acceptedLocalSafetyNotice: local.acceptedLocalSafetyNotice === true,
+    },
+    inventory: {
+      usesStock: inventory.usesStock === true,
+      initialQuantity: integer(inventory.initialQuantity, 0),
+    },
+    variations: Array.isArray(b.variations) ? b.variations : [],
+    attributes: frV51SanitizeProductAttributes(b.attributes),
+  };
+  return stableHash(JSON.stringify(normalized));
+}
+
+function frV51PublishSessionRef(uid, sessionId) {
+  return db.ref(`product_publish_sessions/${firebaseSafeKey(uid)}/${firebaseSafeKey(sessionId)}`);
+}
+
+async function frV51ValidateProductDraft(uid, body) {
+  await assertSellerCanPublish(uid);
+  const productType = safe(body.productType).toLowerCase();
+  if (!["affiliate", "local"].includes(productType)) {
+    const error = new Error("INVALID_PRODUCT_TYPE");
+    error.statusCode = 422;
+    error.publicMessage = "Tipo de produto invalido.";
+    throw error;
+  }
+
+  const flagName = productType === "local" ? "localOrders" : "affiliateProducts";
+  if (!(await getFeatureFlag(flagName, true))) {
+    const error = new Error("PRODUCT_TYPE_DISABLED");
+    error.statusCode = 409;
+    error.publicMessage = "Este tipo de produto esta temporariamente desativado.";
+    throw error;
+  }
+
+  const title = validateProductTitle(body.title);
+  validateProductDescription(body.description);
+  validatePriceCents(body.priceCents);
+  const category = await validateCategory(body.categoryId, productType);
+  const storeId = await resolveStoreForUser(uid, body.storeId);
+  const { store, settings } = await getStoreContext(storeId);
+  validateStoreFeature(settings, productType);
+  const accountVisibility = await getAccountVisibility(uid);
+  const publicEligible = accountAndStoreCanBePublic(accountVisibility, store);
+  const mediaCount = integer(body.mediaCount, 0);
+  if (mediaCount < 1 || mediaCount > 8) {
+    const error = new Error("INVALID_MEDIA_COUNT");
+    error.statusCode = 422;
+    error.publicMessage = "Selecione entre 1 e 8 imagens.";
+    throw error;
+  }
+
+  let localType = "";
+  if (productType === "affiliate") {
+    validateAffiliateUrl(body.affiliate?.url);
+  } else {
+    const localConfig = validateLocalConfig(body.local, body.inventory);
+    localType = localConfig.localType;
+    await resolveLocalAddress(uid, localConfig.addressId);
+    validateVariationDefinitions(body.variations);
+  }
+  frV51SanitizeProductAttributes(body.attributes);
+
+  return {
+    productType,
+    storeId,
+    categoryId: category.id,
+    vertical: frV51DeriveVertical(productType, localType),
+    publicEligible,
+    title,
+  };
+}
+
+async function frV51ValidateProductUpdateDraft(uid, body) {
+  await assertSellerCanPublish(uid);
+  const productId = safe(body.productId);
+  if (!productId) {
+    const error = new Error("PRODUCT_ID_REQUIRED");
+    error.statusCode = 422;
+    error.publicMessage = "Produto invalido.";
+    throw error;
+  }
+  const productSnap = await db.ref(`products/${productId}`).get();
+  if (!productSnap.exists()) {
+    const error = new Error("PRODUCT_NOT_FOUND");
+    error.statusCode = 404;
+    error.publicMessage = "Produto nao encontrado.";
+    throw error;
+  }
+  const product = map(productSnap.val());
+  if (safe(product.ownerUid) !== uid) {
+    const error = new Error("PRODUCT_OWNER_REQUIRED");
+    error.statusCode = 403;
+    error.publicMessage = "Voce nao pode editar este produto.";
+    throw error;
+  }
+  const productType = safe(product.productType).toLowerCase();
+  const expected = safe(body.expectedProductType).toLowerCase();
+  if (expected && expected !== productType) {
+    const error = new Error("PRODUCT_TYPE_CONFLICT");
+    error.statusCode = 409;
+    error.publicMessage = "O tipo do produto mudou. Atualize a tela.";
+    throw error;
+  }
+  validateProductTitle(body.title);
+  validateProductDescription(body.description);
+  validatePriceCents(body.priceCents);
+  const category = await validateCategory(body.categoryId, productType);
+  const storeId = await resolveStoreForUser(uid, product.storeId);
+  const { settings } = await getStoreContext(storeId);
+  validateStoreFeature(settings, productType);
+  if (productType === "affiliate") validateAffiliateUrl(body.affiliate?.url);
+  const imageCount = integer(body.imageCount, 0);
+  if (imageCount < 1 || imageCount > 8) {
+    const error = new Error("INVALID_MEDIA_COUNT");
+    error.statusCode = 422;
+    error.publicMessage = "Selecione entre 1 e 8 imagens.";
+    throw error;
+  }
+  frV51SanitizeProductAttributes(body.attributes);
+  return { productId, productType, storeId, categoryId: category.id };
+}
+
+async function frV51CreatePublishSession(uid, body, validation) {
+  const sessionId = crypto.randomBytes(18).toString("hex");
+  const t = nowMs();
+  const session = {
+    sessionId,
+    uid,
+    status: "open",
+    digest: frV51PublishDigest(body),
+    productType: validation.productType,
+    storeId: validation.storeId,
+    categoryId: validation.categoryId,
+    vertical: validation.vertical,
+    publicEligible: validation.publicEligible === true,
+    createdAtMs: t,
+    updatedAtMs: t,
+    expiresAtMs: t + FIRERANK_PUBLISH_SESSION_TTL_MS,
+    schemaVersion: FIRERANK_MASTER_V51_SCHEMA,
+  };
+  await frV51PublishSessionRef(uid, sessionId).set(session);
+  return session;
+}
+
+async function frV51VerifyPublishSession(uid, body, req) {
+  const sessionId = safe(body.publishSessionId || req?.headers?.["idempotency-key"]);
+  if (!sessionId) {
+    // Backward compatibility for installed clients older than V5.1.
+    return { legacy: true, replay: false, sessionId: "", mediaAssetIds: [] };
+  }
+  if (!/^[a-f0-9]{20,80}$/i.test(sessionId)) {
+    const error = new Error("INVALID_PUBLISH_SESSION");
+    error.statusCode = 422;
+    error.publicMessage = "Sessao de publicacao invalida.";
+    throw error;
+  }
+
+  const ref = frV51PublishSessionRef(uid, sessionId);
+  const snap = await ref.get();
+  const session = map(snap.val());
+  if (!snap.exists() || safe(session.uid) !== uid) {
+    const error = new Error("PUBLISH_SESSION_NOT_FOUND");
+    error.statusCode = 409;
+    error.publicMessage = "A validacao da publicacao nao foi encontrada. Tente novamente.";
+    throw error;
+  }
+  if (safe(session.digest) !== frV51PublishDigest(body)) {
+    const error = new Error("PUBLISH_SESSION_CHANGED");
+    error.statusCode = 409;
+    error.publicMessage = "Os dados mudaram depois da validacao. Valide novamente.";
+    throw error;
+  }
+  if (safe(session.status) === "committed" && safe(session.productId)) {
+    return {
+      replay: true,
+      sessionId,
+      response: {
+        ok: true,
+        productId: safe(session.productId),
+        visibility: safe(session.visibility || "public"),
+        publicProjected: session.publicProjected === true,
+        replayed: true,
+      },
+    };
+  }
+  if (finiteNumber(session.expiresAtMs, 0) <= nowMs()) {
+    const error = new Error("PUBLISH_SESSION_EXPIRED");
+    error.statusCode = 409;
+    error.publicMessage = "A validacao expirou. Tente publicar novamente.";
+    throw error;
+  }
+
+  const mediaAssetIds = [];
+  for (const item of Array.isArray(body.media) ? body.media : []) {
+    const mediaId = safe(item?.mediaId);
+    if (!mediaId) continue;
+    const payload = verifyMediaUploadToken(mediaId, uid);
+    const assetId = safe(payload.mediaId);
+    if (assetId && !mediaAssetIds.includes(assetId)) mediaAssetIds.push(assetId);
+  }
+
+  let lockResult = "";
+  const lockId = crypto.randomBytes(8).toString("hex");
+  const t = nowMs();
+  await ref.transaction((raw) => {
+    const current = map(raw);
+    if (!safe(current.sessionId)) {
+      lockResult = "missing";
+      return raw;
+    }
+    if (safe(current.status) === "committed") {
+      lockResult = "committed";
+      return raw;
+    }
+    const lockUntilMs = finiteNumber(current.lockUntilMs, 0);
+    if (safe(current.status) === "processing" && lockUntilMs > t) {
+      lockResult = "busy";
+      return raw;
+    }
+    lockResult = "locked";
+    return {
+      ...current,
+      status: "processing",
+      lockId,
+      lockUntilMs: t + FIRERANK_PUBLISH_LOCK_TTL_MS,
+      mediaAssetIds,
+      updatedAtMs: t,
+    };
+  }, { applyLocally: false });
+
+  if (lockResult === "busy") {
+    const error = new Error("PUBLISH_IN_PROGRESS");
+    error.statusCode = 409;
+    error.publicMessage = "Esta publicacao ja esta sendo processada.";
+    throw error;
+  }
+  if (lockResult === "missing") {
+    const error = new Error("PUBLISH_SESSION_NOT_FOUND");
+    error.statusCode = 409;
+    throw error;
+  }
+  if (lockResult === "committed") {
+    const latest = map((await ref.get()).val());
+    return {
+      replay: true,
+      sessionId,
+      response: {
+        ok: true,
+        productId: safe(latest.productId),
+        visibility: safe(latest.visibility || "public"),
+        publicProjected: latest.publicProjected === true,
+        replayed: true,
+      },
+    };
+  }
+
+  return { legacy: false, replay: false, sessionId, lockId, mediaAssetIds };
+}
+
+async function frV51ReleasePublishSession(uid, body) {
+  const sessionId = safe(body?.publishSessionId);
+  if (!uid || !sessionId) return;
+  const ref = frV51PublishSessionRef(uid, sessionId);
+  const t = nowMs();
+  await ref.transaction((raw) => {
+    const current = map(raw);
+    if (!safe(current.sessionId) || safe(current.status) === "committed") return raw;
+    return {
+      ...current,
+      status: "open",
+      lockId: null,
+      lockUntilMs: 0,
+      updatedAtMs: t,
+    };
+  }, { applyLocally: false });
+}
+
+async function frV51CommitPublishSession(uid, body, response) {
+  const sessionId = safe(body?.publishSessionId);
+  if (!uid || !sessionId) return;
+  const ref = frV51PublishSessionRef(uid, sessionId);
+  const t = nowMs();
+  let assetIds = [];
+  await ref.transaction((raw) => {
+    const current = map(raw);
+    if (!safe(current.sessionId)) return raw;
+    assetIds = Array.isArray(current.mediaAssetIds) ? current.mediaAssetIds.map(safe).filter(Boolean) : [];
+    if (safe(current.status) === "committed") return raw;
+    return {
+      ...current,
+      status: "committed",
+      productId: safe(response.productId),
+      visibility: safe(response.visibility),
+      publicProjected: response.publicProjected === true,
+      committedAtMs: t,
+      updatedAtMs: t,
+      lockId: null,
+      lockUntilMs: 0,
+    };
+  }, { applyLocally: false });
+
+  if (assetIds.length) {
+    const updates = {};
+    for (const assetId of assetIds.slice(0, 8)) {
+      updates[`media_asset_usage/${assetId}`] = {
+        assetId,
+        uid,
+        productId: safe(response.productId),
+        purpose: "product_image",
+        createdAtMs: t,
+      };
+    }
+    await db.ref().update(updates);
+  }
+}
+
+async function frV51RefreshPublicProductDetail(productId) {
+  const id = safe(productId);
+  if (!id) return;
+  const [productSnap, cardSnap] = await Promise.all([
+    db.ref(`products/${id}`).get(),
+    db.ref(`product_cards/${id}`).get(),
+  ]);
+  const product = map(productSnap.val());
+  const card = map(cardSnap.val());
+  const allowed = productSnap.exists() && cardSnap.exists() &&
+    safe(product.status).toLowerCase() === "active" &&
+    safe(product.visibility).toLowerCase() === "public" &&
+    safe(product.moderation?.status).toLowerCase() === "approved";
+  if (!allowed) {
+    await db.ref(`public_product_details/${id}`).remove();
+    return;
+  }
+  await db.ref(`public_product_details/${id}`).set(frV51PublicProductDetail(product, card, nowMs()));
+}
+
+function frV51QualityScore(product, card, stats, atMs = nowMs()) {
+  const p = map(product);
+  const c = map(card);
+  const s = map(stats);
+  const media = map(p.media);
+  const images = Array.isArray(media.images) ? media.images.length : 0;
+  const titleQuality = Math.min(12, Math.max(0, safe(p.title).length / 8));
+  const descriptionQuality = Math.min(12, Math.max(0, safe(p.description).length / 120));
+  const imageQuality = Math.min(12, images * 2.5);
+  const ratingAverage = Math.max(0, Math.min(5, finiteNumber(c.ratingAverage || s.ratingAverage, 0)));
+  const ratingCount = Math.max(0, integer(c.ratingCount || s.ratingCount, 0));
+  const ratingScore = Math.min(18, ratingAverage * 2.4 + Math.log1p(ratingCount) * 2.2);
+  const views = Math.max(0, integer(s.views || s.viewsCount, 0));
+  const favorites = Math.max(0, integer(s.favorites || s.favoriteCount, 0));
+  const carts = Math.max(0, integer(s.addToCartCount || s.cartCount, 0));
+  const purchases = Math.max(0, integer(s.purchaseCount || s.soldCount, 0));
+  const engagement = Math.min(24,
+    Math.log1p(views) * 1.8 +
+    Math.log1p(favorites) * 4.2 +
+    Math.log1p(carts) * 5.0 +
+    Math.log1p(purchases) * 7.0);
+  const createdAtMs = finiteNumber(p.lifecycle?.createdAtMs || c.createdAtMs, atMs);
+  const ageDays = Math.max(0, (atMs - createdAtMs) / DAY_MS);
+  const freshness = Math.max(0, 14 - Math.log1p(ageDays) * 4.5);
+  const reports = Math.max(0, integer(p.moderation?.reportCount, 0));
+  const reportPenalty = Math.min(30, reports * 8);
+  const qualityScore = Math.max(0, Math.min(100,
+    titleQuality + descriptionQuality + imageQuality + ratingScore + engagement + freshness - reportPenalty));
+  return {
+    qualityScore: Number(qualityScore.toFixed(3)),
+    engagementScore: Number(engagement.toFixed(3)),
+    freshnessBoost: Number(freshness.toFixed(3)),
+    reportPenalty,
+    rankScore: Number(qualityScore.toFixed(3)),
+  };
+}
+
+async function frV51RefreshRecommendationScore(productId, { force = false } = {}) {
+  const id = safe(productId);
+  if (!id) return;
+  const t = nowMs();
+  const last = frV51ScoreRefreshAt.get(id) || 0;
+  if (!force && t - last < FIRERANK_V51_SCORE_REFRESH_MS) return;
+  frV51ScoreRefreshAt.set(id, t);
+  const [pSnap, cSnap, sSnap] = await Promise.all([
+    db.ref(`products/${id}`).get(),
+    db.ref(`product_cards/${id}`).get(),
+    db.ref(`product_stats/${id}`).get(),
+  ]);
+  if (!pSnap.exists() || !cSnap.exists()) return;
+  const product = map(pSnap.val());
+  const card = map(cSnap.val());
+  const stats = map(sSnap.val());
+  const score = frV51QualityScore(product, card, stats, t);
+  const rankedCard = { ...card, rankScore: score.rankScore, updatedAtMs: t };
+  await db.ref().update({
+    [`recommendation_scores_v2/${id}`]: {
+      productId: id,
+      vertical: frV51DeriveVertical(product.productType, product.local?.localType),
+      ...score,
+      paidTrustBoost: 0,
+      calculatedAtMs: t,
+      algorithmVersion: "v2_quality_engagement_freshness",
+    },
+    [`product_cards/${id}/rankScore`]: score.rankScore,
+    [`product_cards/${id}/updatedAtMs`]: t,
+    [`public_product_details/${id}`]: frV51PublicProductDetail(product, rankedCard, t),
+  });
+}
+
+function frV51ScheduleRecommendationRefresh(productId) {
+  frV51RefreshRecommendationScore(productId).catch((error) => {
+    if (process.env.NODE_ENV !== "production") console.error("V51 score refresh", error?.message || error);
+  });
+}
+
+function frV51FillMissing(prefix, existing, defaults, updates) {
+  const current = frV51Object(existing);
+  for (const [key, value] of Object.entries(defaults)) {
+    const path = prefix ? `${prefix}/${key}` : key;
+    if (frV51Object(value) === value && Object.keys(value).length > 0) {
+      frV51FillMissing(path, current[key], value, updates);
+    } else if (current[key] === undefined || current[key] === null) {
+      updates[path] = value;
+    }
+  }
+}
+
+async function frV51EnsureDatabaseConfig() {
+  const defaults = {
+    public_config: {
+      app: {
+        databaseRevision: FIRERANK_MASTER_V51_DB_REVISION,
+        commerceSchemaVersion: FIRERANK_MASTER_V51_SCHEMA,
+      },
+      preferences: {
+        defaultTheme: "light",
+        themePreferenceSchemaVersion: 2,
+      },
+      marketplace: {
+        enabled: true,
+        approximateLocationOnly: true,
+        conditionEnabled: true,
+        negotiationEnabled: true,
+        antiDuplicateEnabled: true,
+        soldItemsLeaveDiscovery: true,
+      },
+      food: {
+        enabled: true,
+        scheduledOrdersSupported: true,
+        minimumLeadTimeEnforced: true,
+        availabilityEnforcedByBackend: true,
+      },
+      recommendationV2: {
+        enabled: true,
+        version: "v2_quality_engagement_freshness",
+        paidPlansDoNotGuaranteeTrust: true,
+        personalizationCanBeDisabled: true,
+        antiRepeatEnabled: true,
+      },
+      regionalDelivery: {
+        enabled: true,
+        timezone: "America/Sao_Paulo",
+        days: ["fri", "sat", "sun"],
+        startHour: 19,
+        endHour: 23,
+        inactivityDaysBeforeWaitlist: 7,
+        offerBatchSize: 5,
+        offerTtlMinutes: 5,
+        presenceTtlMinutes: 12,
+        scoreInitial: 100,
+        scoreCompleteDelta: 2,
+        scoreAbandonDelta: -10,
+        rates: FIRERANK_V51_DELIVERY_RATES,
+      },
+      productPublishing: {
+        preflightRequiredForV51Clients: true,
+        publishSessionMinutes: 15,
+        idempotencyEnabled: true,
+        maxImages: 8,
+        orphanMediaCleanupEnabled: true,
+      },
+    },
+    feature_flags: {
+      productPreflight: true,
+      publicProductDetails: true,
+      marketplaceVertical: true,
+      foodVertical: true,
+      recommendationV2: true,
+    },
+  };
+
+  const [publicConfigSnap, featureFlagsSnap] = await Promise.all([
+    db.ref("public_config").get(),
+    db.ref("feature_flags").get(),
+  ]);
+  const updates = {};
+  frV51FillMissing("public_config", publicConfigSnap.val(), defaults.public_config, updates);
+  frV51FillMissing("feature_flags", featureFlagsSnap.val(), defaults.feature_flags, updates);
+
+  // These are canonical V5.1 upgrades and intentionally advance the revision.
+  updates["public_config/app/databaseRevision"] = FIRERANK_MASTER_V51_DB_REVISION;
+  updates["public_config/app/commerceSchemaVersion"] = FIRERANK_MASTER_V51_SCHEMA;
+  updates["public_config/preferences/defaultTheme"] = "light";
+  updates["public_config/api/productPreflightEndpoint"] = `${APP_BASE_URL}/v1/products/preflight`;
+  updates["public_config/api/productUpdatePreflightEndpoint"] = `${APP_BASE_URL}/v1/products/update-preflight`;
+  updates["public_config/api/publicProductDetailEndpointTemplate"] = `${APP_BASE_URL}/v1/products/public/{productId}`;
+  updates["public_config/api/runtimeHealthEndpoint"] = `${APP_BASE_URL}/v1/runtime/master-v51`;
+  updates["public_config/api/schemaVersion"] = FIRERANK_MASTER_V51_SCHEMA;
+  updates["database_meta/masterV51"] = {
+    revision: FIRERANK_MASTER_V51_DB_REVISION,
+    schemaVersion: FIRERANK_MASTER_V51_SCHEMA,
+    backendAuthorityForSensitiveWrites: true,
+    publicProductDetailsEnabled: true,
+    productPreflightEnabled: true,
+    updatedAtMs: nowMs(),
+  };
+  await db.ref().update(updates);
+}
+
+function frV51NormalizeRate(raw, fallback) {
+  const r = map(raw);
+  const base = Math.max(0, integer(r.base, fallback.base));
+  const perKm = Math.max(0, integer(r.perKm, fallback.perKm));
+  const min = Math.max(0, integer(r.min, fallback.min));
+  const max = Math.max(min, integer(r.max, fallback.max));
+  return { base, perKm, min, max };
+}
+
+async function frV51RefreshRuntimeConfig() {
+  const snap = await db.ref("public_config/regionalDelivery").get();
+  const cfg = map(snap.val());
+  const rates = map(cfg.rates);
+  const configuredDays = Array.isArray(cfg.days) ? cfg.days.map((v) => safe(v).toLowerCase()).filter(Boolean) : [];
+  if (configuredDays.length) FIRERANK_V51_DELIVERY_ALLOWED_DAYS = new Set(configuredDays.slice(0, 7));
+  FIRERANK_V51_DELIVERY_OFFER_BATCH = Math.max(1, Math.min(20, integer(cfg.offerBatchSize, FIRERANK_V51_DELIVERY_OFFER_BATCH)));
+  FIRERANK_V51_SCORE_COMPLETE_DELTA = Math.max(-100, Math.min(100, integer(cfg.scoreCompleteDelta, FIRERANK_V51_SCORE_COMPLETE_DELTA)));
+  FIRERANK_V51_SCORE_ABANDON_DELTA = Math.max(-100, Math.min(100, integer(cfg.scoreAbandonDelta, FIRERANK_V51_SCORE_ABANDON_DELTA)));
+  FIRERANK_V51_DELIVERY_RATES = {
+    electric_bike: frV51NormalizeRate(rates.electric_bike, FIRERANK_V51_DELIVERY_RATES.electric_bike),
+    motorcycle: frV51NormalizeRate(rates.motorcycle, FIRERANK_V51_DELIVERY_RATES.motorcycle),
+    car: frV51NormalizeRate(rates.car, FIRERANK_V51_DELIVERY_RATES.car),
+  };
+
+  if (typeof FIRERANK_REGIONAL_DELIVERY_PRESENCE_TTL_MS !== "undefined") {
+    FIRERANK_REGIONAL_DELIVERY_PRESENCE_TTL_MS = Math.max(2, Math.min(60, integer(cfg.presenceTtlMinutes, 12))) * 60 * 1000;
+  }
+  if (typeof FIRERANK_REGIONAL_DELIVERY_OFFER_TTL_MS !== "undefined") {
+    FIRERANK_REGIONAL_DELIVERY_OFFER_TTL_MS = Math.max(1, Math.min(30, integer(cfg.offerTtlMinutes, 5))) * 60 * 1000;
+  }
+  if (typeof FIRERANK_COURIER_INACTIVITY_MS !== "undefined") {
+    FIRERANK_COURIER_INACTIVITY_MS = Math.max(1, Math.min(90, integer(cfg.inactivityDaysBeforeWaitlist, 7))) * DAY_MS;
+  }
+  if (typeof FIRERANK_COURIER_INITIAL_SCORE !== "undefined") {
+    FIRERANK_COURIER_INITIAL_SCORE = Math.max(1, Math.min(100, integer(cfg.scoreInitial, 100)));
+  }
+
+  if (typeof FIRERANK_REGIONAL_DELIVERY_START_HOUR !== "undefined") {
+    const start = integer(cfg.startHour, FIRERANK_REGIONAL_DELIVERY_START_HOUR);
+    if (start >= 0 && start <= 23) FIRERANK_REGIONAL_DELIVERY_START_HOUR = start;
+  }
+  if (typeof FIRERANK_REGIONAL_DELIVERY_END_HOUR !== "undefined") {
+    const end = integer(cfg.endHour, FIRERANK_REGIONAL_DELIVERY_END_HOUR);
+    if (end >= 0 && end <= 23) FIRERANK_REGIONAL_DELIVERY_END_HOUR = end;
+  }
+}
+
+async function frV51CleanupExpiredPublishSessions() {
+  if (frV51CleanupRunning) return;
+  frV51CleanupRunning = true;
+  try {
+    const t = nowMs();
+    const rootSnap = await db.ref("product_publish_sessions").get();
+    const root = map(rootSnap.val());
+    let processed = 0;
+    for (const [uid, sessionsRaw] of Object.entries(root)) {
+      const sessions = map(sessionsRaw);
+      for (const [sessionId, raw] of Object.entries(sessions)) {
+        if (processed >= 50) return;
+        const session = map(raw);
+        if (safe(session.status) === "committed") continue;
+        if (finiteNumber(session.expiresAtMs, 0) > t) continue;
+        processed += 1;
+        const assetIds = Array.isArray(session.mediaAssetIds) ? session.mediaAssetIds.map(safe).filter(Boolean) : [];
+        for (const assetId of assetIds.slice(0, 8)) {
+          const usageSnap = await db.ref(`media_asset_usage/${assetId}`).get();
+          if (usageSnap.exists()) continue;
+          const assetRef = db.ref(`media_assets/${uid}/${assetId}`);
+          const assetSnap = await assetRef.get();
+          const asset = map(assetSnap.val());
+          if (!assetSnap.exists() || safe(asset.purpose) !== "product_image") continue;
+          let deleted = false;
+          try {
+            if (typeof cloudinary !== "undefined" && cloudinary?.uploader?.destroy && safe(asset.publicId)) {
+              await cloudinary.uploader.destroy(safe(asset.publicId), {
+                resource_type: "image",
+                type: safe(asset.type || "authenticated"),
+                invalidate: true,
+              });
+              deleted = true;
+            }
+          } catch (_) {}
+          if (deleted) {
+            await assetRef.update({ status: "deleted_orphan", deletedAtMs: t, updatedAtMs: t });
+          } else {
+            await db.ref(`media_orphan_queue/${uid}/${assetId}`).set({
+              assetId,
+              uid,
+              sessionId,
+              status: "pending_cleanup",
+              createdAtMs: t,
+            });
+          }
+        }
+        await frV51PublishSessionRef(uid, sessionId).update({
+          status: "expired",
+          expiredAtMs: t,
+          updatedAtMs: t,
+          lockId: null,
+          lockUntilMs: 0,
+        });
+      }
+    }
+  } finally {
+    frV51CleanupRunning = false;
+  }
+}
+
+async function frV51BackfillPublicDetails() {
+  const markerRef = db.ref("database_migrations/master_v51_public_details");
+  const marker = map((await markerRef.get()).val());
+  if (safe(marker.status) === "complete") return;
+
+  const cardsSnap = await db.ref("product_cards").limitToFirst(FIRERANK_V51_MAX_STARTUP_BACKFILL).get();
+  const cards = map(cardsSnap.val());
+  const ids = Object.keys(cards);
+  let updated = 0;
+  for (const productId of ids) {
+    const productSnap = await db.ref(`products/${productId}`).get();
+    if (!productSnap.exists()) continue;
+    const product = map(productSnap.val());
+    const card = map(cards[productId]);
+    if (safe(product.status).toLowerCase() !== "active" || safe(product.visibility).toLowerCase() !== "public") continue;
+    await db.ref(`public_product_details/${productId}`).set(frV51PublicProductDetail(product, card, nowMs()));
+    frV51ScheduleRecommendationRefresh(productId);
+    updated += 1;
+  }
+  await markerRef.set({
+    status: ids.length < FIRERANK_V51_MAX_STARTUP_BACKFILL ? "complete" : "partial_limit_reached",
+    scanned: ids.length,
+    updated,
+    limit: FIRERANK_V51_MAX_STARTUP_BACKFILL,
+    updatedAtMs: nowMs(),
+  });
+}
+
+app.post("/v1/products/update-preflight", requireUser, rateLimit("product-update-preflight", 30, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const validation = await frV51ValidateProductUpdateDraft(req.auth.uid, map(req.body));
+    return res.json({ ok: true, ...validation, schemaVersion: FIRERANK_MASTER_V51_SCHEMA });
+  } catch (error) {
+    return publicError(res, error, "Nao foi possivel validar a edicao.");
+  }
+});
+
+app.post("/v1/products/preflight", requireUser, rateLimit("product-preflight", 30, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const uid = req.auth.uid;
+    const body = map(req.body);
+    const validation = await frV51ValidateProductDraft(uid, body);
+    const session = await frV51CreatePublishSession(uid, body, validation);
+    frV51CleanupExpiredPublishSessions().catch(() => {});
+    return res.status(201).json({
+      ok: true,
+      publishSessionId: session.sessionId,
+      expiresAtMs: session.expiresAtMs,
+      storeId: validation.storeId,
+      categoryId: validation.categoryId,
+      vertical: validation.vertical,
+      publicEligible: validation.publicEligible,
+      schemaVersion: FIRERANK_MASTER_V51_SCHEMA,
+    });
+  } catch (error) {
+    return publicError(res, error, "Nao foi possivel validar a publicacao.");
+  }
+});
+
+app.get("/v1/products/public/:productId", rateLimit("public-product-detail-v51", 240, 10 * 60 * 1000), async (req, res) => {
+  try {
+    const productId = clip(req.params?.productId, 180);
+    if (!productId) {
+      return res.status(422).json({ ok: false, code: "PRODUCT_ID_REQUIRED" });
+    }
+
+    const detailSnap = await db.ref(`public_product_details/${productId}`).get();
+    if (detailSnap.exists()) {
+      return res.json({ ok: true, product: map(detailSnap.val()), source: "public_projection" });
+    }
+
+    // Recovery path for a deployment where the DB16 backfill has not reached
+    // this item yet. We re-evaluate the public gates on the server and never
+    // expose street/number/private inventory or private account data.
+    const [productSnap, cardSnap] = await Promise.all([
+      db.ref(`products/${productId}`).get(),
+      db.ref(`product_cards/${productId}`).get(),
+    ]);
+    if (!productSnap.exists() || !cardSnap.exists()) {
+      return res.status(404).json({ ok: false, code: "PRODUCT_NOT_AVAILABLE" });
+    }
+    const product = map(productSnap.val());
+    const card = map(cardSnap.val());
+    const ownerUid = safe(product.ownerUid);
+    const storeId = safe(product.storeId);
+    const allowedProduct =
+      safe(product.status).toLowerCase() === "active" &&
+      safe(product.visibility).toLowerCase() === "public" &&
+      safe(product.moderation?.status).toLowerCase() === "approved" &&
+      ownerUid && storeId;
+    if (!allowedProduct) {
+      return res.status(404).json({ ok: false, code: "PRODUCT_NOT_AVAILABLE" });
+    }
+    const [visibility, storeSnap] = await Promise.all([
+      getAccountVisibility(ownerUid),
+      db.ref(`stores/${storeId}`).get(),
+    ]);
+    const store = map(storeSnap.val());
+    if (!storeSnap.exists() || !accountAndStoreCanBePublic(visibility, store)) {
+      return res.status(404).json({ ok: false, code: "PRODUCT_NOT_AVAILABLE" });
+    }
+
+    const detail = frV51PublicProductDetail(product, card, nowMs());
+    db.ref(`public_product_details/${productId}`).set(detail).catch(() => {});
+    return res.json({ ok: true, product: detail, source: "server_recovery" });
+  } catch (error) {
+    return publicError(res, error, "Nao foi possivel abrir este produto.");
+  }
+});
+
+app.get("/v1/runtime/master-v51", rateLimit("runtime-master-v51", 120, 10 * 60 * 1000), async (_req, res) => {
+  try {
+    return res.json({
+      ok: true,
+      schemaVersion: FIRERANK_MASTER_V51_SCHEMA,
+      databaseRevision: FIRERANK_MASTER_V51_DB_REVISION,
+      productPreflight: true,
+      publicProductDetails: true,
+      recommendationV2: true,
+      defaultTheme: "light",
+      directPix: true,
+      regionalDelivery: true,
+      firebaseStorageOperationalMedia: false,
+      mediaProvider: "cloudinary",
+      custodyByFireRank: false,
+    });
+  } catch (error) {
+    return publicError(res, error, "Runtime V5.1 indisponivel.");
+  }
+});
+
+async function frV51Bootstrap() {
+  await frV51EnsureDatabaseConfig();
+  await frV51RefreshRuntimeConfig();
+  await frV51BackfillPublicDetails();
+  await frV51CleanupExpiredPublishSessions();
+  await db.ref("runtime_health/master_v51").set({
+    status: "ready",
+    schemaVersion: FIRERANK_MASTER_V51_SCHEMA,
+    databaseRevision: FIRERANK_MASTER_V51_DB_REVISION,
+    updatedAtMs: nowMs(),
+  });
+}
+
+setTimeout(() => {
+  frV51Bootstrap().catch((error) => {
+    console.error("FIRERANK_MASTER_V51_BOOTSTRAP", error?.message || error);
+  });
+}, 1500);
+
+const frV51Timer = setInterval(() => {
+  frV51RefreshRuntimeConfig().catch(() => {});
+  frV51CleanupExpiredPublishSessions().catch(() => {});
+}, FIRERANK_V51_CONFIG_REFRESH_MS);
+if (typeof frV51Timer.unref === "function") frV51Timer.unref();
+
+// FIRERANK_MASTER_V51_END
 
 async function expireBoosts() {
   const t =
