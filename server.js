@@ -31,10 +31,9 @@ const FIRERANK_SCHEMA_VERSION = "4.2.0";
 const OFFICIAL_RENDER_BASE_URL = "https://firerank-api-oxy1.onrender.com";
 
 const APP_BASE_URL = String(
-  process.env.APP_BASE_URL ||
-    (NODE_ENV === "production"
-      ? OFFICIAL_RENDER_BASE_URL
-      : `http://localhost:${PORT}`)
+  process.env.PUBLIC_BASE_URL ||
+    process.env.APP_BASE_URL ||
+    "https://firerank-api-oxy1.onrender.com"
 ).replace(/\/+$/, "");
 
 const FIREBASE_DATABASE_URL = String(process.env.FIREBASE_DATABASE_URL || "");
@@ -773,45 +772,75 @@ async function pushNotification(uid, notification) {
 }
 // FIRERANK_PRODUCTION_FLOW_V1_PUSH_END
 
+// FIRERANK_V51_1_PUBLIC_API_CANONICAL
 async function ensurePublicApiConfig() {
-  if (!isHttpsUrl(APP_BASE_URL) && NODE_ENV === "production") {
-    console.warn(
-      "public_config/api não foi alterado: APP_BASE_URL público HTTPS ainda não está configurado."
-    );
-    return false;
-  }
-
   const t = nowMs();
 
   await db.ref("public_config/api").update({
-    schemaVersion: FIRERANK_SCHEMA_VERSION,
+    schemaVersion: "5.1.0",
     baseUrl: APP_BASE_URL,
     gatewayBaseUrl: APP_BASE_URL,
     backendBaseUrl: APP_BASE_URL,
+
+    accountDeleteEndpoint: `${APP_BASE_URL}/v1/account/delete-request`,
+    accountExportEndpoint: `${APP_BASE_URL}/v1/account/export`,
+    accountPrivacyEndpoint: `${APP_BASE_URL}/v1/account/privacy`,
+    accountProfileEndpoint: `${APP_BASE_URL}/v1/account/profile`,
+    addressSaveEndpoint: `${APP_BASE_URL}/v1/account/address`,
+    saveAddressEndpoint: `${APP_BASE_URL}/v1/account/address`,
+    userAddressEndpoint: `${APP_BASE_URL}/v1/account/address`,
+
+    aiAssistantEndpoint: `${APP_BASE_URL}/v1/ai/v2/chat`,
+    analyticsBannerEndpoint: `${APP_BASE_URL}/v1/analytics/banner`,
+    billingMercadoPagoEndpoint:
+      `${APP_BASE_URL}/v1/billing/mercadopago/create-preference`,
+
+    sellerApplicationEndpoint: `${APP_BASE_URL}/v1/applications/seller`,
+    deliveryApplicationEndpoint: `${APP_BASE_URL}/v1/applications/delivery`,
+    adminApplicationDecisionEndpointTemplate:
+      `${APP_BASE_URL}/v1/admin/applications/{role}/{uid}/decision`,
+
+    boostCatalogEndpoint: `${APP_BASE_URL}/v1/boost/catalog`,
+    chatStartEndpoint: `${APP_BASE_URL}/v1/chats/start`,
+    supportChatEndpoint: `${APP_BASE_URL}/v1/support/chat`,
+
+    deliveryConnectionRequestEndpoint:
+      `${APP_BASE_URL}/v1/delivery/connections/request`,
+    deliveryConnectionRespondEndpoint:
+      `${APP_BASE_URL}/v1/delivery/connections/respond`,
+    deliveryConnectionUpdateEndpoint:
+      `${APP_BASE_URL}/v1/delivery/connections/update`,
+    deliveryOrderActionEndpoint:
+      `${APP_BASE_URL}/v1/delivery/orders/action`,
+
+    mediaSignEndpoint: `${APP_BASE_URL}/v1/media/sign`,
+    mediaUploadEndpoint: `${APP_BASE_URL}/v1/media/product`,
+    productMediaUploadEndpoint: `${APP_BASE_URL}/v1/media/product`,
+    mediaCompleteEndpoint: `${APP_BASE_URL}/v1/media/complete`,
+    mediaProvider: "cloudinary",
+    firebaseStorageUsed: false,
+
     productCreateEndpoint: `${APP_BASE_URL}/v1/products`,
     createProductEndpoint: `${APP_BASE_URL}/v1/products`,
     productUpdateEndpoint: `${APP_BASE_URL}/v1/products/update`,
     updateProductEndpoint: `${APP_BASE_URL}/v1/products/update`,
-    mediaUploadEndpoint: `${APP_BASE_URL}/v1/media/product`,
-    productMediaUploadEndpoint: `${APP_BASE_URL}/v1/media/product`,
-    mediaSignEndpoint: `${APP_BASE_URL}/v1/media/sign`,
-    addressSaveEndpoint: `${APP_BASE_URL}/v1/account/address`,
-    saveAddressEndpoint: `${APP_BASE_URL}/v1/account/address`,
-    userAddressEndpoint: `${APP_BASE_URL}/v1/account/address`,
-    billingMercadoPagoEndpoint:
-      `${APP_BASE_URL}/v1/billing/mercadopago/create-preference`,
-    sellerApplicationEndpoint: `${APP_BASE_URL}/v1/applications/seller`,
-    deliveryApplicationEndpoint: `${APP_BASE_URL}/v1/applications/delivery`,
-    accountPrivacyEndpoint: `${APP_BASE_URL}/v1/account/privacy`,
-    supportChatEndpoint: `${APP_BASE_URL}/v1/support/chat`,
-    aiAssistantEndpoint: `${APP_BASE_URL}/v1/ai/v2/chat`,
-    analyticsBannerEndpoint: `${APP_BASE_URL}/v1/analytics/banner`,
-    mediaProvider: "cloudinary",
-    firebaseStorageUsed: false,
+    productPreflightEndpoint: `${APP_BASE_URL}/v1/products/preflight`,
+    productUpdatePreflightEndpoint:
+      `${APP_BASE_URL}/v1/products/update-preflight`,
+    publicProductDetailEndpointTemplate:
+      `${APP_BASE_URL}/v1/products/public/{productId}`,
+    productActionEndpoint: `${APP_BASE_URL}/v1/products/action`,
+    productEventEndpoint: `${APP_BASE_URL}/v1/products/event`,
+
+    orderCreateEndpoint: `${APP_BASE_URL}/v1/orders`,
+    orderActionEndpoint: `${APP_BASE_URL}/v1/orders/action`,
+    reportEndpoint: `${APP_BASE_URL}/v1/reports`,
+    reviewEndpoint: `${APP_BASE_URL}/v1/reviews`,
+    guestMergeEndpoint: `${APP_BASE_URL}/v1/account/guest-merge`,
+    runtimeHealthEndpoint: `${APP_BASE_URL}/v1/runtime/master-v51`,
+
     updatedAtMs: t,
   });
-
-  return true;
 }
 
 async function getFeatureFlag(
