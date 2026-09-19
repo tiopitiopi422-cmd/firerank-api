@@ -7925,7 +7925,7 @@ async function migrateVerifiedBadgeProjectionV2() {
     const startedAtMs = finiteNumber(current.startedAtMs, 0);
     if (current.status === "running" && startedAtMs > t - 30 * 60 * 1000) return;
     return { status: "running", startedAtMs: t, updatedAtMs: t };
-  }, { applyLocally: false });
+  });
 
   if (!lock.committed) return { skipped: true };
 
@@ -9185,7 +9185,7 @@ async function ensureDeliveryPublicCode(uid) {
     const suffix = crypto.randomBytes(5).toString("hex").slice(0, 8).toUpperCase();
     const code = `FRD-${suffix}`;
     const codeRef = db.ref(`delivery_public_codes/${firebaseSafeKey(code)}`);
-    const tx = await codeRef.transaction((value) => value ? undefined : uid, {applyLocally:false});
+    const tx = await codeRef.transaction((value) => value ? undefined : uid);
     if (tx.committed && tx.snapshot.val() === uid) return code;
   }
   const error = new Error("DELIVERY_CODE_GENERATION_FAILED");
@@ -11924,7 +11924,7 @@ app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 
           uid, monthKey, used: used + 1, limit: PROFILE_PHOTO_CHANGES_PER_MONTH,
           lastChangedAtMs: t, updatedAtMs: t,
         };
-      }, { applyLocally:false });
+      });
       if (!usageTx.committed) {
         return res.status(429).json({
           ok:false, code:'PROFILE_PHOTO_MONTHLY_LIMIT',
@@ -11943,7 +11943,7 @@ app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 
         throw error;
       }
       const indexRef = db.ref(`username_index/${firebaseSafeKey(username)}`);
-      const tx = await indexRef.transaction((value) => (!value || value === uid ? uid : value), { applyLocally:false });
+      const tx = await indexRef.transaction((value) => (!value || value === uid ? uid : value));
       if (!tx.committed || tx.snapshot.val() !== uid) {
         const error = new Error('USERNAME_TAKEN');
         error.statusCode = 409;
@@ -11996,7 +11996,7 @@ app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 
   } catch (e) {
     if (!profileCommitted) {
       if (reservedUsernameRef) {
-        try { await reservedUsernameRef.transaction((value) => value === uid ? null : value, { applyLocally:false }); } catch (_) {}
+        try { await reservedUsernameRef.transaction((value) => value === uid ? null : value); } catch (_) {}
       }
       if (reservedPhotoUsageRef) {
         try {
@@ -12004,7 +12004,7 @@ app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 
             const value = map(raw);
             const used = Math.max(0, integer(value.used, 0));
             return { ...value, used: Math.max(0, used - 1), updatedAtMs: nowMs() };
-          }, { applyLocally:false });
+          });
         } catch (_) {}
       }
     }
@@ -12089,7 +12089,7 @@ app.post('/v1/products/event', rateLimit('product-event', 180, 60 * 60 * 1000), 
     const ref=db.ref(`product_events/${productId}`).push(); const t=nowMs();
     await ref.set({eventId:ref.key,productId,event,createdAtMs:t,clientPlatform:clip(req.body?.clientPlatform,40)});
     const statKey=event==='view'?'views':event==='affiliate_click'?'affiliateClicks':event==='share'?'shares':'favorites';
-    await db.ref(`product_stats/${productId}/${statKey}`).transaction((v)=>integer(v,0)+1,{applyLocally:false});
+    await db.ref(`product_stats/${productId}/${statKey}`).transaction((v)=>integer(v,0)+1);
     // FIRERANK_V51_EVENT_SCORE_REFRESH
     frV51ScheduleRecommendationRefresh(productId);
     return res.status(202).json({ok:true});
@@ -12239,7 +12239,7 @@ app.post('/v1/delivery/connections/update', requireUser, rateLimit('delivery-con
 
 app.post('/v1/reviews', requireUser, rateLimit('review-create', 8, 60 * 60 * 1000), async(req,res)=>{
   try{
-    const uid=req.auth.uid,orderId=safe(req.body?.orderId),rating=integer(req.body?.rating,0),comment=clip(req.body?.comment,1200),t=nowMs(); if(rating<1||rating>5)return res.status(422).json({ok:false,code:'INVALID_RATING'}); const order=await v42LoadOrder(orderId); if(safe(order.buyerUid)!==uid)return res.status(403).json({ok:false,code:'BUYER_REQUIRED'}); if(v42NormalizeStatus(order.status)!=='delivered')return res.status(409).json({ok:false,code:'ORDER_NOT_DELIVERED'}); if(safe(order.review?.reviewId)||order.review?.submitted===true)return res.status(409).json({ok:false,code:'REVIEW_ALREADY_SUBMITTED'}); const reviewId=db.ref('reviews').push().key,productId=safe(order.productId||order.productSnapshot?.productId),sellerUid=safe(order.sellerUid),review={reviewId,orderId,productId,sellerUid,buyerUid:uid,rating,comment,status:'published',createdAtMs:t}; await db.ref().update({[`reviews/${reviewId}`]:review,[`reviews_by_product/${productId}/${reviewId}`]:{reviewId,rating,createdAtMs:t},[`reviews_by_seller/${sellerUid}/${reviewId}`]:{reviewId,rating,createdAtMs:t},[`orders/${orderId}/review`]:{reviewId,submitted:true,rating,createdAtMs:t}}); const statsRef=db.ref(`product_stats/${productId}`); await statsRef.transaction((raw)=>{const s=map(raw);const count=integer(s.ratingCount,0);const sum=finiteNumber(s.ratingSum,0);return {...s,ratingCount:count+1,ratingSum:sum+rating,ratingAverage:(sum+rating)/(count+1),updatedAtMs:t};},{applyLocally:false}); return res.status(201).json({ok:true,reviewId});
+    const uid=req.auth.uid,orderId=safe(req.body?.orderId),rating=integer(req.body?.rating,0),comment=clip(req.body?.comment,1200),t=nowMs(); if(rating<1||rating>5)return res.status(422).json({ok:false,code:'INVALID_RATING'}); const order=await v42LoadOrder(orderId); if(safe(order.buyerUid)!==uid)return res.status(403).json({ok:false,code:'BUYER_REQUIRED'}); if(v42NormalizeStatus(order.status)!=='delivered')return res.status(409).json({ok:false,code:'ORDER_NOT_DELIVERED'}); if(safe(order.review?.reviewId)||order.review?.submitted===true)return res.status(409).json({ok:false,code:'REVIEW_ALREADY_SUBMITTED'}); const reviewId=db.ref('reviews').push().key,productId=safe(order.productId||order.productSnapshot?.productId),sellerUid=safe(order.sellerUid),review={reviewId,orderId,productId,sellerUid,buyerUid:uid,rating,comment,status:'published',createdAtMs:t}; await db.ref().update({[`reviews/${reviewId}`]:review,[`reviews_by_product/${productId}/${reviewId}`]:{reviewId,rating,createdAtMs:t},[`reviews_by_seller/${sellerUid}/${reviewId}`]:{reviewId,rating,createdAtMs:t},[`orders/${orderId}/review`]:{reviewId,submitted:true,rating,createdAtMs:t}}); const statsRef=db.ref(`product_stats/${productId}`); await statsRef.transaction((raw)=>{const s=map(raw);const count=integer(s.ratingCount,0);const sum=finiteNumber(s.ratingSum,0);return {...s,ratingCount:count+1,ratingSum:sum+rating,ratingAverage:(sum+rating)/(count+1),updatedAtMs:t};}); return res.status(201).json({ok:true,reviewId});
   }catch(e){return publicError(res,e,'Não foi possível enviar a avaliação.');}
 });
 
@@ -12334,7 +12334,7 @@ async function runDailyNotifications() {
     if(current.status==='completed') return;
     if(current.status==='running'&&started>t-HOUR_MS) return;
     return {status:'running',startedAtMs:t,updatedAtMs:t};
-  },{applyLocally:false});
+  });
   if(!lock.committed) return {active:true,alreadyRunningOrCompleted:true,notified:0,day};
 
   const subscribersSnap=await db.ref('notification_subscribers').get();
@@ -12557,7 +12557,7 @@ async function frMasterAdjustCourierScore(uid, delta, reason, orderId = "") {
       status: finalScore <= 0 ? "suspended" : safe(current.status || "active"),
       updatedAtMs: nowMs(),
     };
-  }, { applyLocally: false });
+  });
   const eventRef = db.ref(`delivery_score_events/${uid}`).push();
   await eventRef.set({
     eventId: eventRef.key,
@@ -12928,7 +12928,7 @@ app.post("/v1/checkout/pix-intents/action", requireUser, rateLimit("pix-intent-a
         const current = map(raw);
         if (safe(current.status) !== "pix_sent") return;
         return { ...current, status: "confirming", confirmingAtMs: t, confirmingByUid: uid, updatedAtMs: t };
-      }, { applyLocally: false });
+      });
       if (!tx.committed) {
         const latest = map((await ref.get()).val());
         if (safe(latest.status) === "confirmed" && safe(latest.orderId)) return res.json({ ok: true, intentId, status: "confirmed", orderId: safe(latest.orderId), idempotent: true });
@@ -13034,7 +13034,7 @@ async function frMasterCreateRegionalPayout(order, dispatch, t = nowMs()) {
       createdAtMs: t,
       updatedAtMs: t,
     };
-  }, { applyLocally: false });
+  });
   return map((await ref.get()).val());
 }
 
@@ -13262,7 +13262,7 @@ app.post("/v1/delivery/regional/accept", requireUser, rateLimit("regional-delive
       const current = map(raw);
       if (safe(current.status) !== "searching" || current.offeredTo?.[uid] !== true || finiteNumber(current.expiresAtMs, 0) <= t) return;
       return { ...current, status: "assigned", deliveryUid: uid, acceptedAtMs: t, updatedAtMs: t };
-    }, { applyLocally: false });
+    });
     if (!tx.committed) return res.status(409).json({ ok: false, code: "DELIVERY_ALREADY_TAKEN", message: "Esta entrega ja foi aceita por outro entregador ou expirou." });
     const dispatch = map(tx.snapshot.val());
     const orderId = safe(dispatch.orderId);
@@ -13887,7 +13887,7 @@ async function frV51VerifyPublishSession(uid, body, req) {
       mediaAssetIds,
       updatedAtMs: t,
     };
-  }, { applyLocally: false });
+  });
 
   if (lockResult === "busy") {
     const error = new Error("PUBLISH_IN_PROGRESS");
@@ -13933,7 +13933,7 @@ async function frV51ReleasePublishSession(uid, body) {
       lockUntilMs: 0,
       updatedAtMs: t,
     };
-  }, { applyLocally: false });
+  });
 }
 
 async function frV51CommitPublishSession(uid, body, response) {
@@ -13958,7 +13958,7 @@ async function frV51CommitPublishSession(uid, body, response) {
       lockId: null,
       lockUntilMs: 0,
     };
-  }, { applyLocally: false });
+  });
 
   if (assetIds.length) {
     const updates = {};
