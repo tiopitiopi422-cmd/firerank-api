@@ -3601,10 +3601,6 @@ function addPublicProjections(
     };
   }
 
-  updates[
-    `product_cards/${productId}/updatedAtMs`
-  ] =
-    t;
 }
 
 async function mediaForNewProduct(
