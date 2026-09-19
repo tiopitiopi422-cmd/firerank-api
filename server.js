@@ -28,7 +28,7 @@ const NODE_ENV = String(process.env.NODE_ENV || "development")
   .toLowerCase();
 
 const FIRERANK_SCHEMA_VERSION = "5.1.0";
-const FIRERANK_PATCH_REVISION = "2026-09-16-production-hardening-v3";
+const FIRERANK_PATCH_REVISION = "2026-09-18-contract-repair-v4";
 const PROFILE_PHOTO_CHANGES_PER_MONTH = 2;
 const OFFICIAL_RENDER_BASE_URL = "https://firerank-api-oxy1.onrender.com";
 
@@ -36,16 +36,16 @@ const APP_BASE_URL = String(
   process.env.PUBLIC_BASE_URL ||
     process.env.APP_BASE_URL ||
     "https://firerank-api-oxy1.onrender.com"
-).replace(/\/+$/, "");
+).trim().replace(/\/+$/, "");
 
-const FIREBASE_DATABASE_URL = String(process.env.FIREBASE_DATABASE_URL || "");
+const FIREBASE_DATABASE_URL = String(process.env.FIREBASE_DATABASE_URL || "").trim().replace(/\/+$/, "");
 const FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 = String(
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64 || ""
 );
 const FIREBASE_SERVICE_ACCOUNT_JSON = String(
   process.env.FIREBASE_SERVICE_ACCOUNT_JSON || ""
 );
-const FIREBASE_WEB_API_KEY = String(process.env.FIREBASE_WEB_API_KEY || "");
+const FIREBASE_WEB_API_KEY = String(process.env.FIREBASE_WEB_API_KEY || "").trim();
 
 const MP_PUBLIC_KEY = String(process.env.MERCADO_PAGO_PUBLIC_KEY || "");
 const MP_ACCESS_TOKEN = String(process.env.MERCADO_PAGO_ACCESS_TOKEN || "");
@@ -536,14 +536,15 @@ async function requireUser(
 
     return next();
   } catch (error) {
-    if (
-      NODE_ENV !== "production"
-    ) {
-      console.error(
-        "Auth middleware:",
-        error.message
-      );
-    }
+    console.error(
+      "AUTH_VERIFY_FAILED",
+      JSON.stringify({
+        code: safe(error?.code),
+        message: clip(error?.message, 180),
+        appCheckRequired: REQUIRE_APP_CHECK,
+        firebaseProjectId: safe(serviceAccount?.project_id),
+      })
+    );
 
     return res
       .status(
@@ -840,6 +841,7 @@ async function ensurePublicApiConfig() {
     reviewEndpoint: `${APP_BASE_URL}/v1/reviews`,
     guestMergeEndpoint: `${APP_BASE_URL}/v1/account/guest-merge`,
     runtimeHealthEndpoint: `${APP_BASE_URL}/v1/runtime/master-v51`,
+    ownerProductsReadMode: "rtdb_owner_products",
 
     updatedAtMs: t,
   });
@@ -4617,6 +4619,9 @@ const updates = {
           initialProductStats(
             t
           ),
+
+        [`owner_products/${uid}/${productId}`]:
+          ownerProductIndexValue(productId, product, t),
       };
 
       for (
@@ -5065,6 +5070,10 @@ const oldCardSnap =
       const updates = {
         [`products/${productId}`]:
           updated,
+        [`owner_products/${uid}/${productId}`]:
+          updated.status === "deleted"
+            ? null
+            : ownerProductIndexValue(productId, updated, t),
       };
 
       addProjectionRemovals(
@@ -11282,8 +11291,90 @@ function v42PublicUserProjection(uid, source, t) {
     profileLink: clip(source.profileLink, 500),
     photoUrl: safe(source.photoUrl || source.profilePhotoUrl),
     accountVisibility: safe(source.accountVisibility || 'public') === 'private' ? 'private' : 'public',
+    followersCount: Math.max(0, integer(source.followersCount, 0)),
+    followingCount: Math.max(0, integer(source.followingCount, 0)),
+    createdAtMs: finiteNumber(source.createdAtMs, t),
     updatedAtMs: t,
   };
+}
+
+function ownerProductIndexValue(productId, product, t = nowMs()) {
+  const lifecycle = map(product?.lifecycle);
+  return {
+    productId: safe(productId),
+    ownerUid: safe(product?.ownerUid),
+    status: safe(product?.status || 'active').toLowerCase(),
+    createdAtMs: finiteNumber(lifecycle.createdAtMs, t),
+    updatedAtMs: finiteNumber(lifecycle.updatedAtMs, t),
+  };
+}
+
+async function repairSocialCountsAndOwnerProducts() {
+  const markerRef = db.ref('database_migrations/contract_repair_20260918_v4');
+  const marker = map((await markerRef.get()).val());
+  if (safe(marker.status) === 'complete') return map(marker);
+
+  const [edgesSnap, publicUsersSnap, profilesSnap, productsSnap] = await Promise.all([
+    db.ref('follow_edges').get(),
+    db.ref('public_users').get(),
+    db.ref('user_profiles').get(),
+    db.ref('products').get(),
+  ]);
+
+  const edges = map(edgesSnap.val());
+  const publicUsers = map(publicUsersSnap.val());
+  const profiles = map(profilesSnap.val());
+  const products = map(productsSnap.val());
+  const followers = {};
+  const following = {};
+
+  for (const [ownerUid, rawEdges] of Object.entries(edges)) {
+    const ownerEdges = map(rawEdges);
+    for (const [viewerUid, rawEdge] of Object.entries(ownerEdges)) {
+      const edge = map(rawEdge);
+      const approved = rawEdge === true ||
+        edge.approved === true ||
+        edge.active === true ||
+        ['approved', 'active'].includes(safe(edge.status).toLowerCase());
+      if (!approved) continue;
+      followers[ownerUid] = integer(followers[ownerUid], 0) + 1;
+      following[viewerUid] = integer(following[viewerUid], 0) + 1;
+    }
+  }
+
+  const updates = {};
+  for (const [uid, rawPublic] of Object.entries(publicUsers)) {
+    const pub = map(rawPublic);
+    const profile = map(profiles[uid]);
+    updates[`public_users/${uid}/followersCount`] = Math.max(0, integer(followers[uid], 0));
+    updates[`public_users/${uid}/followingCount`] = Math.max(0, integer(following[uid], 0));
+    if (!finiteNumber(pub.createdAtMs, 0)) {
+      updates[`public_users/${uid}/createdAtMs`] = finiteNumber(profile.createdAtMs, 0);
+    }
+  }
+
+  let ownerProductCount = 0;
+  for (const [productId, rawProduct] of Object.entries(products)) {
+    const product = map(rawProduct);
+    const ownerUid = safe(product.ownerUid);
+    if (!ownerUid) continue;
+    if (safe(product.status).toLowerCase() === 'deleted') {
+      updates[`owner_products/${ownerUid}/${productId}`] = null;
+      continue;
+    }
+    updates[`owner_products/${ownerUid}/${productId}`] = ownerProductIndexValue(productId, product);
+    ownerProductCount += 1;
+  }
+
+  if (Object.keys(updates).length) await db.ref().update(updates);
+  const result = {
+    status: 'complete',
+    publicUsersRecounted: Object.keys(publicUsers).length,
+    ownerProductsIndexed: ownerProductCount,
+    updatedAtMs: nowMs(),
+  };
+  await markerRef.set(result);
+  return result;
 }
 
 // FIRERANK_PRODUCTION_FLOW_V1_ROUTES_BEGIN
@@ -11781,7 +11872,12 @@ app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 
     if (!displayName) return res.status(422).json({ ok:false, code:'DISPLAY_NAME_REQUIRED', message:'Nome obrigatório.' });
     if (profileLink && !isHttpsUrl(profileLink)) return res.status(422).json({ ok:false, code:'INVALID_PROFILE_LINK', message:'Use um link HTTPS válido.' });
 
-    const current = map((await db.ref(`user_profiles/${uid}`).get()).val());
+    const [currentProfileSnap, currentPublicSnap] = await Promise.all([
+      db.ref(`user_profiles/${uid}`).get(),
+      db.ref(`public_users/${uid}`).get(),
+    ]);
+    const current = map(currentProfileSnap.val());
+    const currentPublic = map(currentPublicSnap.val());
     const oldUsername = safe(current.username).toLowerCase();
     const hasUsernameField = Object.prototype.hasOwnProperty.call(body, 'username');
     const username = (hasUsernameField ? safe(body.username) : oldUsername).toLowerCase();
@@ -11864,7 +11960,13 @@ app.post('/v1/account/profile', requireUser, rateLimit('profile-update', 20, 10 
     const visibility = await getAccountVisibility(uid);
     const updates = {
       [`user_profiles/${uid}`]: profile,
-      [`public_users/${uid}`]: v42PublicUserProjection(uid, { ...profile, accountVisibility: visibility }, t),
+      [`public_users/${uid}`]: v42PublicUserProjection(uid, {
+        ...profile,
+        accountVisibility: visibility,
+        followersCount: currentPublic.followersCount,
+        followingCount: currentPublic.followingCount,
+        createdAtMs: currentPublic.createdAtMs || profile.createdAtMs,
+      }, t),
     };
     if (usernameChanged && oldUsername) updates[`username_index/${firebaseSafeKey(oldUsername)}`] = null;
     if (profileMediaId && photoChanged) {
@@ -12005,6 +12107,7 @@ app.post('/v1/products/action', requireUser, rateLimit('product-action', 30, 10 
     const updates={
       [`products/${productId}/status`]:nextStatus,[`products/${productId}/lifecycle/updatedAtMs`]:t,
       [`product_cards/${productId}`]:null,[`feed_index/${productId}`]:null,[`search_index_basic/${productId}`]:null,[`active_boost_cards/${productId}`]:null,
+      [`owner_products/${uid}/${productId}`]:action==='delete' ? null : ownerProductIndexValue(productId,{...product,status:nextStatus,lifecycle:{...map(product.lifecycle),updatedAtMs:t}},t),
     };
     const categoryId=safe(product.categoryId); if(categoryId)updates[`category_index/${categoryId}/${productId}`]=null;
     if(action==='delete')updates[`products/${productId}/lifecycle/deletedAtMs`]=t;
@@ -14054,6 +14157,7 @@ async function frV51EnsureDatabaseConfig() {
 
   // These are canonical V5.1 upgrades and intentionally advance the revision.
   updates["public_config/app/databaseRevision"] = FIRERANK_MASTER_V51_DB_REVISION;
+  updates["public_config/app/schemaVersion"] = FIRERANK_MASTER_V51_SCHEMA;
   updates["public_config/app/commerceSchemaVersion"] = FIRERANK_MASTER_V51_SCHEMA;
   updates["public_config/preferences/defaultTheme"] = "light";
   updates["public_config/productPublishing/maxImages"] = MAX_PRODUCT_IMAGES;
@@ -14859,6 +14963,8 @@ app.get(
         ok: ready,
         schemaVersion:
           FIRERANK_SCHEMA_VERSION,
+        patchRevision: FIRERANK_PATCH_REVISION,
+        firebaseProjectId: safe(serviceAccount?.project_id),
         nodeEnv: NODE_ENV,
         databaseOk,
         databaseError:
@@ -15040,6 +15146,10 @@ async function start() {
 
   try {
     await ensurePublicApiConfig();
+    const contractRepair = await repairSocialCountsAndOwnerProducts();
+    console.log(
+      `Contract repair: users=${integer(contractRepair.publicUsersRecounted, 0)} ownerProducts=${integer(contractRepair.ownerProductsIndexed, 0)}`
+    );
     await ensureDefaultBoostCatalog();
     await ensureDefaultNotificationConfig();
     await bestEffort("verified-badge-projection-migration", migrateVerifiedBadgeProjectionV2);
