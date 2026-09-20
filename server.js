@@ -13,12 +13,14 @@ const nodemailer = require("nodemailer");
 const sharp = require("sharp");
 const multer = require("multer");
 const { v2: cloudinary } = require("cloudinary");
+const { createDb17Runtime } = require("./src/db17/runtime");
 const {
   WebhookSignatureValidator,
   InvalidWebhookSignatureError,
 } = require("mercadopago");
 
 const app = express();
+let db17Runtime = null;
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
@@ -28,7 +30,7 @@ const NODE_ENV = String(process.env.NODE_ENV || "development")
   .toLowerCase();
 
 const FIRERANK_SCHEMA_VERSION = "5.1.0";
-const FIRERANK_PATCH_REVISION = "2026-09-18-contract-repair-v4";
+const FIRERANK_PATCH_REVISION = "2026-09-20-db17-runtime-v1";
 const PROFILE_PHOTO_CHANGES_PER_MONTH = 2;
 const OFFICIAL_RENDER_BASE_URL = "https://firerank-api-oxy1.onrender.com";
 
@@ -700,19 +702,20 @@ async function pushNotification(uid, notification) {
   const title = clip(notification.title || "FireRank", 120);
   const body = clip(notification.body || "Você tem uma nova notificação.", 500);
   const type = clip(notification.type || "system", 80);
+  const canonicalType = db17Runtime?.canonicalNotificationType(type) || type;
   const data = map(notification.data);
-  const urgent = new Set(["order_created", "order_reminder", "delivery_assigned"]).has(type);
+  const urgent = canonicalType.startsWith("order.") || canonicalType.startsWith("delivery.") || canonicalType.startsWith("payment.");
   const channelId = urgent ? "firerank_orders_channel" : "firerank_general_channel";
   const ref = db.ref(`notifications/${uid}`).push();
 
-  await ref.set({
-    title,
-    body,
-    type,
-    read: false,
-    createdAtMs: t,
-    data,
-  });
+  await ref.set({ title, body, type, canonicalType, read: false, createdAtMs: t, data });
+
+  let outbox = null;
+  try {
+    if (db17Runtime) outbox = await db17Runtime.createOutboxEntry(uid, ref.key, { title, body, type, data });
+  } catch (error) {
+    console.error("[pushNotification:outbox]", error?.code || error?.message || "unknown");
+  }
 
   try {
     const devicesSnap = await db.ref(`user_devices/${uid}`).get();
@@ -721,6 +724,12 @@ async function pushNotification(uid, notification) {
       .map(([deviceId, raw]) => ({ deviceId, ...map(raw) }))
       .filter((row) => row.active === true && safe(row.token));
 
+    if (!rows.length) {
+      if (outbox?.outboxId) await db17Runtime.updateOutbox(outbox.outboxId, { status: "no_devices", attempts: 1, completedAtMs: t });
+      return ref.key;
+    }
+
+    let transientFailures = 0;
     for (let offset = 0; offset < rows.length; offset += 500) {
       const chunk = rows.slice(offset, offset + 500);
       const tokens = chunk.map((row) => safe(row.token));
@@ -731,44 +740,37 @@ async function pushNotification(uid, notification) {
         notification: { title, body },
         data: {
           ...notificationDataStrings(data),
-          title,
-          body,
-          type,
-          notificationId: safe(ref.key),
+          title, body, type, canonicalType, notificationId: safe(ref.key),
         },
-        android: {
-          priority: urgent ? "high" : "normal",
-          notification: {
-            channelId,
-            sound: "default",
-          },
-        },
-        apns: {
-          headers: { "apns-priority": urgent ? "10" : "5" },
-          payload: { aps: { sound: "default" } },
-        },
+        android: { priority: urgent ? "high" : "normal", notification: { channelId, sound: "default" } },
+        apns: { headers: { "apns-priority": urgent ? "10" : "5" }, payload: { aps: { sound: "default" } } },
       });
 
       const invalidUpdates = {};
       response.responses.forEach((item, index) => {
         if (item.success) return;
         const code = safe(item.error?.code);
-        if (
-          code === "messaging/registration-token-not-registered" ||
-          code === "messaging/invalid-registration-token"
-        ) {
+        if (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token") {
           const deviceId = safe(chunk[index]?.deviceId);
           if (deviceId) {
             invalidUpdates[`user_devices/${uid}/${deviceId}/active`] = false;
             invalidUpdates[`user_devices/${uid}/${deviceId}/updatedAtMs`] = t;
           }
-        }
+        } else transientFailures += 1;
       });
       if (Object.keys(invalidUpdates).length) await db.ref().update(invalidUpdates);
     }
+
+    if (outbox?.outboxId) {
+      await db17Runtime.updateOutbox(outbox.outboxId, transientFailures > 0
+        ? { status: "retry", attempts: 1, nextAttemptAtMs: t + 2 * 60 * 1000, lastError: "TRANSIENT_FCM_FAILURE" }
+        : { status: "sent", attempts: 1, sentAtMs: t, lastError: null });
+    }
   } catch (error) {
-    // A notificação no RTDB continua válida mesmo se o FCM estiver temporariamente indisponível.
     console.error("[pushNotification:fcm]", error?.code || error?.message || "unknown");
+    if (outbox?.outboxId) {
+      await db17Runtime.updateOutbox(outbox.outboxId, { status: "retry", attempts: 1, nextAttemptAtMs: t + 2 * 60 * 1000, lastError: clip(error?.code || error?.message || "unknown", 120) }).catch(() => {});
+    }
   }
 
   return ref.key;
@@ -11262,6 +11264,7 @@ async function v42WriteOrderState(orderId, order, nextStatus, actorUid, actorRol
     [`orders/${orderId}/timestamps/updatedAtMs`]: t,
     [`orders_by_buyer/${buyerUid}/${orderId}`]: { orderId, status: nextStatus, updatedAtMs: t, createdAtMs: finiteNumber(order.createdAtMs || order.timestamps?.createdAtMs, t) },
     [`orders_by_store/${storeId}/${orderId}`]: { orderId, status: nextStatus, updatedAtMs: t, createdAtMs: finiteNumber(order.createdAtMs || order.timestamps?.createdAtMs, t) },
+    [`buyer_orders/${buyerUid}/${orderId}`]: { orderId, status: nextStatus, updatedAtMs: t },
     [`order_events/${orderId}/${eventRef.key}`]: { eventId: eventRef.key, orderId, action, status: nextStatus, actorUid, actorRole, createdAtMs: t, immutable: true },
   };
   if (sellerUid) updates[`orders/${orderId}/sellerUid`] = sellerUid;
@@ -12122,95 +12125,42 @@ app.post('/v1/products/action', requireUser, rateLimit('product-action', 30, 10 
 });
 
 app.post('/v1/orders', requireUser, rateLimit('order-create', 12, 10 * 60 * 1000), async(req,res)=>{
-  try{
-    const uid=req.auth.uid, body=map(req.body), productId=safe(body.productId), quantity=Math.max(1,Math.min(99,integer(body.quantity,1))), fulfillmentType=safe(body.fulfillmentType).toLowerCase(), paymentMethod=clip(body.paymentMethod,60), buyerNote=clip(body.buyerNote,1000), t=nowMs();
-    const addressKey=safe(body.addressKey||'primary');
-    const buyerAddressResult=await requireVerifiedRealAddress(uid,addressKey,'buy');
-    const scheduledAtMs=validateScheduledAtMs(body.scheduledAtMs);
-    const productSnap=await db.ref(`products/${productId}`).get(); const product=map(productSnap.val());
-    if(!productSnap.exists()||safe(product.status)!=='active'||safe(product.productType)!=='local')return res.status(404).json({ok:false,code:'PRODUCT_NOT_AVAILABLE'});
-    if(safe(product.ownerUid)===uid)return res.status(403).json({ok:false,code:'OWN_PRODUCT'});
-    if(!(await v42CanBuyerAccessProduct(uid,product)))return res.status(403).json({ok:false,code:'PRODUCT_PRIVATE'});
-    const local=map(product.local); if(!['delivery','pickup'].includes(fulfillmentType))return res.status(422).json({ok:false,code:'INVALID_FULFILLMENT'});
-    if(fulfillmentType==='delivery'&&local.deliveryAvailable!==true)return res.status(422).json({ok:false,code:'DELIVERY_UNAVAILABLE'});
-    if(fulfillmentType==='pickup'&&local.pickupAvailable!==true)return res.status(422).json({ok:false,code:'PICKUP_UNAVAILABLE'});
-    const unitPriceCents=integer(product.pricing?.priceCents,0); if(unitPriceCents<=0)return res.status(409).json({ok:false,code:'PRICE_CHANGED'});
-    const storeId=safe(product.storeId), sellerUid=safe(product.ownerUid); const store=map((await db.ref(`stores/${storeId}`).get()).val());
-    const storeSettings=map((await db.ref(`store_settings/${storeId}`).get()).val());
-    if(storeSettings.ordersOpen===false)return res.status(409).json({ok:false,code:'STORE_CLOSED',message:'Esta loja está fechada para novos pedidos agora.'});
-    let address=buyerAddressResult.address;
-    const deliveryFeeCents=fulfillmentType==='delivery'?Math.max(0,integer(local.deliveryFeeCents,0)):0; const productAmountCents=unitPriceCents*quantity; const totalCents=productAmountCents+deliveryFeeCents;
-    const orderId=db.ref('orders').push().key; const code=String(crypto.randomInt(100000,999999)); const codeHash=stableHash(`${orderId}:${code}`);
-    const order={orderId,buyerUid:uid,sellerUid,storeId,productId,quantity,status:'sent',fulfillmentType,paymentMethod,productAmountCents,deliveryFeeCents,totalCents,scheduledAtMs,isScheduled:scheduledAtMs>0,deliveryCodeRequired:fulfillmentType==='delivery',deliveryCodeVerified:false,productSnapshot:{productId,title:safe(product.title),coverUrl:safe(product.media?.coverUrl),priceCents:unitPriceCents},storeSnapshot:{storeId,name:safe(store.name)},review:{status:'pending'},createdAtMs:t,updatedAtMs:t,timestamps:{createdAtMs:t,updatedAtMs:t}};
-    const privateData={buyer:{uid},buyerNote,scheduledAtMs,buyerAddressSnapshot:address,payment:{method:paymentMethod,totalCents,productAmountCents,deliveryFeeCents},deliveryAddress:fulfillmentType==='delivery'?address:null,deliveryCode:fulfillmentType==='delivery'?{plainForBuyer:code,codeHash,required:true,verified:false}:null};
-    const updates={
-      [`orders/${orderId}`]:order,[`order_private/${orderId}`]:privateData,
-      [`orders_by_buyer/${uid}/${orderId}`]:v42OrderIndexValue(orderId,'sent',t),
-      [`orders_by_store/${storeId}/${orderId}`]:v42OrderIndexValue(orderId,'sent',t),
-      [`buyer_orders/${uid}/${orderId}`]:{orderId,status:'sent',updatedAtMs:t},
-      [`pending_order_alerts/${orderId}`]:{orderId,sellerUid,storeId,status:'active',repeatCount:0,nextAlertAtMs:t+2*60*1000,createdAtMs:t,updatedAtMs:t},
-    };
-    const scheduledAlert=scheduledOrderAlertValue(orderId,sellerUid,storeId,scheduledAtMs,t);
-    if(scheduledAlert) updates[`scheduled_order_alerts/${orderId}`]=scheduledAlert;
-    await db.ref().update(updates); await appendAudit('order_created',{actorUid:uid,targetUid:sellerUid,referenceId:orderId,status:'sent'});
-    await pushNotification(sellerUid,{title:'Novo pedido',body:`Você recebeu um novo pedido de ${clip(product.title,80)}.`,type:'order_created',data:{orderId,productId}});
-    return res.status(201).json({ok:true,orderId,status:'sent'});
-  }catch(e){return publicError(res,e,'Não foi possível criar o pedido.');}
+  try {
+    if (!db17Runtime) return res.status(503).json({ ok:false, code:'DB17_RUNTIME_NOT_READY', message:'Checkout temporariamente indisponível.' });
+    const result = await db17Runtime.createDirectOrder(req.auth.uid, map(req.body));
+    return res.status(201).json({ ok:true, ...result });
+  } catch (e) { return publicError(res,e,'Não foi possível criar o pedido.'); }
 });
 
 app.post('/v1/orders/action', requireUser, rateLimit('order-action', 40, 10 * 60 * 1000), async(req,res)=>{
-  try{
-    const uid=req.auth.uid,orderId=safe(req.body?.orderId),actorRole=safe(req.body?.actorRole).toLowerCase(),action=safe(req.body?.action).toLowerCase();
-    const order=await v42LoadOrder(orderId); const status=v42NormalizeStatus(order.status); const buyerUid=safe(order.buyerUid), sellerUid=safe(order.sellerUid||order.ownerUid), storeId=safe(order.storeId);
-    if(actorRole==='buyer'&&buyerUid!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});
-    if(actorRole==='seller'&&!(sellerUid===uid||await v42SellerOwnsStore(uid,storeId)))return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});
-    if(actorRole==='delivery'){await v42AssertDeliveryActive(uid); if(safe(order.deliveryUid)&&safe(order.deliveryUid)!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});}
-    const transitions={
-      buyer:{cancel:{from:['sent'],to:'cancelled'},archive:{from:['delivered','cancelled','rejected'],to:'archived'}},
-      seller:{accept:{from:['sent'],to:'accepted'},reject:{from:['sent'],to:'rejected'},mark_preparing:{from:['accepted'],to:'preparing'},mark_ready:{from:['preparing'],to:'ready'},complete_pickup:{from:['ready'],to:'delivered'},archive:{from:['delivered','cancelled','rejected'],to:'archived'}},
-      delivery:{accept_delivery:{from:['assigned'],to:'delivery_accepted'},accept:{from:['assigned'],to:'delivery_accepted'},mark_picked_up:{from:['delivery_accepted'],to:'picked_up'},start_route:{from:['picked_up'],to:'on_route'},mark_arriving:{from:['on_route'],to:'arriving'},confirm_delivery:{from:['arriving','on_route'],to:'delivered'},archive:{from:['delivered','cancelled','rejected'],to:'archived'}},
-    };
-    if(action==='assign_delivery'){
-      if(actorRole!=='seller'||status!=='ready')return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});
-      const code=safe(req.body?.deliveryCode).toUpperCase(); const codeSnap=await db.ref(`delivery_public_codes/${firebaseSafeKey(code)}`).get(); let deliveryUid='';
-      if(typeof codeSnap.val()==='string')deliveryUid=safe(codeSnap.val());else deliveryUid=safe(map(codeSnap.val()).uid||map(codeSnap.val()).deliveryUid);
-      if(!deliveryUid)return res.status(404).json({ok:false,code:'DELIVERY_NOT_FOUND'});
-      const connection=map((await db.ref(`delivery_connections/${storeId}/${deliveryUid}`).get()).val()); if(!['active','accepted'].includes(safe(connection.status).toLowerCase()))return res.status(403).json({ok:false,code:'DELIVERY_NOT_CONNECTED'});
-      await v42WriteOrderState(orderId,order,'assigned',uid,'seller',action,{deliveryUid}); await pushNotification(deliveryUid,{title:'Nova entrega',body:'Uma loja conectada enviou um pedido para você.',type:'delivery_assigned',data:{orderId}}); return res.json({ok:true,orderId,status:'assigned',deliveryUid});
-    }
-    if(action==='verify_delivery_code'){
-      if(actorRole!=='delivery'||!['arriving','on_route'].includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});
-      const typed=safe(req.body?.code||req.body?.deliveryCode).replace(/[^0-9A-Za-z]/g,''); const priv=map((await db.ref(`order_private/${orderId}`).get()).val()); const codeData=map(priv.deliveryCode||priv.deliveryConfirmation); const expected=safe(codeData.codeHash||priv.deliveryCodeHash||priv.confirmationCodeHash);
-      if(!typed||!expected||stableHash(`${orderId}:${typed}`)!==expected)return res.status(422).json({ok:false,code:'DELIVERY_CODE_INVALID',message:'Código de entrega inválido.'});
-      await db.ref().update({[`orders/${orderId}/deliveryCodeVerified`]:true,[`order_private/${orderId}/deliveryCode/verified`]:true,[`order_private/${orderId}/deliveryCode/verifiedAtMs`]:nowMs()}); await v42WriteOrderState(orderId,order,'delivered',uid,'delivery',action,{deliveryCodeVerified:true}); await pushNotification(buyerUid,{title:'Entrega concluída',body:'Seu pedido foi marcado como entregue.',type:'order_delivered',data:{orderId}}); return res.json({ok:true,orderId,status:'delivered'});
-    }
-    const tr=transitions[actorRole]?.[action]; if(!tr)return res.status(422).json({ok:false,code:'INVALID_ACTION'}); if(!tr.from.includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION',status});
-    if(actorRole==='delivery'&&!safe(order.deliveryUid))return res.status(409).json({ok:false,code:'DELIVERY_NOT_ASSIGNED'});
-    await v42WriteOrderState(orderId,order,tr.to,uid,actorRole,action,actorRole==='delivery'?{deliveryUid:uid}:{});
-    if(tr.to==='delivered')await pushNotification(buyerUid,{title:'Pedido entregue',body:'Seu pedido foi concluído.',type:'order_delivered',data:{orderId}});
-    else if(actorRole==='seller')await pushNotification(buyerUid,{title:'Pedido atualizado',body:`Novo status: ${tr.to}.`,type:'order_status',data:{orderId,status:tr.to}});
-    return res.json({ok:true,orderId,status:tr.to});
-  }catch(e){return publicError(res,e,'Não foi possível atualizar o pedido.');}
+  try {
+    if (!db17Runtime) return res.status(503).json({ ok:false, code:'DB17_RUNTIME_NOT_READY' });
+    const result = await db17Runtime.transitionOrder({
+      uid: req.auth.uid,
+      orderId: safe(req.body?.orderId),
+      actorRole: safe(req.body?.actorRole),
+      action: safe(req.body?.action),
+      body: map(req.body),
+    });
+    return res.json({ ok:true, ...result });
+  } catch (e) { return publicError(res,e,'Não foi possível atualizar o pedido.'); }
 });
 
 app.post('/v1/delivery/orders/action', requireUser, rateLimit('delivery-order-action', 40, 10 * 60 * 1000), async(req,res)=>{
-  req.body={...map(req.body),actorRole:'delivery'};
-  // Reutiliza a mesma lógica por chamada interna HTTP-less: replica apenas o formato esperado.
-  const orderId=safe(req.body.orderId); const action=safe(req.body.action).toLowerCase();
-  try{
-    const uid=req.auth.uid; await v42AssertDeliveryActive(uid); const order=await v42LoadOrder(orderId); const assigned=safe(order.deliveryUid); if(assigned&&assigned!==uid)return res.status(403).json({ok:false,code:'ORDER_ACTOR_INVALID'});
-    const mapAction={accept:'accept_delivery',reject:'reject_delivery',mark_picked_up:'mark_picked_up',start_route:'start_route',mark_arriving:'mark_arriving',verify_delivery_code:'verify_delivery_code',confirm_delivery:'confirm_delivery',archive:'archive'}; const normalized=mapAction[action]||action;
-    if(normalized==='reject_delivery'){
-      if(v42NormalizeStatus(order.status)!=='assigned')return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION'});
-      await db.ref(`orders_by_delivery/${uid}/${orderId}`).remove(); await v42WriteOrderState(orderId,order,'ready',uid,'delivery','reject_delivery',{deliveryUid:null}); await db.ref(`orders/${orderId}/deliveryUid`).remove(); return res.json({ok:true,orderId,status:'ready'});
-    }
-    // Implementacao direta das demais transicoes.
-    const status=v42NormalizeStatus(order.status); const transitions={accept_delivery:{from:['assigned'],to:'delivery_accepted'},mark_picked_up:{from:['delivery_accepted'],to:'picked_up'},start_route:{from:['picked_up'],to:'on_route'},mark_arriving:{from:['on_route'],to:'arriving'},confirm_delivery:{from:['arriving','on_route'],to:'delivered'},archive:{from:['delivered','cancelled','rejected'],to:'archived'}};
-    if(normalized==='verify_delivery_code'){
-      const typed=safe(req.body.code||req.body.deliveryCode).replace(/[^0-9A-Za-z]/g,''); const priv=map((await db.ref(`order_private/${orderId}`).get()).val()); const codeData=map(priv.deliveryCode||priv.deliveryConfirmation); const expected=safe(codeData.codeHash||priv.deliveryCodeHash||priv.confirmationCodeHash); if(!typed||!expected||stableHash(`${orderId}:${typed}`)!==expected)return res.status(422).json({ok:false,code:'DELIVERY_CODE_INVALID',message:'Código de entrega inválido.'}); await db.ref().update({[`orders/${orderId}/deliveryCodeVerified`]:true,[`order_private/${orderId}/deliveryCode/verified`]:true,[`order_private/${orderId}/deliveryCode/verifiedAtMs`]:nowMs()}); await v42WriteOrderState(orderId,order,'delivered',uid,'delivery','verify_delivery_code',{deliveryUid:uid,deliveryCodeVerified:true}); return res.json({ok:true,orderId,status:'delivered'});
-    }
-    const tr=transitions[normalized]; if(!tr)return res.status(422).json({ok:false,code:'INVALID_ACTION'}); if(!tr.from.includes(status))return res.status(409).json({ok:false,code:'INVALID_ORDER_TRANSITION',status}); await v42WriteOrderState(orderId,order,tr.to,uid,'delivery',normalized,{deliveryUid:uid}); return res.json({ok:true,orderId,status:tr.to});
-  }catch(e){return publicError(res,e,'Não foi possível atualizar a entrega.');}
+  try {
+    if (!db17Runtime) return res.status(503).json({ ok:false, code:'DB17_RUNTIME_NOT_READY' });
+    const aliases = { accept:'accept_delivery', reject:'reject_delivery', mark_picked_up:'mark_picked_up', start_route:'start_route', mark_arriving:'mark_arriving', verify_delivery_code:'verify_delivery_code', confirm_delivery:'confirm_delivery', archive:'archive' };
+    const rawAction = safe(req.body?.action).toLowerCase();
+    const action = aliases[rawAction] || rawAction;
+    const result = await db17Runtime.transitionOrder({
+      uid: req.auth.uid,
+      orderId: safe(req.body?.orderId),
+      actorRole: 'delivery',
+      action,
+      body: map(req.body),
+    });
+    return res.json({ ok:true, ...result });
+  } catch (e) { return publicError(res,e,'Não foi possível atualizar a entrega.'); }
 });
 
 app.post('/v1/delivery/connections/request', requireUser, rateLimit('delivery-connection-request', 20, 60 * 60 * 1000), async(req,res)=>{
@@ -12333,8 +12283,13 @@ async function runDailyNotifications() {
   });
   if(!lock.committed) return {active:true,alreadyRunningOrCompleted:true,notified:0,day};
 
-  const subscribersSnap=await db.ref('notification_subscribers').get();
-  const uids=Object.entries(map(subscribersSnap.val())).filter(([,v])=>map(v).active!==false).map(([uid])=>uid).slice(0,5000);
+  const [subscribersSnap,devicesSnap]=await Promise.all([db.ref('notification_subscribers').get(),db.ref('user_devices').get()]);
+  const uidSet=new Set(Object.entries(map(subscribersSnap.val())).filter(([,v])=>map(v).active!==false).map(([uid])=>uid));
+  for(const [uid,rawDevices] of Object.entries(map(devicesSnap.val()))){
+    const hasActive=Object.values(map(rawDevices)).some((raw)=>map(raw).active===true&&safe(map(raw).token));
+    if(hasActive) uidSet.add(uid);
+  }
+  const uids=[...uidSet].slice(0,5000);
   let notified=0,skipped=0;
   for(let offset=0;offset<uids.length;offset+=20){
     const batch=uids.slice(offset,offset+20);
@@ -12615,135 +12570,13 @@ app.post("/v1/seller/store/pix", requireUser, rateLimit("seller-pix-save", 12, 6
 });
 
 async function frMasterCreatePixIntent(uid, body) {
-  const productId = safe(body.productId);
-  const quantity = Math.max(1, Math.min(20, integer(body.quantity, 1)));
-  const fulfillmentType = safe(body.fulfillmentType).toLowerCase();
-  const addressKey = safe(body.addressKey || "primary");
-  const buyerAddressResult = await requireVerifiedRealAddress(uid, addressKey, "buy");
-  const scheduledAtMs = validateScheduledAtMs(body.scheduledAtMs);
-  const productSnap = await db.ref(`products/${productId}`).get();
-  const product = map(productSnap.val());
-  if (!productSnap.exists() || safe(product.status) !== "active" || safe(product.productType) !== "local") {
-    const error = new Error("PRODUCT_NOT_AVAILABLE");
-    error.statusCode = 404;
-    error.publicMessage = "Produto local indisponivel.";
+  if (!db17Runtime) {
+    const error = new Error("DB17_RUNTIME_NOT_READY");
+    error.statusCode = 503;
+    error.publicMessage = "Checkout temporariamente indisponível.";
     throw error;
   }
-  const sellerUid = safe(product.ownerUid);
-  if (!sellerUid || sellerUid === uid) {
-    const error = new Error("OWN_PRODUCT");
-    error.statusCode = 403;
-    error.publicMessage = "Voce nao pode comprar seu proprio produto.";
-    throw error;
-  }
-  if (!(await v42CanBuyerAccessProduct(uid, product))) {
-    const error = new Error("PRODUCT_PRIVATE");
-    error.statusCode = 403;
-    error.publicMessage = "Produto indisponivel para esta conta.";
-    throw error;
-  }
-  const local = map(product.local);
-  const localType = safe(local.localType).toLowerCase();
-  const preorderAllowed = localType === "custom_order" || safe(local.orderType).toLowerCase() === "preorder";
-  if (!["delivery", "pickup", "preorder"].includes(fulfillmentType)) {
-    const error = new Error("INVALID_FULFILLMENT");
-    error.statusCode = 422;
-    throw error;
-  }
-  if (fulfillmentType === "delivery" && local.deliveryAvailable !== true) {
-    const error = new Error("DELIVERY_UNAVAILABLE"); error.statusCode = 422; throw error;
-  }
-  if (fulfillmentType === "pickup" && local.pickupAvailable !== true) {
-    const error = new Error("PICKUP_UNAVAILABLE"); error.statusCode = 422; throw error;
-  }
-  if (fulfillmentType === "preorder" && !preorderAllowed) {
-    const error = new Error("PREORDER_UNAVAILABLE"); error.statusCode = 422; throw error;
-  }
-
-  const storeId = safe(product.storeId);
-  const store = map((await db.ref(`stores/${storeId}`).get()).val());
-  const paymentProfile = map((await db.ref(`seller_payment_profiles/${storeId}`).get()).val());
-  if (!safe(paymentProfile.pixKey) || paymentProfile.enabled === false) {
-    const error = new Error("SELLER_PIX_NOT_CONFIGURED");
-    error.statusCode = 409;
-    error.publicMessage = "A loja ainda nao configurou a chave Pix.";
-    throw error;
-  }
-
-  const unitPriceCents = integer(product.pricing?.priceCents, 0);
-  if (unitPriceCents <= 0) {
-    const error = new Error("PRICE_CHANGED"); error.statusCode = 409; throw error;
-  }
-  const productAmountCents = unitPriceCents * quantity;
-  let buyerAddress = buyerAddressResult.address;
-  let sellerAddress = {};
-  let quote = { distanceKm: 0, vehicleClass: "none", deliveryFeeCents: 0, courierPayoutCents: 0 };
-  if (fulfillmentType === "delivery") {
-    const sellerAddressKey = safe(local.addressId || local.sellerAddressKey || "primary");
-    sellerAddress = map((await db.ref(`user_addresses/${sellerUid}/${sellerAddressKey}`).get()).val());
-    const distanceKm = frMasterDistanceKm(buyerAddress, sellerAddress);
-    const serviceRadiusKm = finiteNumber(local.serviceRadiusKm, 0);
-    if (distanceKm > 0 && serviceRadiusKm > 0 && distanceKm > serviceRadiusKm) {
-      const error = new Error("OUTSIDE_DELIVERY_RADIUS");
-      error.statusCode = 422;
-      error.publicMessage = "Este endereco esta fora do raio de entrega da loja.";
-      throw error;
-    }
-    quote = frMasterDeliveryQuote(distanceKm, integer(local.deliveryFeeCents, 0));
-    if (quote.deliveryFeeCents <= 0) {
-      const error = new Error("DELIVERY_QUOTE_UNAVAILABLE");
-      error.statusCode = 409;
-      error.publicMessage = "Nao foi possivel calcular a entrega agora.";
-      throw error;
-    }
-  }
-
-  const t = nowMs();
-  const intentRef = db.ref("pix_checkout_intents").push();
-  const intentId = intentRef.key;
-  const totalCents = productAmountCents + quote.deliveryFeeCents;
-  const intent = {
-    intentId,
-    buyerUid: uid,
-    sellerUid,
-    storeId,
-    productId,
-    productTitle: clip(product.title, 180),
-    quantity,
-    fulfillmentType,
-    localType,
-    paymentMethod: "pix_direct",
-    paymentCustody: "seller_direct",
-    status: "awaiting_pix",
-    unitPriceCents,
-    productAmountCents,
-    deliveryFeeCents: quote.deliveryFeeCents,
-    courierPayoutCents: quote.courierPayoutCents,
-    deliveryDistanceKm: quote.distanceKm,
-    deliveryVehicleClass: quote.vehicleClass,
-    buyerNote: clip(body.buyerNote, 1000),
-    scheduledAtMs,
-    expiresAtMs: t + FIRERANK_PIX_INTENT_TTL_MS,
-    createdAtMs: t,
-    updatedAtMs: t,
-  };
-  await db.ref().update({
-    [`pix_checkout_intents/${intentId}`]: intent,
-    [`pix_intents_by_buyer/${uid}/${intentId}`]: { intentId, status: intent.status, storeId, updatedAtMs: t },
-    [`pix_intents_by_store/${storeId}/${intentId}`]: { intentId, status: intent.status, buyerUid: uid, updatedAtMs: t },
-    [`pix_checkout_private/${intentId}/buyerAddressSnapshot`]: buyerAddress,
-    [`pix_checkout_private/${intentId}/deliveryAddress`]: fulfillmentType === "delivery" ? buyerAddress : null,
-    [`pix_checkout_private/${intentId}/pickupAddress`]: fulfillmentType === "delivery" ? sellerAddress : null,
-  });
-  await appendAudit("pix_intent_created", { actorUid: uid, targetUid: sellerUid, referenceId: intentId, status: "awaiting_pix" });
-  return {
-    ...intent,
-    totalCents,
-    pixKey: safe(paymentProfile.pixKey),
-    pixKeyType: safe(paymentProfile.pixKeyType),
-    beneficiaryName: safe(paymentProfile.beneficiaryName),
-    custodyByFireRank: false,
-  };
+  return db17Runtime.createPixIntent(uid, body);
 }
 
 app.post("/v1/checkout/pix-intent", requireUser, rateLimit("pix-intent-create", 12, 10 * 60 * 1000), async (req, res) => {
@@ -12779,100 +12612,13 @@ app.get("/v1/checkout/pix-intent", requireUser, rateLimit("pix-intent-get", 60, 
 });
 
 async function frMasterCreateOrderFromPixIntent(intent) {
-  const t = nowMs();
-  const orderId = db.ref("orders").push().key;
-  const fulfillmentType = safe(intent.fulfillmentType);
-  const delivery = fulfillmentType === "delivery";
-  const code = delivery ? String(crypto.randomInt(100000, 999999)) : "";
-  const codeHash = delivery ? stableHash(`${orderId}:${code}`) : "";
-  const productSnap = await db.ref(`products/${safe(intent.productId)}`).get();
-  const product = map(productSnap.val());
-  if (
-    !productSnap.exists() ||
-    safe(product.status).toLowerCase() !== "active" ||
-    safe(product.ownerUid) !== safe(intent.sellerUid) ||
-    safe(product.storeId) !== safe(intent.storeId) ||
-    safe(product.productType).toLowerCase() !== "local"
-  ) {
-    const error = new Error("PRODUCT_NOT_AVAILABLE");
-    error.statusCode = 409;
-    error.publicMessage = "O produto mudou ou ficou indisponivel. Nao confirme o Pix por este pre-pedido.";
+  if (!db17Runtime) {
+    const error = new Error("DB17_RUNTIME_NOT_READY");
+    error.statusCode = 503;
+    error.publicMessage = "Checkout temporariamente indisponível.";
     throw error;
   }
-  const store = map((await db.ref(`stores/${safe(intent.storeId)}`).get()).val());
-  const privateCheckout = map((await db.ref(`pix_checkout_private/${safe(intent.intentId)}`).get()).val());
-  const order = {
-    orderId,
-    buyerUid: safe(intent.buyerUid),
-    sellerUid: safe(intent.sellerUid),
-    storeId: safe(intent.storeId),
-    productId: safe(intent.productId),
-    quantity: integer(intent.quantity, 1),
-    status: "sent",
-    fulfillmentType,
-    paymentMethod: "pix_direct",
-    paymentState: "confirmed_by_seller",
-    pixIntentId: safe(intent.intentId),
-    productAmountCents: integer(intent.productAmountCents, 0),
-    deliveryFeeCents: integer(intent.deliveryFeeCents, 0),
-    courierPayoutCents: integer(intent.courierPayoutCents, 0),
-    totalCents: integer(intent.productAmountCents, 0) + integer(intent.deliveryFeeCents, 0),
-    deliveryVehicleClass: safe(intent.deliveryVehicleClass),
-    deliveryDistanceKm: finiteNumber(intent.deliveryDistanceKm, 0),
-    deliveryCodeRequired: delivery,
-    deliveryCodeVerified: false,
-    productSnapshot: {
-      productId: safe(intent.productId),
-      title: safe(intent.productTitle || product.title),
-      coverUrl: safe(product.media?.coverUrl),
-      priceCents: integer(intent.unitPriceCents, 0),
-    },
-    storeSnapshot: { storeId: safe(intent.storeId), name: safe(store.name) },
-    review: { status: "pending" },
-    scheduledAtMs: Math.max(0, finiteNumber(intent.scheduledAtMs, 0)),
-    isScheduled: finiteNumber(intent.scheduledAtMs, 0) > 0,
-    createdAtMs: t,
-    updatedAtMs: t,
-    timestamps: { createdAtMs: t, updatedAtMs: t },
-  };
-  const privateData = {
-    buyer: { uid: safe(intent.buyerUid) },
-    buyerNote: clip(intent.buyerNote, 1000),
-    scheduledAtMs: Math.max(0, finiteNumber(intent.scheduledAtMs, 0)),
-    buyerAddressSnapshot: map(privateCheckout.buyerAddressSnapshot),
-    payment: {
-      method: "pix_direct",
-      status: "confirmed_by_seller",
-      custodyByFireRank: false,
-      totalCents: order.totalCents,
-      productAmountCents: order.productAmountCents,
-      deliveryFeeCents: order.deliveryFeeCents,
-      confirmedAtMs: t,
-    },
-    deliveryAddress: delivery ? map(privateCheckout.deliveryAddress) : null,
-    deliveryCode: delivery ? { plainForBuyer: code, codeHash, required: true, verified: false } : null,
-  };
-  const updates = {
-    [`orders/${orderId}`]: order,
-    [`order_private/${orderId}`]: privateData,
-    [`orders_by_buyer/${order.buyerUid}/${orderId}`]: v42OrderIndexValue(orderId, "sent", t),
-    [`orders_by_store/${order.storeId}/${orderId}`]: v42OrderIndexValue(orderId, "sent", t),
-    [`buyer_orders/${order.buyerUid}/${orderId}`]: { orderId, status: "sent", updatedAtMs: t },
-    [`pix_checkout_intents/${safe(intent.intentId)}/status`]: "confirmed",
-    [`pix_checkout_intents/${safe(intent.intentId)}/orderId`]: orderId,
-    [`pix_checkout_intents/${safe(intent.intentId)}/confirmedAtMs`]: t,
-    [`pix_checkout_intents/${safe(intent.intentId)}/updatedAtMs`]: t,
-    [`pix_intents_by_buyer/${order.buyerUid}/${safe(intent.intentId)}/status`]: "confirmed",
-    [`pix_intents_by_buyer/${order.buyerUid}/${safe(intent.intentId)}/updatedAtMs`]: t,
-    [`pix_intents_by_store/${order.storeId}/${safe(intent.intentId)}/status`]: "confirmed",
-    [`pix_intents_by_store/${order.storeId}/${safe(intent.intentId)}/updatedAtMs`]: t,
-  };
-  const scheduledAlert = scheduledOrderAlertValue(orderId, order.sellerUid, order.storeId, order.scheduledAtMs, t);
-  if (scheduledAlert) updates[`scheduled_order_alerts/${orderId}`] = scheduledAlert;
-  await db.ref().update(updates);
-  await appendAudit("pix_confirmed_order_created", { actorUid: safe(intent.sellerUid), targetUid: order.buyerUid, referenceId: orderId, status: "sent" });
-  await pushNotification(order.buyerUid, { title: "Pix confirmado", body: "A loja confirmou o Pix e seu pedido foi gerado.", type: "pix_confirmed", data: { orderId, intentId: safe(intent.intentId) } });
-  return orderId;
+  return db17Runtime.createOrderFromPixIntent(intent);
 }
 
 app.post("/v1/checkout/pix-intents/action", requireUser, rateLimit("pix-intent-action", 30, 10 * 60 * 1000), async (req, res) => {
@@ -14143,16 +13889,19 @@ async function frV51EnsureDatabaseConfig() {
     },
   };
 
-  const [publicConfigSnap, featureFlagsSnap] = await Promise.all([
+  const [publicConfigSnap, featureFlagsSnap, dbMetaSnap] = await Promise.all([
     db.ref("public_config").get(),
     db.ref("feature_flags").get(),
+    db.ref("database_meta/masterV51").get(),
   ]);
+  const currentDbRevision = safe(map(dbMetaSnap.val()).revision).toUpperCase();
+  const effectiveDbRevision = currentDbRevision === "DB17" ? "DB17" : FIRERANK_MASTER_V51_DB_REVISION;
   const updates = {};
   frV51FillMissing("public_config", publicConfigSnap.val(), defaults.public_config, updates);
   frV51FillMissing("feature_flags", featureFlagsSnap.val(), defaults.feature_flags, updates);
 
   // These are canonical V5.1 upgrades and intentionally advance the revision.
-  updates["public_config/app/databaseRevision"] = FIRERANK_MASTER_V51_DB_REVISION;
+  updates["public_config/app/databaseRevision"] = effectiveDbRevision;
   updates["public_config/app/schemaVersion"] = FIRERANK_MASTER_V51_SCHEMA;
   updates["public_config/app/commerceSchemaVersion"] = FIRERANK_MASTER_V51_SCHEMA;
   updates["public_config/preferences/defaultTheme"] = "light";
@@ -14167,7 +13916,7 @@ async function frV51EnsureDatabaseConfig() {
   updates["public_config/api/runtimeHealthEndpoint"] = `${APP_BASE_URL}/v1/runtime/master-v51`;
   updates["public_config/api/schemaVersion"] = FIRERANK_MASTER_V51_SCHEMA;
   updates["database_meta/masterV51"] = {
-    revision: FIRERANK_MASTER_V51_DB_REVISION,
+    revision: effectiveDbRevision,
     schemaVersion: FIRERANK_MASTER_V51_SCHEMA,
     backendAuthorityForSensitiveWrites: true,
     publicProductDetailsEnabled: true,
@@ -14397,29 +14146,18 @@ app.get("/v1/products/public/:productId", rateLimit("public-product-detail-v51",
 
 app.get("/v1/runtime/master-v51", rateLimit("runtime-master-v51", 120, 10 * 60 * 1000), async (_req, res) => {
   try {
+    const liveRevision = safe((await db.ref("database_meta/masterV51/revision").get()).val()) || FIRERANK_MASTER_V51_DB_REVISION;
     return res.json({
-      ok: true,
-      schemaVersion: FIRERANK_MASTER_V51_SCHEMA,
-      databaseRevision: FIRERANK_MASTER_V51_DB_REVISION,
-      productPreflight: true,
-      publicProductDetails: true,
-      recommendationV2: true,
-      defaultTheme: "light",
-      directPix: true,
-      regionalDelivery: true,
-      firebaseStorageOperationalMedia: false,
-      mediaProvider: "cloudinary",
-      custodyByFireRank: false,
-      patchRevision: FIRERANK_PATCH_REVISION,
-      maxProductImages: MAX_PRODUCT_IMAGES,
-      scheduledOrders: true,
-      verifiedAddressRequiredForCommerce: true,
-      profilePhotoChangesPerMonth: PROFILE_PHOTO_CHANGES_PER_MONTH,
+      ok: true, schemaVersion: FIRERANK_MASTER_V51_SCHEMA, databaseRevision: liveRevision,
+      db17RuntimeReady: !!db17Runtime,
+      smartCheckoutV2: liveRevision === "DB17",
+      productPreflight: true, publicProductDetails: true, recommendationV2: true, defaultTheme: "light",
+      directPix: true, regionalDelivery: true, firebaseStorageOperationalMedia: false, mediaProvider: "cloudinary",
+      custodyByFireRank: false, patchRevision: FIRERANK_PATCH_REVISION, maxProductImages: MAX_PRODUCT_IMAGES,
+      scheduledOrders: true, verifiedAddressRequiredForCommerce: true, profilePhotoChangesPerMonth: PROFILE_PHOTO_CHANGES_PER_MONTH,
       identityDocumentReview: true,
     });
-  } catch (error) {
-    return publicError(res, error, "Runtime V5.1 indisponivel.");
-  }
+  } catch (error) { return publicError(res, error, "Runtime V5.1 indisponivel."); }
 });
 
 async function frV51Bootstrap() {
@@ -14427,10 +14165,12 @@ async function frV51Bootstrap() {
   await frV51RefreshRuntimeConfig();
   await frV51BackfillPublicDetails();
   await frV51CleanupExpiredPublishSessions();
+  const liveRevision = safe((await db.ref("database_meta/masterV51/revision").get()).val()) || FIRERANK_MASTER_V51_DB_REVISION;
   await db.ref("runtime_health/master_v51").set({
     status: "ready",
     schemaVersion: FIRERANK_MASTER_V51_SCHEMA,
-    databaseRevision: FIRERANK_MASTER_V51_DB_REVISION,
+    databaseRevision: liveRevision,
+    db17RuntimeReady: !!db17Runtime,
     updatedAtMs: nowMs(),
   });
 }
@@ -15060,6 +14800,16 @@ app.get(
   }
 );
 
+// FIRERANK_DB17_RUNTIME_BEGIN
+db17Runtime = createDb17Runtime({
+  app, db, firebaseMessaging, requireUser, requireCronSecret, rateLimit, publicError, safe, clip, map, integer, finiteNumber, nowMs, stableHash,
+  assertSellerCanPublish, v42CanBuyerAccessProduct, v42LoadOrder, v42NormalizeStatus, v42SellerOwnsStore, v42AssertDeliveryActive, v42WriteOrderState,
+  requireVerifiedRealAddress, validateScheduledAtMs, scheduledOrderAlertValue, frMasterDistanceKm, frMasterDeliveryQuote, notificationDataStrings, appendAudit, pushNotification,
+  appBaseUrl: APP_BASE_URL,
+});
+db17Runtime.registerRoutes();
+// FIRERANK_DB17_RUNTIME_END
+
 app.use(
   (
     error,
@@ -15142,6 +14892,7 @@ async function start() {
 
   try {
     await ensurePublicApiConfig();
+    if (db17Runtime) await db17Runtime.ensureRuntimeConfig();
     const contractRepair = await repairSocialCountsAndOwnerProducts();
     console.log(
       `Contract repair: users=${integer(contractRepair.publicUsersRecounted, 0)} ownerProducts=${integer(contractRepair.ownerProductsIndexed, 0)}`
