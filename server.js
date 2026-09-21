@@ -12666,22 +12666,124 @@ app.post("/v1/checkout/pix-intents/action", requireUser, rateLimit("pix-intent-a
     }
 
     if (action === "confirm_pix_received") {
-      const tx = await ref.transaction((raw) => {
-        const current = map(raw);
-        if (safe(current.status) !== "pix_sent") return;
-        return { ...current, status: "confirming", confirmingAtMs: t, confirmingByUid: uid, updatedAtMs: t };
-      });
-      if (!tx.committed) {
-        const latest = map((await ref.get()).val());
-        if (safe(latest.status) === "confirmed" && safe(latest.orderId)) return res.json({ ok: true, intentId, status: "confirmed", orderId: safe(latest.orderId), idempotent: true });
-        return res.status(409).json({ ok: false, code: "PIX_INTENT_STATE_INVALID", status: safe(latest.status) });
+      // DB17 Pix confirmation lock:
+      // keep the commercial intent immutable during lock acquisition and use a
+      // dedicated tiny transaction node. This avoids transaction failures on
+      // the complete intent payload and gives us safe stale-lock recovery.
+      const lockRef = db.ref(`pix_confirmation_locks/${intentId}`);
+      const lockTtlMs = 2 * 60 * 1000;
+
+      let latest = map((await ref.get()).val());
+
+      if (safe(latest.status) === "confirmed" && safe(latest.orderId)) {
+        return res.json({
+          ok: true,
+          intentId,
+          status: "confirmed",
+          orderId: safe(latest.orderId),
+          idempotent: true,
+        });
       }
+
+      if (
+        safe(latest.status) === "confirming" &&
+        !safe(latest.orderId) &&
+        finiteNumber(latest.confirmingAtMs, 0) > 0 &&
+        finiteNumber(latest.confirmingAtMs, 0) <= t - lockTtlMs
+      ) {
+        await ref.update({
+          status: "pix_sent",
+          confirmingRecoveredAtMs: t,
+          updatedAtMs: t,
+        });
+        latest = map((await ref.get()).val());
+      }
+
+      if (safe(latest.status) !== "pix_sent") {
+        return res.status(409).json({
+          ok: false,
+          code: safe(latest.status) === "confirming"
+            ? "PIX_CONFIRM_IN_PROGRESS"
+            : "PIX_INTENT_STATE_INVALID",
+          status: safe(latest.status),
+          message: safe(latest.status) === "confirming"
+            ? "A confirmação deste Pix já está em andamento. Aguarde alguns segundos e atualize a tela."
+            : "Este Pix não está mais aguardando confirmação.",
+        });
+      }
+
+      let lockTx;
       try {
-        const locked = map(tx.snapshot.val());
+        lockTx = await lockRef.transaction((raw) => {
+          const current = map(raw);
+          const expiresAtMs = finiteNumber(current.expiresAtMs, 0);
+          if (expiresAtMs > t) return;
+          return {
+            intentId,
+            sellerUid: uid,
+            createdAtMs: t,
+            expiresAtMs: t + lockTtlMs,
+          };
+        });
+      } catch (lockError) {
+        await ref.update({
+          updatedAtMs: nowMs(),
+          lastConfirmError: clip(
+            `LOCK_${lockError?.code || lockError?.message || "error"}`,
+            80
+          ),
+        }).catch(() => {});
+        throw lockError;
+      }
+
+      if (!lockTx.committed) {
+        const afterLock = map((await ref.get()).val());
+        if (safe(afterLock.status) === "confirmed" && safe(afterLock.orderId)) {
+          return res.json({
+            ok: true,
+            intentId,
+            status: "confirmed",
+            orderId: safe(afterLock.orderId),
+            idempotent: true,
+          });
+        }
+        return res.status(409).json({
+          ok: false,
+          code: "PIX_CONFIRM_IN_PROGRESS",
+          status: safe(afterLock.status),
+          message: "Outra confirmação deste Pix já está em andamento. Aguarde alguns segundos e atualize a tela.",
+        });
+      }
+
+      try {
+        await ref.update({
+          status: "confirming",
+          confirmingAtMs: t,
+          confirmingByUid: uid,
+          updatedAtMs: t,
+          lastConfirmError: null,
+        });
+
+        const locked = map((await ref.get()).val());
         const orderId = await frMasterCreateOrderFromPixIntent(locked);
-        return res.json({ ok: true, intentId, status: "confirmed", orderId });
+
+        await lockRef.remove().catch(() => {});
+
+        return res.json({
+          ok: true,
+          intentId,
+          status: "confirmed",
+          orderId,
+        });
       } catch (error) {
-        await ref.update({ status: "pix_sent", updatedAtMs: nowMs(), lastConfirmError: clip(error?.code || error?.message || "error", 80) });
+        await Promise.allSettled([
+          ref.update({
+            status: "pix_sent",
+            updatedAtMs: nowMs(),
+            lastConfirmError: clip(error?.code || error?.message || "error", 80),
+          }),
+          lockRef.remove(),
+        ]);
         throw error;
       }
     }
