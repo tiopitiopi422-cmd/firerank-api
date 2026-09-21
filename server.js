@@ -11267,6 +11267,12 @@ async function v42WriteOrderState(orderId, order, nextStatus, actorUid, actorRol
     [`buyer_orders/${buyerUid}/${orderId}`]: { orderId, status: nextStatus, updatedAtMs: t },
     [`order_events/${orderId}/${eventRef.key}`]: { eventId: eventRef.key, orderId, action, status: nextStatus, actorUid, actorRole, createdAtMs: t, immutable: true },
   };
+  if (nextStatus === 'delivered') {
+    // DB17 canonical completion timestamp used by seller daily summaries.
+    updates[`orders/${orderId}/deliveredAtMs`] = t;
+    updates[`orders/${orderId}/timestamps/deliveredAtMs`] = t;
+  }
+
   if (sellerUid) updates[`orders/${orderId}/sellerUid`] = sellerUid;
   if (deliveryUid) {
     updates[`orders/${orderId}/deliveryUid`] = deliveryUid;
